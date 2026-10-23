@@ -166,7 +166,7 @@
     "description": "Tests the check for an invalid string input index with replaceable"
   },
   {
-    "exec": "./elements-tx",
+    "exec": "./elements-functional-test-tx",
     "args":
     ["-serialization=BITCOIN", "-chain=main", "-create",
      "in=5897de6bd6027a475eadd57019d4e6872c396d0716c4875a5f1a6fcfdf385c1f:0",
@@ -176,7 +176,7 @@
     "description": "Tests the check for an invalid negative input index with replaceable"
   },
   {
-    "exec": "./elements-tx",
+    "exec": "./elements-functional-test-tx",
     "args":
     ["-serialization=BITCOIN", "-chain=main", "-create",
      "in=5897de6bd6027a475eadd57019d4e6872c396d0716c4875a5f1a6fcfdf385c1f:0",
@@ -186,7 +186,7 @@
     "description": "Tests the check for an invalid positive out-of-bounds input index with replaceable"
   },
   {
-    "exec": "./elements-tx",
+    "exec": "./elements-functional-test-tx",
     "args":
     ["-serialization=BITCOIN", "-chain=main", "-create",
      "in=5897de6bd6027a475eadd57019d4e6872c396d0716c4875a5f1a6fcfdf385c1f:0",
@@ -195,7 +195,7 @@
     "description": "Tests that the 'SEQUENCE' value for a single input is set to fdffffff for single input"
   },
   {
-    "exec": "./elements-tx",
+    "exec": "./elements-functional-test-tx",
     "args":
     ["-serialization=BITCOIN", "-chain=main", "-create",
      "in=5897de6bd6027a475eadd57019d4e6872c396d0716c4875a5f1a6fcfdf385c1f:0",
@@ -204,7 +204,7 @@
     "description": "Tests that the 'SEQUENCE' value for a single input is set to fdffffff when N omitted"
   },
   {
-    "exec": "./elements-tx",
+    "exec": "./elements-functional-test-tx",
     "args":
     ["-serialization=BITCOIN", "-chain=main", "-create",
      "in=5897de6bd6027a475eadd57019d4e6872c396d0716c4875a5f1a6fcfdf385c1f:0",
@@ -215,7 +215,7 @@
     "description": "Tests that only the 'SEQUENCE' value of input[1] is set to fdffffff"
   },
   {
-    "exec": "./elements-tx",
+    "exec": "./elements-functional-test-tx",
     "args":
     ["-serialization=BITCOIN", "-chain=main", "-create",
      "in=5897de6bd6027a475eadd57019d4e6872c396d0716c4875a5f1a6fcfdf385c1f:0",
@@ -226,7 +226,7 @@
     "description": "Tests that the 'SEQUENCE' value for each input is set to fdffffff when N omitted"
   },
   {
-    "exec": "./elements-tx",
+    "exec": "./elements-functional-test-tx",
     "args":
     ["-serialization=BITCOIN", "-chain=main", "-create",
      "replaceable="],
@@ -234,7 +234,7 @@
     "description": "Tests behavior when no inputs are provided in the transaction"
   },
   {
-    "exec": "./elements-tx",
+    "exec": "./elements-functional-test-tx",
     "args":
     ["-serialization=BITCOIN", "-chain=main", "-create",
      "in=5897de6bd6027a475eadd57019d4e6872c396d0716c4875a5f1a6fcfdf385c1f:0:abcdef00",
@@ -333,7 +333,7 @@
     "description": "Create a new transaction with an invalid output script"
   },
   { "exec": "./elements-functional-test-tx",
-    "args": ["-create", "outscript=0:OP_DROP", "nversion=1"],
+    "args": ["-chain=liquidv1", "-create", "outscript=0:OP_DROP", "nversion=1"],
     "output_cmp": "txcreatescript1.hex",
     "description": "Create a new transaction with a single output script (OP_DROP)"
   },
@@ -391,7 +391,7 @@
     "description": "Try to parse an output script with a decimal number just above the allowed range"
   },
   { "exec": "./elements-functional-test-tx",
-    "args": ["-create", "outscript=0:4294967295"],
+    "args": ["-chain=liquidv1", "-create", "outscript=0:4294967295"],
     "output_cmp": "txcreatescript5.hex",
     "description": "Try to parse an output script with a decimal number at the upper limit of the allowed range"
   },
@@ -408,7 +408,7 @@
     "description": "Try to parse an output script with a decimal number just below the allowed range"
   },
   { "exec": "./elements-functional-test-tx",
-    "args": ["-create", "outscript=0:-4294967295"],
+    "args": ["-chain=liquidv1", "-create", "outscript=0:-4294967295"],
     "output_cmp": "txcreatescript6.hex",
     "description": "Try to parse an output script with a decimal number at the lower limit of the allowed range"
   },
