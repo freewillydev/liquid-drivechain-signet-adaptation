@@ -129,8 +129,19 @@ bool CachingTransactionSignatureChecker::VerifySchnorrSignature(Span<const unsig
 
 // ELEMENTS CACHES
 namespace {
-    static SignatureCache rangeProofCache;
-    static SignatureCache surjectionProofCache;
+// Initialize on first use, not in an unspecified cross-translation-unit
+// constructor order. In particular, Windows must not consume the global PRNG
+// before the test harness has initialized its independent temporary-path RNG.
+SignatureCache& RangeProofCache()
+{
+    static SignatureCache cache;
+    return cache;
+}
+SignatureCache& SurjectionProofCache()
+{
+    static SignatureCache cache;
+    return cache;
+}
 }
 // To be called once in AppInit2/TestingSetup to initialize the rangeproof cache
 bool InitRangeproofCache(size_t max_size_bytes)
@@ -139,7 +150,7 @@ bool InitRangeproofCache(size_t max_size_bytes)
         LogPrintf("Range proof cache disabled via -norangeproofcache\n");
         return true;
     }
-    auto setup_results = rangeProofCache.setup_bytes(max_size_bytes);
+    auto setup_results = RangeProofCache().setup_bytes(max_size_bytes);
     if (!setup_results) return false;
     const auto [num_elems, approx_size_bytes] = *setup_results;
     LogPrintf("Using %zu MiB out of %zu Mib requested for rangeproof cache, able to store %zu elements\n",
@@ -150,7 +161,7 @@ bool InitRangeproofCache(size_t max_size_bytes)
 // To be called once in AppInit2/TestingSetup to initialize the surjectionrproof cache
 bool InitSurjectionproofCache(size_t max_size_bytes)
 {
-    auto setup_results = surjectionProofCache.setup_bytes(max_size_bytes);
+    auto setup_results = SurjectionProofCache().setup_bytes(max_size_bytes);
     if (!setup_results) return false;
     const auto [num_elems, approx_size_bytes] = *setup_results;
     LogPrintf("Using %zu MiB out of %zu Mib requested for surjectionproof cache, able to store %zu elements\n",
@@ -168,8 +179,8 @@ bool CachingRangeProofChecker::VerifyRangeProof(const std::vector<unsigned char>
     uint256 entry;
     const bool useCache = gArgs.GetBoolArg("-rangeproofcache", true);
     if (useCache) {
-        rangeProofCache.ComputeEntryRangeProof(entry, vchRangeProof, vchValueCommitment, vchAssetCommitment, scriptPubKey);
-        if (rangeProofCache.Get(entry, !store)) {
+        RangeProofCache().ComputeEntryRangeProof(entry, vchRangeProof, vchValueCommitment, vchAssetCommitment, scriptPubKey);
+        if (RangeProofCache().Get(entry, !store)) {
             return true;
         }
     }
@@ -201,7 +212,7 @@ bool CachingRangeProofChecker::VerifyRangeProof(const std::vector<unsigned char>
     }
 
     if (useCache && store) {
-        rangeProofCache.Set(entry);
+        RangeProofCache().Set(entry);
     }
 
     return true;
@@ -219,9 +230,9 @@ bool CachingSurjectionProofChecker::VerifySurjectionProof(secp256k1_surjectionpr
     // wtxid commits to all data including surj targets
     // we need to specify the proof and output asset point to be unique
     uint256 entry;
-    surjectionProofCache.ComputeEntrySurjectionProof(entry, wtxid, vchproof, std::vector<unsigned char>(std::begin(gen.data), std::end(gen.data)), vTags);
+    SurjectionProofCache().ComputeEntrySurjectionProof(entry, wtxid, vchproof, std::vector<unsigned char>(std::begin(gen.data), std::end(gen.data)), vTags);
 
-    if (surjectionProofCache.Get(entry, !store)) {
+    if (SurjectionProofCache().Get(entry, !store)) {
         return true;
     }
 
@@ -230,7 +241,7 @@ bool CachingSurjectionProofChecker::VerifySurjectionProof(secp256k1_surjectionpr
     }
 
     if (store) {
-        surjectionProofCache.Set(entry);
+        SurjectionProofCache().Set(entry);
     }
 
     return true;
@@ -243,7 +254,7 @@ void TestComputeEntryRangeProof(uint256& entry,
                                 const std::vector<unsigned char>& asset_commitment,
                                 const CScript& script_pub_key)
 {
-    rangeProofCache.ComputeEntryRangeProof(entry, proof, commitment, asset_commitment, script_pub_key);
+    RangeProofCache().ComputeEntryRangeProof(entry, proof, commitment, asset_commitment, script_pub_key);
 }
 
 void TestComputeEntrySurjectionProof(uint256& entry,
@@ -252,7 +263,7 @@ void TestComputeEntrySurjectionProof(uint256& entry,
                                      const std::vector<unsigned char>& commitment,
                                      const std::vector<secp256k1_generator>& vTags)
 {
-    surjectionProofCache.ComputeEntrySurjectionProof(entry, hash, proof, commitment, vTags);
+    SurjectionProofCache().ComputeEntrySurjectionProof(entry, hash, proof, commitment, vTags);
 }
 
 // END ELEMENTS
