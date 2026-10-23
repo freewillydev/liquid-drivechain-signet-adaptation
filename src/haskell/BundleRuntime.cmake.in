@@ -1,18 +1,38 @@
 # Bundle the actual linked dependency closure, never an assumed GHC package list.
+if(POLICY CMP0207)
+  cmake_policy(SET CMP0207 NEW)
+endif()
 file(INSTALL "@operation_capabilities_SOURCE_DIR@/LICENSE" "@operation_capabilities_SOURCE_DIR@/NOTICE"
   DESTINATION "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_DATADIR@/doc/elements/operation-capabilities")
 file(INSTALL "@grpc_haskell_SOURCE_DIR@/LICENSE"
   DESTINATION "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_DATADIR@/doc/elements/grpc-haskell")
 file(INSTALL "@proto3_suite_SOURCE_DIR@/LICENSE"
   DESTINATION "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_DATADIR@/doc/elements/proto3-suite")
+set(system_excludes "^/usr/lib/" "^/System/" "^/lib/" "^/lib64/")
+set(system_api_excludes)
+set(runtime_directories)
+if("@WIN32@")
+  # The executable and its full non-system DLL closure stay together. Never
+  # resolve runtime dependencies from the user's current directory or PATH.
+  list(APPEND system_excludes "[Ww][Ii][Nn][Dd][Oo][Ww][Ss][/\\\\][Ss][Yy][Ss][Tt][Ee][Mm]32[/\\\\]")
+  set(runtime_directories [==[@ELEMENTS_WINDOWS_RUNTIME_DIRS@]==])
+  # Windows API-set contracts are provided by the OS loader, not redistributable
+  # DLL files. Keep every other unresolved dependency fatal.
+  set(system_api_excludes "^[Aa][Pp][Ii]-[Mm][Ss]-[Ww][Ii][Nn]-" "^[Ee][Xx][Tt]-[Mm][Ss]-[Ww][Ii][Nn]-")
+endif()
 file(GET_RUNTIME_DEPENDENCIES LIBRARIES "@hs_library@"
   RESOLVED_DEPENDENCIES_VAR dependencies UNRESOLVED_DEPENDENCIES_VAR unresolved
   CONFLICTING_DEPENDENCIES_PREFIX conflicts
-  POST_EXCLUDE_REGEXES "^/usr/lib/" "^/System/" "^/lib/" "^/lib64/")
+  PRE_EXCLUDE_REGEXES ${system_api_excludes}
+  POST_EXCLUDE_REGEXES ${system_excludes}
+  DIRECTORIES ${runtime_directories})
 if(unresolved OR conflicts_FILENAMES)
   message(FATAL_ERROR "Unresolved/conflicting Haskell runtime dependencies: ${unresolved};${conflicts_FILENAMES}")
 endif()
 set(destination "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_LIBDIR@")
+if("@WIN32@")
+  set(destination "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/@CMAKE_INSTALL_BINDIR@")
+endif()
 set(libraries "@hs_library@" ${dependencies})
 foreach(source IN LISTS libraries)
   get_filename_component(name "${source}" NAME)
@@ -50,7 +70,7 @@ foreach(source IN LISTS libraries)
       execute_process(COMMAND "@hs_install_name_tool@" -change "${dependency}" "@rpath/${dependency_name}" "${installed}" COMMAND_ERROR_IS_FATAL ANY)
     endforeach()
     execute_process(COMMAND "@hs_codesign@" --force --sign - "${installed}" COMMAND_ERROR_IS_FATAL ANY)
-  else()
+  elseif(NOT "@WIN32@")
     execute_process(COMMAND "@hs_patchelf@" --set-rpath "$ORIGIN" "${installed}" COMMAND_ERROR_IS_FATAL ANY)
     foreach(dependency IN LISTS dependencies)
       get_filename_component(dependency_name "${dependency}" NAME)

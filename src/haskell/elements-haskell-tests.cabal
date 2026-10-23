@@ -10,7 +10,8 @@ test-suite properties
   hs-source-dirs: test, .
   other-modules: Abi, DomainABI, AbiTests, Drivechain, Withdrawal, Deposit, Bmm, BmmConstants, ParentReplay, Exchange, Usdd, ScriptPolicy, CapabilityContext, Workflow, ExchangeTests, OperationTests
   cxx-sources: test/reference.cpp
-  if os(osx)
+  -- The pinned native Windows GHC uses LLVM/libc++ for its C++ test oracle.
+  if os(osx) || os(windows)
     extra-libraries: c++
   else
     extra-libraries: stdc++

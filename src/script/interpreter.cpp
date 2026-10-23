@@ -778,7 +778,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                         (bool(flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_CHECK_TEMPLATE_VERIFY_HASH) << 3) |
                         (!stack.empty() << 4);
                     switch (drivechain::haskell::CtvAdmission(options, stack.empty() ? 0 : stack.back().size())) {
-                    case drivechain::haskell::CtvAction::IGNORE:
+                    case drivechain::haskell::CtvAction::IGNORE_OPCODE:
                         break;
                     case drivechain::haskell::CtvAction::DISCOURAGE:
                         return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);

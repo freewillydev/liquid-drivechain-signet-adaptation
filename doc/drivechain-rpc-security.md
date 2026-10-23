@@ -131,8 +131,15 @@ and install the miner-issued client credentials and trusted CA. Set
 Remote opt-in does not relax mTLS, allow plaintext, or permit remote parent
 wallet HTTP. An optional deprecated `drivechainbmmwalletaddr` must exactly
 match it; `drivechainbmmconnectauthcookie` is unsupported.
-The overall Haskell migration still requires a native macOS/Linux toolchain;
-Windows packaging is not qualified. This transport change does not change that.
+Native Windows builds require the explicit qualification path described in
+[Windows build notes](build-windows.md). On Windows, protect the credential
+directory and private key with NTFS ACLs restricted to the process user and
+trusted system administrators. The existing Windows admission checks reject
+non-regular/symlink and unreadable files, but do not enforce the POSIX
+owner/mode policy or audit NTFS ACLs. This remains an operator responsibility,
+not a claim of cross-platform permission-policy parity. The parent rotating
+cookie is supported; `mainchainrpccredentialfile` still requires POSIX permission
+checks and is not supported on Windows.
 The configured authority is used for TLS server-name verification as well as
 the request authority, including when connecting to a numeric loopback endpoint.
 
@@ -150,12 +157,15 @@ to the intended release OS; locally installed libraries are not portable release
 Missing/wrong client credentials must fail the TLS handshake. No plaintext or
 insecure-certificate fallback is provided.
 
-Daemon startup re-executes the node after detaching, retaining the initialization
+On POSIX, daemon startup re-executes the node after detaching, retaining the initialization
 pipe for `-daemonwait`. Configuration parsing already uses the threaded Haskell
 runtime; using that runtime after a raw fork loses its worker threads and can
 hang the first asynchronous gRPC request. The optional test-node argument above
 checks daemon startup, read-only enforcer queries, and shutdown with isolated
 fixtures. No live transactions are created.
+On Windows the lifecycle fixture runs a foreground process, verifies a restart
+against the same isolated data directory, and checks initialization failures and
+clean shutdown; it never sends Unix daemon flags to the Windows process.
 
 ## Production and rotation
 

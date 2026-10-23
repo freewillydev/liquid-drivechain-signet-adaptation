@@ -1,6 +1,71 @@
 WINDOWS BUILD NOTES
 ====================
 
+## This fork: native Haskell qualification build
+
+The current fork requires a native GHC toolchain. The historical upstream
+cross-compilation and MSVC instructions below do **not** qualify the migrated
+node. The opt-in `ELEMENTS_EXPERIMENTAL_WINDOWS_HASKELL=ON` path targets native
+x86-64 MinGW/UCRT builds; it does not remove production identity or activation
+gates. The release is command-line only (`BUILD_GUI=OFF`).
+
+The Windows qualification toolchain uses GHC 9.6.7, cabal-install 3.16.1.0,
+the UCRT64 GCC toolchain, and the Boost **1.81.0** headers/checksum pinned in
+`depends/packages/boost.mk`. Select `Boost_INCLUDE_DIR` explicitly and use
+`Boost_NO_SYSTEM_PATHS=ON`; a newer package-manager Boost is not a substitute.
+Build both real Rust verifier archives from their authenticated source packets
+with the pinned native Windows Rust toolchain. Supply their native import/system
+libraries from `cargo rustc -- --print native-static-libs`, and retain the
+USDD semantic-identity check. Never substitute empty or verifier-disabled archives.
+
+Required CMake selections, in addition to the ordinary native Ninja release build:
+
+- `ELEMENTS_EXPERIMENTAL_WINDOWS_HASKELL=ON`
+- `ELEMENTS_GHC`, `ELEMENTS_GHC_PKG`, and `ELEMENTS_CABAL`: absolute tool paths
+- `CMAKE_PREFIX_PATH`: the native UCRT dependency prefix
+- `ELEMENTS_WINDOWS_RUNTIME_DIRS`: explicit, reviewed DLL search directories
+- `USDD_SP1_VERIFIER_ARCHIVE` and `USDD_SP1_VERIFIER_NATIVE_LIBS`
+- `ECX_SP1_VERIFIER_ARCHIVE` and `ECX_SP1_VERIFIER_SYSTEM_LIBS`
+
+The Windows GHC distribution supplies static Haskell packages. These are embedded
+in one `libelements_haskell.dll`, with exports derived from the existing foreign
+declarations. Its runtime is initialized once, ignores `GHCRTS`, leaves signal
+ownership with the caller, and stays pinned while runtime threads can reference
+it. Do not copy a second runtime into each C++ consumer.
+Use Windows PE relocations for this DLL, without the Unix `-fPIC` flag. The
+native callback tests catch incorrect relative jump-table entries from that
+combination in GHC 9.6.7. The Windows gRPC adapter also owns the shared event
+engine while requests are active and drains it after the last request, before
+Windows loader teardown; concurrent and repeated-request tests cover that path.
+
+Use `contrib/devtools/bundle_windows_runtime.cmake` to collect actual PE imports
+into a **new** directory. It requires `ROOT_BINARIES`, `SEARCH_DIRECTORIES`,
+`OUTPUT_DIRECTORY`, and an absolute `OBJDUMP`; it rejects unresolved/conflicting
+dependencies, non-PE inputs, and output-directory reuse. Include the Haskell DLL
+among the root inputs. Test the resulting bundle after removing development
+directories from `PATH`, including from a directory containing spaces.
+`test_bundle_windows_runtime.py` covers the bundler's positive and negative cases.
+Distribute dependency notices and exact source/build provenance with the bundle.
+
+Qualification includes the native verifier tests and verification of existing
+proof fixtures (not proof generation), Haskell property/ABI/loader tests, node
+unit tests, and isolated mTLS/lifecycle tests. The property-test C++ reference
+uses GHC's bundled Clang/libc++; its `mingw/bin` must be available to that test
+process for `libc++.dll` and `libunwind.dll`. This is a test-tool requirement,
+not a runtime dependency to impose on node users.
+
+On Windows, run the node in the foreground; Unix `-daemon`/`-daemonwait` behavior
+is not supported. `grpc_transport.py --direct-only` tests native direct mTLS and,
+with the functional test node, startup/restart/shutdown. It explicitly does not
+qualify HAProxy: retain a separate full proxy-client test where HAProxy is run.
+Test-only node binaries and private proof/TLS fixtures must never enter a release.
+
+For credential and parent-RPC limitations, see
+[Drivechain RPC security](drivechain-rpc-security.md). Successful platform tests
+do not authorize a new network, consensus identity, proof, or transaction.
+
+## Historical upstream instructions
+
 Below are some notes on how to build Bitcoin Core for Windows.
 
 The options known to work for building Bitcoin Core on Windows are:

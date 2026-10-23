@@ -1,6 +1,18 @@
 # Haskell owns the migrated rules; there is deliberately no C++ fallback.
-if(CMAKE_CROSSCOMPILING OR WIN32)
-  message(FATAL_ERROR "The Haskell FFI migration currently requires a native macOS/Linux GHC toolchain; cross/Windows packaging is not qualified yet.")
+if(CMAKE_CROSSCOMPILING)
+  message(FATAL_ERROR "The Haskell FFI requires a native GHC toolchain; cross packaging is not qualified.")
+endif()
+option(ELEMENTS_EXPERIMENTAL_WINDOWS_HASKELL "Build the native MinGW Haskell qualification candidate; not a production qualification claim." OFF)
+set(ELEMENTS_WINDOWS_RUNTIME_DIRS "" CACHE STRING "Explicit DLL search directories for native Windows runtime packaging")
+if(WIN32 AND (NOT MINGW OR NOT ELEMENTS_EXPERIMENTAL_WINDOWS_HASKELL))
+  message(FATAL_ERROR "Native Windows Haskell packaging requires MinGW and explicit ELEMENTS_EXPERIMENTAL_WINDOWS_HASKELL qualification opt-in.")
+endif()
+if(WIN32)
+  foreach(directory IN LISTS ELEMENTS_WINDOWS_RUNTIME_DIRS)
+    if(NOT IS_ABSOLUTE "${directory}" OR NOT IS_DIRECTORY "${directory}")
+      message(FATAL_ERROR "Windows runtime search directory must exist and be absolute: ${directory}")
+    endif()
+  endforeach()
 endif()
 include("${CMAKE_CURRENT_SOURCE_DIR}/CheckCabal.cmake")
 find_program(ELEMENTS_GHC ghc REQUIRED)
@@ -75,6 +87,43 @@ set(operation_sources
 
 set(hs_library "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}elements_haskell${CMAKE_SHARED_LIBRARY_SUFFIX}")
 set(hs_link_flags)
+set(hs_way_flags -dynamic -fPIC)
+set(hs_import_library "${hs_library}.a")
+set(hs_extra_outputs)
+if(WIN32)
+  # The native Windows GHC bindist supplies static Haskell packages. Embed one
+  # RTS/package closure in our pinned DLL, not one runtime per C++ consumer.
+  # PE uses its native relocation table. Do not apply ELF-style -fPIC: with
+  # GHC 9.6.7 it produces incorrectly extended relative jump-table entries
+  # in this Windows DLL (caught by the nested-callback ABI regression).
+  set(hs_way_flags -static)
+  set(windows_exports "EXPORTS\n  elements_hs_runtime_init\n")
+  set(export_names elements_hs_runtime_init)
+  # Drivechain also exports the three resumable live-evidence handle operations
+  # consumed directly by bridge.cpp; they are not domain-selector wrappers.
+  foreach(module DomainABI Drivechain GrpcClient Utreexo)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${module}.hs")
+    file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/${module}.hs" declarations REGEX "^foreign export ccall ")
+    if(NOT declarations)
+      message(FATAL_ERROR "Missing foreign exports in ${module}.hs")
+    endif()
+    foreach(declaration IN LISTS declarations)
+      if(NOT declaration MATCHES "^foreign export ccall [\"]?(elements_hs_[A-Za-z0-9_]+)([\" ]|$)")
+        message(FATAL_ERROR "Unrecognized Windows export: ${declaration}")
+      endif()
+      set(symbol "${CMAKE_MATCH_1}")
+      if(symbol IN_LIST export_names)
+        message(FATAL_ERROR "Duplicate Windows export: ${symbol}")
+      endif()
+      list(APPEND export_names "${symbol}")
+      string(APPEND windows_exports "  ${symbol}\n")
+    endforeach()
+  endforeach()
+  file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/elements_haskell.def" CONTENT "${windows_exports}")
+  list(APPEND hs_link_flags "${CMAKE_CURRENT_BINARY_DIR}/elements_haskell.def" "-optl-Wl,--exclude-all-symbols")
+  list(APPEND hs_link_flags "-optl-Wl,--out-implib,${hs_import_library}")
+  list(APPEND hs_extra_outputs "${hs_import_library}")
+endif()
 foreach(lib IN LISTS CMAKE_DL_LIBS)
   list(APPEND hs_link_flags "-optl-l${lib}")
 endforeach()
@@ -87,9 +136,9 @@ if(APPLE)
   endif()
 endif()
 configure_file(runtime.c runtime.c COPYONLY)
-add_custom_command(OUTPUT "${hs_library}" "${CMAKE_CURRENT_BINARY_DIR}/Drivechain_stub.h" "${CMAKE_CURRENT_BINARY_DIR}/DomainABI_stub.h" "${CMAKE_CURRENT_BINARY_DIR}/GrpcClient_stub.h"
+add_custom_command(OUTPUT "${hs_library}" "${CMAKE_CURRENT_BINARY_DIR}/Drivechain_stub.h" "${CMAKE_CURRENT_BINARY_DIR}/DomainABI_stub.h" "${CMAKE_CURRENT_BINARY_DIR}/GrpcClient_stub.h" ${hs_extra_outputs}
   COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/generate_abi.py" --check
-  COMMAND ${grpc_exec} "${ELEMENTS_GHC}" -O2 -Wall -Werror -fforce-recomp -dynamic -shared -fPIC -threaded -flink-rts
+  COMMAND ${grpc_exec} "${ELEMENTS_GHC}" -O2 -Wall -Werror -fforce-recomp ${hs_way_flags} -shared -threaded -flink-rts
     -no-hs-main -no-user-package-db -hide-all-packages -package base -package bytestring -package transformers
     -package grpc-haskell-core -package grpc-haskell -package proto3-suite -package async -package text -package vector -package containers -package deepseq -package aeson
     "-i${CMAKE_CURRENT_SOURCE_DIR}" "-i${operation_capabilities_SOURCE_DIR}/src"
@@ -97,10 +146,13 @@ add_custom_command(OUTPUT "${hs_library}" "${CMAKE_CURRENT_BINARY_DIR}/Drivechai
     -odir "${CMAKE_CURRENT_BINARY_DIR}" -hidir "${CMAKE_CURRENT_BINARY_DIR}"
     -stubdir "${CMAKE_CURRENT_BINARY_DIR}" ${hs_link_flags}
     "${CMAKE_CURRENT_SOURCE_DIR}/DomainABI.hs" "${CMAKE_CURRENT_SOURCE_DIR}/GrpcClient.hs" "${CMAKE_CURRENT_SOURCE_DIR}/Utreexo.hs" "${CMAKE_CURRENT_BINARY_DIR}/runtime.c" -o "${hs_library}"
-  DEPENDS ${grpc_ready} Utreexo.hs GrpcClient.hs EnforcerCodec.hs Abi.hs DomainABI.hs domain_abi.h abi.def generate_abi.py Drivechain.hs Withdrawal.hs Deposit.hs Bmm.hs BmmConstants.hs ParentReplay.hs Exchange.hs Usdd.hs ScriptPolicy.hs CapabilityContext.hs Workflow.hs ${operation_sources} runtime.c VERBATIM)
+  DEPENDS ${grpc_ready} Utreexo.hs GrpcClient.hs EnforcerCodec.hs Abi.hs DomainABI.hs domain_abi.h abi.def generate_abi.py Drivechain.hs Withdrawal.hs Deposit.hs Bmm.hs BmmConstants.hs ParentReplay.hs Exchange.hs Usdd.hs ScriptPolicy.hs CapabilityContext.hs Workflow.hs ${operation_sources} runtime.c $<$<BOOL:${WIN32}>:${CMAKE_CURRENT_BINARY_DIR}/elements_haskell.def> VERBATIM)
 add_custom_target(elements_haskell_build DEPENDS "${hs_library}" "${CMAKE_CURRENT_BINARY_DIR}/Drivechain_stub.h" "${CMAKE_CURRENT_BINARY_DIR}/DomainABI_stub.h")
 add_library(elements_haskell_runtime SHARED IMPORTED GLOBAL)
 set_target_properties(elements_haskell_runtime PROPERTIES IMPORTED_LOCATION "${hs_library}")
+if(WIN32)
+  set_target_properties(elements_haskell_runtime PROPERTIES IMPORTED_IMPLIB "${hs_import_library}")
+endif()
 add_dependencies(elements_haskell_runtime elements_haskell_build)
 add_library(elements_haskell STATIC bridge.cpp simplicity_bridge.cpp grpc_bridge.cpp)
 set_target_properties(elements_haskell PROPERTIES POSITION_INDEPENDENT_CODE ON OUTPUT_NAME elements_haskell_bridge)
@@ -108,6 +160,10 @@ add_dependencies(elements_haskell elements_haskell_build)
 target_include_directories(elements_haskell PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_include_directories(elements_haskell SYSTEM PRIVATE ${rts_includes})
 target_link_libraries(elements_haskell PUBLIC elements_haskell_runtime elements_utreexo PRIVATE core_interface bitcoin_consensus bitcoin_util)
+if(WIN32)
+  target_include_directories(elements_haskell SYSTEM PRIVATE "${ELEMENTS_GRPC_CPP_INCLUDE}")
+  target_link_libraries(elements_haskell PRIVATE "${ELEMENTS_GRPC_LIBRARY}")
+endif()
 if(BUILD_TESTS)
   add_test(NAME haskell_cabal_version COMMAND "${CMAKE_COMMAND}"
     "-DTEST_TMP=${CMAKE_CURRENT_BINARY_DIR}/cabal-version-test"
@@ -121,7 +177,7 @@ if(APPLE)
   find_program(hs_install_name_tool install_name_tool REQUIRED)
   find_program(hs_otool otool REQUIRED)
   find_program(hs_codesign codesign REQUIRED)
-else()
+elseif(NOT WIN32)
   find_program(hs_patchelf patchelf REQUIRED)
 endif()
 configure_file(BundleRuntime.cmake.in BundleRuntime.cmake @ONLY)
@@ -144,6 +200,8 @@ if(BUILD_TESTS)
   target_link_libraries(test_haskell_loader PRIVATE core_interface ${CMAKE_DL_LIBS})
   add_dependencies(test_haskell_loader elements_haskell_build)
   add_test(NAME haskell_runtime_reload COMMAND test_haskell_loader "${hs_library}")
+  add_test(NAME haskell_runtime_ignores_environment COMMAND "${CMAKE_COMMAND}" -E env
+    "GHCRTS=--invalid-option-must-not-be-parsed" "$<TARGET_FILE:test_haskell_loader>" "${hs_library}")
   add_executable(test_haskell_domain_abi domain_abi_tests.cpp)
   add_dependencies(test_haskell_domain_abi elements_haskell_build)
   target_include_directories(test_haskell_domain_abi PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")

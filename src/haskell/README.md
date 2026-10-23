@@ -23,7 +23,9 @@ gRPC C-core development libraries and protobuf headers. Follow the verified
 [Linux bootstrap and secure-index instructions](../../doc/build-unix.md#haskell-toolchain)
 before `cabal update`; CMake checks the selected `ELEMENTS_CABAL` version early.
 Generated
-bindings live in the build directory. Windows/cross packaging remains unqualified.
+bindings live in the build directory. Native Windows packaging has a separate,
+explicit opt-in qualification path in `doc/build-windows.md`; cross packaging
+remains unqualified.
 Do not ship locally built native dependencies for older OS deployment targets
 without rebuilding and qualifying those dependencies for that target.
 

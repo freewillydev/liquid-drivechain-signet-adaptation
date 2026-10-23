@@ -67,7 +67,8 @@ enum class ConfigurationField : uint32_t { RAW_HASH, NONZERO_HASH, OUTPOINT, SPE
 enum class NetworkSelection : uint32_t { PRODUCTION, CHAIN_NAME, REGTEST_OPTION };
 uint8_t ContextPresence(uint32_t count, uint32_t required);
 void ScriptCacheEncode(bool endpoint_only, std::span<const std::byte> input, std::span<unsigned char> output);
-enum class CtvAction : uint8_t { IGNORE, DISCOURAGE, EMPTY_STACK, CHECK_HASH };
+// IGNORE is a Windows SDK macro; keep the existing ABI values explicit.
+enum class CtvAction : uint8_t { IGNORE_OPCODE = 0, DISCOURAGE = 1, EMPTY_STACK = 2, CHECK_HASH = 3 };
 CtvAction CtvAdmission(uint32_t flags, uint64_t size);
 bool VerifierStartup(bool active, const std::function<bool(uint32_t)>& read, std::string* error);
 bool VerifierIdentity(bool active, uint32_t abi, uint32_t format,

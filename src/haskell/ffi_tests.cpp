@@ -771,11 +771,15 @@ void CheckAnchorReentry()
 int main()
 {
     try {
+#ifdef _WIN32
+        Require(std::signal(SIGINT, SignalHandler) != SIG_ERR);
+#else
         struct sigaction handler{}, before{}, after{};
         handler.sa_handler = SignalHandler;
         sigemptyset(&handler.sa_mask);
         Require(sigaction(SIGINT, &handler, nullptr) == 0);
         Require(sigaction(SIGINT, nullptr, &before) == 0);
+#endif
         // Concurrent first entry also exercises the one-time RTS initializer.
         std::atomic<bool> ready{false}, ok{true};
         std::vector<std::thread> workers;
@@ -824,8 +828,12 @@ int main()
         ready = true;
         for (auto& worker : workers) worker.join();
         Require(ok);
+#ifdef _WIN32
+        Require(std::signal(SIGINT, SignalHandler) == SignalHandler);
+#else
         Require(sigaction(SIGINT, nullptr, &after) == 0);
         Require(before.sa_handler == after.sa_handler);
+#endif
         CheckStatusAdapters();
         CheckWideArithmetic();
         CheckOptionalEnvironment();

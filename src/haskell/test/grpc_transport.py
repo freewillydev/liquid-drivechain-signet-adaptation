@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Exercise the actual C++/Haskell client ABI against the official enforcer schema."""
 import concurrent.futures
+import argparse
 import json
+import os
 import pathlib
 import socket
 import subprocess
@@ -16,8 +18,21 @@ sys.path.insert(0, str(root / "test/functional"))
 from test_framework.enforcer_protocol import load_protocol
 from grpc_daemon import check_daemon, unused_port
 
-probe, temporary_root = sys.argv[1:3]
-node = sys.argv[3] if len(sys.argv) > 3 else None
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("probe")
+parser.add_argument("temporary_root")
+parser.add_argument("node", nargs="?")
+parser.add_argument("--direct-only", action="store_true",
+                    help="Test direct mTLS only; does not qualify the separate HAProxy deployment")
+arguments = parser.parse_args()
+probe, temporary_root, node = arguments.probe, arguments.temporary_root, arguments.node
+
+
+def generate_certs(destination):
+    # MSYS2 must convert filesystem arguments, but not OpenSSL's subject name.
+    environment = dict(os.environ, MSYS2_ARG_CONV_EXCL="/CN=")
+    subprocess.run(["bash", (root / "contrib/drivechain-mtls/generate-certs.sh").as_posix(),
+                    destination.as_posix()], check=True, capture_output=True, env=environment)
 cases = [
     ("ValidatorService", "GetChainInfo", {}, {"network": "NETWORK_SIGNET"}),
     ("ValidatorService", "GetChainTip", {}, {"blockHeaderInfo": {
@@ -41,8 +56,7 @@ cases = [
 
 with tempfile.TemporaryDirectory(prefix="direct-grpc-", dir=temporary_root) as directory:
     certs = pathlib.Path(directory) / "tls"
-    subprocess.run(["bash", str(root / "contrib/drivechain-mtls/generate-certs.sh"), str(certs)],
-                   check=True, capture_output=True)
+    generate_certs(certs)
     # A DNS-only certificate ensures authority controls TLS verification, not
     # merely the HTTP/2 header. All connections still use numeric loopback.
     subprocess.run(["openssl", "req", "-new", "-key", str(certs / "server-key.pem"),
@@ -108,6 +122,12 @@ with tempfile.TemporaryDirectory(prefix="direct-grpc-", dir=temporary_root) as d
                 assert json_format.Parse(output, response_type()) == json_format.ParseDict(response, response_type())
                 assert len(calls) == before + 1
                 print("PASS official-schema", method, flush=True)
+            for mode, count in (("concurrent", 8), ("repeat", 4)):
+                before = len(calls)
+                status, output = run("ValidatorService", "GetChainInfo", {}, mode)
+                assert status == 0 and json.loads(output) == {"network": "NETWORK_SIGNET"}, (mode, status, output)
+                assert calls[before:] == ["GetChainInfo"] * count, calls[before:]
+                print("PASS", mode, "request lifetime and clean process exit", flush=True)
             # TLS must not silently fall back when the endpoint is plaintext.
             secure_port = port
             before = len(calls)
@@ -129,35 +149,37 @@ with tempfile.TemporaryDirectory(prefix="direct-grpc-", dir=temporary_root) as d
             behavior = "valid"
             if node:
                 check_daemon(node, directory, certs, port, calls)
-            # Qualify the shipped HTTP/2 proxy, not just direct gRPC TLS.
-            secure_port = port
-            port = unused_port()
-            with tempfile.TemporaryFile() as proxy_log:
-                proxy = subprocess.Popen(["bash", str(root / "contrib/drivechain-mtls/run-mtls-proxy.sh"),
-                    str(certs), f"127.0.0.1:{port}", f"127.0.0.1:{plaintext_port}"],
-                    stdout=proxy_log, stderr=proxy_log)
-                try:
-                    for _ in range(100):
-                        try:
-                            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
-                                break
-                        except OSError:
-                            assert proxy.poll() is None, "HTTP/2 proxy exited"
-                            time.sleep(0.05)
-                    for service, method, request, response in cases:
-                        before = len(calls)
-                        status, output = run(service, method, request)
-                        assert status == 0, (method, status, output)
-                        assert len(calls) == before + 1
-                    if node:
-                        proxy_directory = pathlib.Path(directory) / "proxied"
-                        proxy_directory.mkdir()
-                        check_daemon(node, proxy_directory, certs, port, calls)
-                    print("PASS authenticated HTTP/2 proxy: all allowed methods", flush=True)
-                finally:
-                    proxy.terminate()
-                    proxy.wait(timeout=10)
-                    port = secure_port
+            # The default still requires the shipped HTTP/2 proxy. Windows
+            # direct-only runs are separate evidence, never proxy qualification.
+            if not arguments.direct_only:
+                secure_port = port
+                port = unused_port()
+                with tempfile.TemporaryFile() as proxy_log:
+                    proxy = subprocess.Popen(["bash", str(root / "contrib/drivechain-mtls/run-mtls-proxy.sh"),
+                        str(certs), f"127.0.0.1:{port}", f"127.0.0.1:{plaintext_port}"],
+                        stdout=proxy_log, stderr=proxy_log)
+                    try:
+                        for _ in range(100):
+                            try:
+                                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                                    break
+                            except OSError:
+                                assert proxy.poll() is None, "HTTP/2 proxy exited"
+                                time.sleep(0.05)
+                        for service, method, request, response in cases:
+                            before = len(calls)
+                            status, output = run(service, method, request)
+                            assert status == 0, (method, status, output)
+                            assert len(calls) == before + 1
+                        if node:
+                            proxy_directory = pathlib.Path(directory) / "proxied"
+                            proxy_directory.mkdir()
+                            check_daemon(node, proxy_directory, certs, port, calls)
+                        print("PASS authenticated HTTP/2 proxy: all allowed methods", flush=True)
+                    finally:
+                        proxy.terminate()
+                        proxy.wait(timeout=10)
+                        port = secure_port
             before = len(calls)
             status, output = run("ValidatorService", "GetChainInfo", {}, "wrong-authority")
             assert status == 14 and output, (status, output)
@@ -168,8 +190,7 @@ with tempfile.TemporaryDirectory(prefix="direct-grpc-", dir=temporary_root) as d
             assert run("ValidatorService", "GetCtip", {"sidechainNumber": 24, "sidechain_number": 25})[0] == -1
             assert len(calls) == before
             other = pathlib.Path(directory) / "other"
-            subprocess.run(["bash", str(root / "contrib/drivechain-mtls/generate-certs.sh"), str(other)],
-                           check=True, capture_output=True)
+            generate_certs(other)
             ca = (certs / "ca.pem").read_bytes()
             (certs / "ca.pem").write_bytes((other / "ca.pem").read_bytes())
             status, output = run("ValidatorService", "GetChainInfo", {})
