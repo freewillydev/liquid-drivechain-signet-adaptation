@@ -11,7 +11,9 @@
 #include <set>
 #include <vector>
 
-BOOST_AUTO_TEST_SUITE(merkleblock_tests)
+// These fixtures contain Bitcoin-serialized blocks. Select their chain mode
+// explicitly rather than inheriting a preceding suite's Elements globals.
+BOOST_FIXTURE_TEST_SUITE(merkleblock_tests, BasicTestingSetup)
 
 /**
  * Create a CMerkleBlock using a list of txids which will be found in the
