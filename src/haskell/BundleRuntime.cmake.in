@@ -11,6 +11,7 @@ file(INSTALL "@proto3_suite_SOURCE_DIR@/LICENSE"
 set(system_excludes "^/usr/lib/" "^/System/" "^/lib/" "^/lib64/")
 set(system_api_excludes)
 set(runtime_directories)
+set(runtime_executables)
 if("@WIN32@")
   # The executable and its full non-system DLL closure stay together. Never
   # resolve runtime dependencies from the user's current directory or PATH.
@@ -19,13 +20,45 @@ if("@WIN32@")
   # Windows API-set contracts are provided by the OS loader, not redistributable
   # DLL files. Keep every other unresolved dependency fatal.
   set(system_api_excludes "^[Aa][Pp][Ii]-[Mm][Ss]-[Ww][Ii][Nn]-" "^[Ee][Xx][Tt]-[Mm][Ss]-[Ww][Ii][Nn]-")
+  # The selected executable can import additional native libraries (notably
+  # SQLite) that the Haskell DLL does not. Resolve its closure as well.
+  foreach(component elementsd elements-cli elements-tx elements-util elements-wallet)
+    if(NOT CMAKE_INSTALL_COMPONENT OR CMAKE_INSTALL_COMPONENT STREQUAL component)
+      set(executable "@CMAKE_RUNTIME_OUTPUT_DIRECTORY@/${component}@CMAKE_EXECUTABLE_SUFFIX@")
+      if(EXISTS "${executable}")
+        list(APPEND runtime_executables "${executable}")
+      elseif(CMAKE_INSTALL_COMPONENT STREQUAL component)
+        message(FATAL_ERROR "Build the selected component before installing: ${component}")
+      endif()
+    endif()
+  endforeach()
 endif()
 file(GET_RUNTIME_DEPENDENCIES LIBRARIES "@hs_library@"
+  EXECUTABLES ${runtime_executables}
   RESOLVED_DEPENDENCIES_VAR dependencies UNRESOLVED_DEPENDENCIES_VAR unresolved
   CONFLICTING_DEPENDENCIES_PREFIX conflicts
   PRE_EXCLUDE_REGEXES ${system_api_excludes}
   POST_EXCLUDE_REGEXES ${system_excludes}
   DIRECTORIES ${runtime_directories})
+if("@WIN32@")
+  # Native test staging can leave byte-identical DLL copies beside executables.
+  # CMake calls different paths a conflict even when the bytes match. Accept
+  # only exact aliases; a differing DLL still makes the install fail closed.
+  foreach(name IN LISTS conflicts_FILENAMES)
+    set(expected_digest "")
+    set(selected "")
+    foreach(candidate IN LISTS conflicts_${name})
+      file(SHA256 "${candidate}" digest)
+      if(expected_digest AND NOT digest STREQUAL expected_digest)
+        message(FATAL_ERROR "Conflicting Windows runtime bytes: ${name}")
+      endif()
+      set(expected_digest "${digest}")
+      set(selected "${candidate}")
+    endforeach()
+    list(APPEND dependencies "${selected}")
+  endforeach()
+  set(conflicts_FILENAMES)
+endif()
 if(unresolved OR conflicts_FILENAMES)
   message(FATAL_ERROR "Unresolved/conflicting Haskell runtime dependencies: ${unresolved};${conflicts_FILENAMES}")
 endif()
