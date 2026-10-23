@@ -4449,6 +4449,43 @@ UniValue FetchDrivechainL1PegEvents(int sidechain_id)
 
 } // namespace
 
+static RPCHelpMan getdrivechaindepositdestination()
+{
+    return RPCHelpMan{"getdrivechaindepositdestination",
+        "Encode the recipient and exact Elements fee to commit in an L1 M5 deposit.\n"
+        "This does not create or broadcast a transaction. The parent transaction fee is separate.\n",
+        {
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Recipient Elements address."},
+            {"deposit_fee_sats", RPCArg::Type::NUM, RPCArg::Default{0}, "Exact Elements fee deducted from the deposit, in integer satoshis. The deposit must exceed this amount."},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::STR, "destination", "Opaque destination for the enforcer's CreateDepositTransaction address field."},
+            {RPCResult::Type::STR, "bitwindow_address", "Slot-prefixed destination for BitWindow's generic deposit-address parser."},
+            {RPCResult::Type::STR_HEX, "destination_hex", "Exact M5 destination bytes."},
+            {RPCResult::Type::NUM, "deposit_fee_sats", "Elements fee committed by these bytes."},
+            {RPCResult::Type::NUM, "sidechain_slot", "Configured sidechain slot."},
+        }},
+        RPCExamples{HelpExampleCli("getdrivechaindepositdestination", "\"<elements-address>\" 1000")},
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const auto slot = Params().GetConsensus().drivechain_slot;
+            if (!slot) throw JSONRPCError(RPC_METHOD_NOT_FOUND, "Native BIP300 deposits are not enabled on this network");
+            const auto& fee_value = request.params[1];
+            CAmount fee{0};
+            if (!fee_value.isNull() && (!fee_value.isNum() || !ParseInt64(fee_value.getValStr(), &fee)))
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "deposit_fee_sats must be an integer");
+            std::string destination;
+            try { destination = EncodeDrivechainDepositDestination(request.params[0].get_str(), fee); }
+            catch (const std::invalid_argument& e) { throw JSONRPCError(RPC_INVALID_PARAMETER, e.what()); }
+            UniValue result(UniValue::VOBJ);
+            result.pushKV("destination", destination);
+            result.pushKV("bitwindow_address", strprintf("s%u_%s", *slot, destination));
+            result.pushKV("destination_hex", HexStr(std::vector<unsigned char>(destination.begin(), destination.end())));
+            result.pushKV("deposit_fee_sats", fee);
+            result.pushKV("sidechain_slot", *slot);
+            return result;
+        }};
+}
+
 static RPCHelpMan getdrivechainpegevents()
 {
     return RPCHelpMan{"getdrivechainpegevents",
@@ -5366,6 +5403,7 @@ void RegisterBlockchainRPCCommands(CRPCTable &t)
         {"blockchain", &getecxconsensuscontext},
         {"blockchain", &getecxbondinboxentries},
         {"blockchain", &getdrivechainpegevents},
+        {"blockchain", &getdrivechaindepositdestination},
         {"blockchain", &getdrivechainwithdrawalbundle},
         {"blockchain", &verifydrivechainwithdrawalbundle},
         {"blockchain", &submitdrivechainwithdrawal},

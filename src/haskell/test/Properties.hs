@@ -2723,13 +2723,15 @@ waitProbeOrder = forAll ((,,,) <$> arbitrary <*> arbitrary <*> arbitrary <*> cho
   in commandTrace kind 2 (\phase reply -> validate (next phase reply)) script fault expected
 
 fundedSubmissionOrder :: Property
-fundedSubmissionOrder = forAll ((,,,) <$> arbitrary <*> arbitrary <*> arbitrary <*> choose (-1,3 :: Int)) $ \(template,current,submitted,fault) -> ioProperty $
+fundedSubmissionOrder = forAll ((,,,) <$> arbitrary <*> arbitrary <*> choose (0,2 :: Int64) <*> choose (-1,3 :: Int)) $ \(template,current,status,fault) -> ioProperty $
   let flag value = if value then 1 else 0
+      submitted = status == 2
       script = [(1,flag current)] ++ if template then
-        if current then [(3,flag submitted)] ++ [(4,1) | not submitted] else [(2,1)]
+        if current then [(3,status)] ++ [(4,1) | status == 0] else [(2,1)]
         else [(2,flag submitted) | current] ++ [(if submitted then 4 else 3,1) | current]
       (kind,next) = if template then (244,Bmm.TemplateCreationFlow) else (241,Bmm.FundedSubmissionFlow)
-  in commandTrace kind 4 (\phase reply -> validate (next phase reply))
+      invalid phase = if template && phase == 3 then [3,maxBound] else [2,maxBound]
+  in commandTraceWith invalid kind 4 (\phase reply -> validate (next phase reply))
        script fault (if current && submitted then 1 else 0)
 
 bidInputOrder :: Property

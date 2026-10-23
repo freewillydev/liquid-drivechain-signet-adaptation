@@ -108,6 +108,17 @@ with tempfile.TemporaryDirectory(prefix="direct-grpc-", dir=temporary_root) as d
                 assert json_format.Parse(output, response_type()) == json_format.ParseDict(response, response_type())
                 assert len(calls) == before + 1
                 print("PASS official-schema", method, flush=True)
+            # TLS must not silently fall back when the endpoint is plaintext.
+            secure_port = port
+            before = len(calls)
+            try:
+                port = plaintext_port
+                status, output = run("ValidatorService", "GetChainInfo", {})
+                assert status == 14 and output, (status, output)
+                assert len(calls) == before
+            finally:
+                port = secure_port
+            print("PASS plaintext endpoint rejected with diagnostic", flush=True)
             for behavior, expected in [("oversized", 8), ("malformed", -1), ("duplicate", 6),
                                        ("fake-duplicate", 7), ("deadline", -3), ("cancel", -2)]:
                 started = time.monotonic()
@@ -148,7 +159,8 @@ with tempfile.TemporaryDirectory(prefix="direct-grpc-", dir=temporary_root) as d
                     proxy.wait(timeout=10)
                     port = secure_port
             before = len(calls)
-            assert run("ValidatorService", "GetChainInfo", {}, "wrong-authority")[0] == 14
+            status, output = run("ValidatorService", "GetChainInfo", {}, "wrong-authority")
+            assert status == 14 and output, (status, output)
             assert len(calls) == before
             assert run("ValidatorService", "Stop", {})[0] == -1
             assert len(calls) == before
@@ -160,17 +172,20 @@ with tempfile.TemporaryDirectory(prefix="direct-grpc-", dir=temporary_root) as d
                            check=True, capture_output=True)
             ca = (certs / "ca.pem").read_bytes()
             (certs / "ca.pem").write_bytes((other / "ca.pem").read_bytes())
-            assert run("ValidatorService", "GetChainInfo", {})[0] != 0
+            status, output = run("ValidatorService", "GetChainInfo", {})
+            assert status != 0 and output, (status, output)
             assert len(calls) == before
             (certs / "ca.pem").write_bytes(ca)
             (certs / "elements-client.pem").write_bytes((other / "elements-client.pem").read_bytes())
             (certs / "elements-client-key.pem").write_bytes((other / "elements-client-key.pem").read_bytes())
-            assert run("ValidatorService", "GetChainInfo", {})[0] != 0
+            status, output = run("ValidatorService", "GetChainInfo", {})
+            assert status != 0 and output, (status, output)
             assert len(calls) == before
             (certs / "ca.pem").write_text("not a PEM certificate")
             (certs / "elements-client.pem").write_text("not a PEM certificate")
             (certs / "elements-client-key.pem").write_text("not a PEM key")
-            assert run("ValidatorService", "GetChainInfo", {})[0] != 0
+            status, output = run("ValidatorService", "GetChainInfo", {})
+            assert status != 0 and output, (status, output)
             assert len(calls) == before
             print("PASS authority and method rejection", flush=True)
         finally:

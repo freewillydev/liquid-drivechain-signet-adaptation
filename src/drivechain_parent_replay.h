@@ -106,6 +106,11 @@ public:
         DrivechainMintableDeposit& deposit,
         std::string* error) const;
 
+    /** Bounded discovery only; callers must still authenticate depth and active-chain membership. */
+    bool ListDeposits(const std::optional<Sidechain::Bitcoin::COutPoint>& after,
+        size_t limit, std::vector<DrivechainMintableDeposit>& deposits,
+        std::optional<Sidechain::Bitcoin::COutPoint>& next, std::string* error) const;
+
     DrivechainReplayStoreReadStatus ReadBmmEdge(
         const uint256& parent_hash,
         DrivechainReplayedBmmEdge& edge,

@@ -16,6 +16,8 @@
 #include <haskell/bridge.h>
 #include <haskell/bmm_constants.h>
 #include <interfaces/chain.h>
+#include <key_io.h>
+#include <pegins.h>
 #include <node/context.h>
 #include <rpc/blockchain.h>
 #include <rpc/client.h>
@@ -103,6 +105,32 @@ UniValue RPCTestingSetup::CallRPC(std::string args)
 
 
 BOOST_FIXTURE_TEST_SUITE(rpc_tests, RPCTestingSetup)
+
+BOOST_AUTO_TEST_CASE(drivechain_deposit_destination_rpc)
+{
+    auto& consensus = const_cast<Consensus::Params&>(Params().GetConsensus());
+    struct Restore {
+        Consensus::Params& consensus;
+        std::optional<uint8_t> slot;
+        ~Restore() { consensus.drivechain_slot = slot; }
+    } restore{consensus, consensus.drivechain_slot};
+    const auto address = EncodeDestination(WitnessV0KeyHash(uint160{ParseHex(std::string(40, '3'))}));
+    consensus.drivechain_slot.reset();
+    BOOST_CHECK_THROW(CallRPC("getdrivechaindepositdestination " + address), std::runtime_error);
+    consensus.drivechain_slot = 24;
+    const auto plain = CallRPC("getdrivechaindepositdestination " + address);
+    BOOST_CHECK_EQUAL(plain["destination"].get_str(), address);
+    BOOST_CHECK_EQUAL(plain["deposit_fee_sats"].getInt<int64_t>(), 0);
+    const auto paid = CallRPC("getdrivechaindepositdestination " + address + " 1000");
+    const auto payload = "dcfee1:1000:" + address;
+    BOOST_CHECK_EQUAL(paid["destination"].get_str(), payload);
+    BOOST_CHECK_EQUAL(paid["bitwindow_address"].get_str(), "s24_" + payload);
+    BOOST_CHECK_EQUAL(paid["sidechain_slot"].getInt<unsigned>(), 24);
+    BOOST_CHECK_EQUAL(paid["destination_hex"].get_str(), HexStr(std::vector<unsigned char>(payload.begin(), payload.end())));
+    for (const auto& fee : {"-1", "1.5", "1e3", "\"1000\"", "2100000000000001", "9223372036854775808"})
+        BOOST_CHECK_THROW(CallRPC("getdrivechaindepositdestination " + address + " " + fee), std::runtime_error);
+    BOOST_CHECK_THROW(CallRPC("getdrivechaindepositdestination invalid 1000"), std::runtime_error);
+}
 
 BOOST_AUTO_TEST_CASE(withdrawal_proof_error_precedence)
 {
@@ -1436,6 +1464,11 @@ BOOST_AUTO_TEST_CASE(rpc_convert_values_importdrivechaindeposit)
     BOOST_CHECK_EQUAL(named["address"].get_str(), ADDRESS);
     BOOST_CHECK_EQUAL(named["value_sats"].getInt<int64_t>(), 100000);
     BOOST_CHECK_EQUAL(named["fee_sats"].getInt<int64_t>(), 42);
+    const auto committed = RPCConvertValues("importdrivechaindeposit",
+        {TXID, "7", BLOCK_HASH, ADDRESS, "100000", "0", "1000"});
+    BOOST_CHECK_EQUAL(committed[6].getInt<int64_t>(), 1000);
+    const auto destination = RPCConvertValues("getdrivechaindepositdestination", {ADDRESS, "1000"});
+    BOOST_CHECK_EQUAL(destination[1].getInt<int64_t>(), 1000);
 }
 
 BOOST_AUTO_TEST_CASE(rpc_convert_values_native_drivechain_withdrawal)

@@ -375,6 +375,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "importdrivechaindeposit", 1, "mainchain_vout" },
     { "importdrivechaindeposit", 4, "value_sats" },
     { "importdrivechaindeposit", 5, "fee_sats" },
+    { "importdrivechaindeposit", 6, "deposit_fee_sats" },
+    { "getdrivechaindepositdestination", 1, "deposit_fee_sats" },
 
 };
 // clang-format on

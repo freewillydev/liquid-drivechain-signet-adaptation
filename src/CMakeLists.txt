@@ -348,6 +348,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/context.cpp
   node/database_args.cpp
   node/drivechain_withdrawal_journal.cpp
+  node/drivechain_deposits.cpp
   node/ecx_deployment_identity.cpp
   node/eviction.cpp
   node/interface_ui.cpp

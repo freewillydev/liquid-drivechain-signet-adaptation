@@ -549,6 +549,58 @@ bool IsDrivechainDepositPeginWitness(const CScriptWitness& pegin_witness,
     return true;
 }
 
+bool DecodeDrivechainDepositDestination(const std::string& payload, CScript& recipient, CAmount& fee)
+{
+    recipient.clear();
+    fee = 0;
+    if (payload.empty() || payload.size() > 128) return false;
+    std::string address = payload;
+    CAmount committed_fee{0};
+    if (payload.starts_with("dcfee1:")) {
+        const auto separator = payload.find(':', 7);
+        if (separator == std::string::npos) return false;
+        const auto encoded_fee = payload.substr(7, separator - 7);
+        if (!ParseInt64(encoded_fee, &committed_fee) || !MoneyRange(committed_fee) ||
+            committed_fee == 0 || std::to_string(committed_fee) != encoded_fee) return false;
+        address = payload.substr(separator + 1);
+    }
+    const auto destination = DecodeDestination(address);
+    if (!IsValidDestination(destination)) return false;
+    recipient = GetScriptForDestination(destination);
+    fee = committed_fee;
+    return true;
+}
+
+std::string EncodeDrivechainDepositDestination(const std::string& address, CAmount fee)
+{
+    if (!IsValidDestination(DecodeDestination(address)) || !MoneyRange(fee))
+        throw std::invalid_argument("invalid drivechain deposit address or fee");
+    const std::string payload = fee ? "dcfee1:" + std::to_string(fee) + ":" + address : address;
+    if (payload.size() > 128) throw std::invalid_argument("drivechain deposit destination exceeds 128 bytes");
+    return payload;
+}
+
+CTransactionRef CreateNativeDrivechainDeposit(const DrivechainMintableDeposit& deposit)
+{
+    CScript recipient;
+    CAmount fee{0};
+    if (!DecodeDrivechainDepositDestination(std::string(deposit.address.begin(), deposit.address.end()), recipient, fee) ||
+        !MoneyRange(deposit.value) || deposit.value <= fee)
+        throw std::invalid_argument("invalid native deposit destination or value");
+    CMutableTransaction tx;
+    const COutPoint outpoint(Txid::FromUint256(deposit.outpoint.hash), deposit.outpoint.n);
+    tx.vin.emplace_back(outpoint);
+    tx.vin[0].m_is_pegin = true;
+    tx.vout.emplace_back(Params().GetConsensus().pegged_asset, deposit.value - fee, recipient);
+    if (fee) tx.vout.emplace_back(Params().GetConsensus().pegged_asset, fee, CScript());
+    tx.witness.vtxinwit.resize(1);
+    tx.witness.vtxoutwit.resize(tx.vout.size());
+    tx.witness.vtxinwit[0].m_pegin_witness = CreateDrivechainDepositPeginWitness(
+        deposit.value, Params().GetConsensus().pegged_asset, Params().ParentGenesisBlockHash(),
+        CScript() << OP_TRUE, outpoint, deposit.block_hash, deposit.address);
+    return MakeTransactionRef(std::move(tx));
+}
+
 bool CheckDrivechainDepositOutputs(const CTransaction& tx, const unsigned int pegin_index, std::string& err_msg)
 {
     if (pegin_index >= tx.vin.size() || pegin_index >= tx.witness.vtxinwit.size()) {
@@ -569,8 +621,9 @@ bool CheckDrivechainDepositOutputs(const CTransaction& tx, const unsigned int pe
     const bool native = IsDrivechainDepositPeginWitness(tx.witness.vtxinwit[pegin_index].m_pegin_witness,
         tx.vin[pegin_index].prevout, &deposit_value, &claim_script, nullptr, &address_bytes);
     const std::string address(address_bytes.begin(), address_bytes.end());
-    const CTxDestination destination = DecodeDestination(address);
-    const CScript expected_script = GetScriptForDestination(destination);
+    CScript expected_script;
+    CAmount committed_fee{0};
+    const bool valid_destination = DecodeDrivechainDepositDestination(address, expected_script, committed_fee);
     for (const CTxOut& output : tx.vout) {
         outputs.push_back((output.scriptPubKey == expected_script) |
             ((output.nAsset.IsExplicit() && output.nAsset.GetAsset() == Params().GetConsensus().pegged_asset) << 1) |
@@ -578,8 +631,31 @@ bool CheckDrivechainDepositOutputs(const CTransaction& tx, const unsigned int pe
         amounts.push_back(output.nValue.IsExplicit() ? output.nValue.GetAmount() : 0);
     }
     const uint32_t facts = !tx.vin[pegin_index].assetIssuance.IsNull() | (native << 1) |
-        ((claim_script == (CScript() << OP_TRUE)) << 2) | (IsValidDestination(destination) << 3);
-    return drivechain::haskell::DepositOutputs(facts, deposit_value, inputs, outputs, amounts, err_msg);
+        ((claim_script == (CScript() << OP_TRUE)) << 2) | (valid_destination << 3);
+    if (committed_fee > 0 && committed_fee >= deposit_value) {
+        err_msg = "Committed Elements fee must be less than the authenticated deposit value.";
+        return false;
+    }
+    if (!drivechain::haskell::DepositOutputs(facts, deposit_value - committed_fee, inputs, outputs, amounts, err_msg)) return false;
+    if (!committed_fee) return true;
+
+    // Reuse the existing exact one-credit/one-fee Haskell validator. The first
+    // check fixes the net credit; conservation then fixes the fee to the L1
+    // commitment. No sponsor inputs, redirected change or extra outputs exist.
+    std::array<unsigned char, 2> flags{};
+    std::array<int64_t, 2> values{};
+    for (size_t i = 0; i < std::min(tx.vout.size(), flags.size()); ++i) {
+        const auto& output = tx.vout[i];
+        flags[i] = ((outputs[i] & 2) != 0) | (output.nValue.IsExplicit() << 1) |
+            (output.nNonce.IsNull() << 2) | (output.scriptPubKey.empty() << 3) |
+            ((output.scriptPubKey == expected_script) << 4);
+        values[i] = amounts[i];
+    }
+    const uint32_t input_facts = tx.vin[pegin_index].m_is_pegin | (1 << 1) |
+        (tx.vin[pegin_index].scriptSig.empty() << 2) | (tx.vin[pegin_index].assetIssuance.IsNull() << 3) |
+        (native << 4) | (1 << 5) | ((claim_script == (CScript() << OP_TRUE)) << 6);
+    return drivechain::haskell::AuthenticatedDeposit(tx.vin.size(), pegin_index, tx.witness.vtxinwit.size(),
+        input_facts, deposit_value, deposit_value, tx.vout.size(), flags, values, err_msg);
 }
 
 bool IsCanonicalFeeFreeDrivechainDeposit(const CTransaction& tx)

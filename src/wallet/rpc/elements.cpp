@@ -1615,7 +1615,7 @@ static UniValue FinishDrivechainDeposit(CWallet& wallet, const CTransactionRef& 
     }
     ret.pushKV("address", address);
     ret.pushKV("amount", ValueFromAmount(amount));
-    ret.pushKV("value_sats", deposit_amount);
+    ret.pushKV("value_sats", amount);
     ret.pushKV("deposit_value_sats", deposit_amount);
     ret.pushKV("fee_sats", fee_sats);
     ret.pushKV("hex", tx_hex);
@@ -1636,7 +1636,8 @@ static RPCHelpMan importdrivechaindeposit_native()
                     {"mainchain_block_hash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The mainchain block containing the BIP300 deposit event."},
                     {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The Elements address committed by the BIP300 deposit."},
                     {"value_sats", RPCArg::Type::NUM, RPCArg::Optional::NO, "The exact deposit value in satoshis."},
-                    {"fee_sats", RPCArg::Type::NUM, RPCArg::Default{0}, "Maximum optional sidechain network fee sponsored by this wallet without reducing the credited deposit."},
+                    {"fee_sats", RPCArg::Type::NUM, RPCArg::Default{0}, "Maximum optional fee sponsored by this wallet for an address-only deposit. Cannot be combined with deposit_fee_sats."},
+                    {"deposit_fee_sats", RPCArg::Type::NUM, RPCArg::Default{0}, "Exact Elements fee committed in the L1 deposit destination, deducted from value_sats. Use getdrivechaindepositdestination before creating the L1 deposit. Cannot alter an existing deposit's fee."},
                 },
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
@@ -1649,7 +1650,7 @@ static RPCHelpMan importdrivechaindeposit_native()
                         {RPCResult::Type::STR_AMOUNT, "amount", "The credited amount in pegged asset units."},
                         {RPCResult::Type::NUM, "value_sats", "The credited amount in satoshis."},
                         {RPCResult::Type::NUM, "deposit_value_sats", "The deposit input value in satoshis."},
-                        {RPCResult::Type::NUM, "fee_sats", "The actual sidechain network fee sponsored by this wallet."},
+                        {RPCResult::Type::NUM, "fee_sats", "The actual Elements fee, either wallet-sponsored or committed in the L1 deposit."},
                         {RPCResult::Type::STR_HEX, "hex", "The sidechain transaction hex."},
                         {RPCResult::Type::BOOL, "already_imported", "Whether this sidechain deposit transaction was already known."},
                         {RPCResult::Type::BOOL, "broadcast", "Whether the transaction was broadcast by this call."},
@@ -1687,18 +1688,25 @@ static RPCHelpMan importdrivechaindeposit_native()
     wallet::CheckDepositArgument(wallet::DepositArgument::NATIVE_VALUE, value_sats);
     const int64_t max_fee_sats = wallet::ParseDrivechainSatoshis(request.params[5], "fee_sats", 0);
     wallet::CheckDepositArgument(wallet::DepositArgument::NATIVE_FEE, max_fee_sats);
+    const int64_t deposit_fee_sats = wallet::ParseDrivechainSatoshis(request.params[6], "deposit_fee_sats", 0);
+    wallet::CheckDepositArgument(wallet::DepositArgument::HISTORICAL_FEE, deposit_fee_sats, value_sats);
+    if (deposit_fee_sats && max_fee_sats)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Choose a committed deposit fee or a sponsored fee, not both");
     const CAmount deposit_amount = value_sats;
-    const CAmount amount = deposit_amount;
+    const CAmount amount = deposit_amount - deposit_fee_sats;
 
     const uint256 mainchain_txid = uint256S(mainchain_txid_str);
     const uint256 mainchain_block_hash = uint256S(mainchain_block_hash_str);
     const COutPoint mainchain_outpoint(Txid::FromUint256(mainchain_txid), static_cast<uint32_t>(mainchain_vout));
-    const std::vector<unsigned char> address_bytes(address.begin(), address.end());
+    std::string committed_destination;
+    try { committed_destination = EncodeDrivechainDepositDestination(address, deposit_fee_sats); }
+    catch (const std::invalid_argument& e) { throw JSONRPCError(RPC_INVALID_PARAMETER, e.what()); }
+    const std::vector<unsigned char> address_bytes(committed_destination.begin(), committed_destination.end());
     const CBlockIndex* active_tip = pwallet->chain().getTip();
     std::string deposit_error;
     CMutableTransaction mtx;
     CTransactionRef tx_ref;
-    CAmount fee_sats{0};
+    CAmount fee_sats{deposit_fee_sats};
     drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::DEPOSIT_NATIVE_IMPORT,
         [&](uint32_t stage) -> uint32_t {
         switch (stage) {
@@ -1712,20 +1720,9 @@ static RPCHelpMan importdrivechaindeposit_native()
         case 2:
             throw JSONRPCError(RPC_VERIFY_REJECTED, strprintf("BIP300 deposit validation failed: %s", deposit_error));
         case 3: {
-            CTxIn pegin_input(mainchain_outpoint, CScript(), CTxIn::SEQUENCE_FINAL);
-            pegin_input.m_is_pegin = true;
-            mtx.vin.push_back(pegin_input);
-            mtx.vout.push_back(CTxOut(Params().GetConsensus().pegged_asset, amount, GetScriptForDestination(dest)));
-            mtx.witness.vtxinwit.resize(1);
-            mtx.witness.vtxoutwit.resize(mtx.vout.size());
-            mtx.witness.vtxinwit[0].m_pegin_witness = CreateDrivechainDepositPeginWitness(
-                deposit_amount,
-                Params().GetConsensus().pegged_asset,
-                Params().ParentGenesisBlockHash(),
-                CScript() << OP_TRUE,
-                mainchain_outpoint,
-                mainchain_block_hash,
-                address_bytes);
+            mtx = CMutableTransaction{*CreateNativeDrivechainDeposit({
+                Sidechain::Bitcoin::COutPoint(mainchain_outpoint.hash, mainchain_outpoint.n),
+                mainchain_block_hash, 0, deposit_amount, address_bytes})};
             return 1;
         }
         case 4: return drivechain::haskell::DepositPreflight(2, max_fee_sats, 0);

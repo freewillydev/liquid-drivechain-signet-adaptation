@@ -107,7 +107,7 @@ set_target_properties(elements_haskell PROPERTIES POSITION_INDEPENDENT_CODE ON O
 add_dependencies(elements_haskell elements_haskell_build)
 target_include_directories(elements_haskell PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_include_directories(elements_haskell SYSTEM PRIVATE ${rts_includes})
-target_link_libraries(elements_haskell PUBLIC elements_haskell_runtime elements_utreexo PRIVATE core_interface)
+target_link_libraries(elements_haskell PUBLIC elements_haskell_runtime elements_utreexo PRIVATE core_interface bitcoin_consensus bitcoin_util)
 if(BUILD_TESTS)
   add_test(NAME haskell_cabal_version COMMAND "${CMAKE_COMMAND}"
     "-DTEST_TMP=${CMAKE_CURRENT_BINARY_DIR}/cabal-version-test"

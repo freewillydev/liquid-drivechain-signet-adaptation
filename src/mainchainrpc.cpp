@@ -2292,6 +2292,29 @@ DrivechainDepositStatus GetConfirmedDrivechainDepositStatus(
     }
 }
 
+bool ListDrivechainDepositCandidates(const std::optional<Bitcoin::COutPoint>& after,
+    int child_height, std::vector<DrivechainMintableDeposit>& deposits,
+    std::optional<Bitcoin::COutPoint>& next, std::string* error)
+{
+    deposits.clear();
+    next.reset();
+    std::unique_lock<std::mutex> lock(g_drivechain_parent_replay_mutex, std::try_to_lock);
+    const auto& cache = g_drivechain_parent_replay_cache;
+    if (!lock.owns_lock() || !ReplayCacheMatchesConfiguredIdentity(cache, Params().GetConsensus()) ||
+        !g_drivechain_parent_replay_store)
+        return SetError(error, "authenticated parent deposit index is unavailable");
+    if (!RequireConfiguredElementsProposalActive(cache, cache.height, error)) return false;
+    std::vector<DrivechainMintableDeposit> page;
+    if (!g_drivechain_parent_replay_store->ListDeposits(after, 64, page, next, error)) return false;
+    const auto depth = drivechain::haskell::RequiredPeginDepth(GetDrivechainPeginConfirmationDepth(Params(), child_height));
+    for (auto& deposit : page) {
+        if (deposit.block_height >= cache.state.required_activation_height &&
+            HasRequiredDrivechainDepositDepth(deposit.block_height, cache.height, depth))
+            deposits.push_back(std::move(deposit));
+    }
+    return true;
+}
+
 bool IsConfirmedDrivechainDeposit(const uint256& mainchain_block_hash,
                                   const int sidechain_slot,
                                   const COutPoint& outpoint,

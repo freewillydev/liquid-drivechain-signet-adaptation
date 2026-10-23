@@ -28,7 +28,8 @@ methods can change state or spend funds. Listing a method is not advice to execu
 
 | RPC | Purpose and important limits |
 | --- | --- |
-| `importdrivechaindeposit` | Wallet call constructing a deposit claim. Native Drivechain arguments are `mainchain_txid mainchain_vout mainchain_block_hash address value_sats (fee_sats)`. Verifies exact deposit evidence, activation and confirmation depth using authenticated parent replay. Optional fees are wallet-sponsored, not deducted from the native deposit. Historical ECX routing has a different signature; consult the selected network's help. |
+| `importdrivechaindeposit` | Wallet call constructing a deposit claim. Native arguments are `mainchain_txid mainchain_vout mainchain_block_hash address value_sats (fee_sats deposit_fee_sats)`. Verifies exact deposit evidence, activation and confirmation depth using authenticated parent replay. `fee_sats` remains wallet-sponsored; `deposit_fee_sats` must exactly match the fee committed in the L1 destination and is deducted from the credit. Cannot combine both. Existing address-only deposits remain fee-free. Historical ECX routing has a different signature; consult the selected network's help. |
+| `getdrivechaindepositdestination` | Encodes an Elements recipient and exact fee into the opaque L1 M5 destination, with optional BitWindow slot prefix in the result. Does not sign or broadcast. Requires native Drivechain mode. Use before funding, and upgrade validators before using nonzero committed fees. |
 | `sendtomainchain` | Wallet peg-out entry point. Behavior depends on the configured network and peg-out policy; does not imply immediate L1 payout. |
 | `getdrivechainpegevents` | Scans active-chain peg events. Optional `include_l1` queries the enforcer's `GetTwoWayPegData`; this is not the native deposit-validation authority. |
 | `getdrivechainwithdrawalbundle` | Derives a canonical blinded M6 from a confirmed native pegged-asset burn. Does not submit it. |
@@ -69,7 +70,7 @@ in their registered categories for completeness.
 `getblockchaininfo`, `getblockcount`, `getblockfilter`, `getblockfrompeer`,
 `getblockhash`, `getblockheader`, `getblockstats`, `getbmmconsensuscontext`,
 `getchainstates`, `getchaintips`, `getchaintxstats`, `getdeploymentinfo`,
-`getdescriptoractivity`, `getdifficulty`, `getdrivechainpegevents`,
+`getdescriptoractivity`, `getdifficulty`, `getdrivechaindepositdestination`, `getdrivechainpegevents`,
 `getdrivechainwithdrawalbundle`, `getecxbondinboxentries`,
 `getecxconsensuscontext`, `getecxstateutxoroot`, `getmempoolancestors`,
 `getmempooldescendants`, `getmempoolentry`, `getmempoolinfo`, `getrawmempool`,

@@ -64,7 +64,7 @@ def generate():
             signature = f'{ret}(' + ', '.join(ctype(t) for t in args) + ')'
             cpp += [f'static constexpr elements_abi::Binding<{export}, {opcode}, {signature}> {symbol}{{}};']
     cpp += ['static constexpr std::array elements_hs_domains_v1{',
-            ',\n'.join(f'    std::pair{{elements_hs_{domain}_api_v1, elements_hs_{domain}_operation_count_v1}}' for domain in domains), '};']
+            ',\n'.join(f'    std::pair{{&elements_hs_{domain}_api_v1, elements_hs_{domain}_operation_count_v1}}' for domain in domains), '};']
     return {'DomainABI.hs': '\n'.join(hs), 'domain_abi.h': '\n'.join(cpp)}
 
 

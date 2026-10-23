@@ -1060,7 +1060,7 @@ BOOST_AUTO_TEST_CASE(deposit_codec_dispatch_keeps_native_and_ecx_state_separate)
     BOOST_CHECK(IsDrivechainDepositPeginWitness(native, outpoint, &classified_value));
     BOOST_CHECK_EQUAL(classified_value, 2'000);
     BOOST_CHECK(!IsEcxDrivechainDepositPeginWitness(native, outpoint));
-    BOOST_CHECK(GetPeginSpentKey(native, outpoint) == std::make_pair(outpoint.hash, outpoint));
+    BOOST_CHECK(GetPeginSpentKey(native, outpoint) == std::make_pair(outpoint.hash.ToUint256(), outpoint));
 
     for (size_t length : {size_t{0}, size_t{100}, size_t{101}}) {
         CScriptWitness altered = native;

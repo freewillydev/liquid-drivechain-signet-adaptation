@@ -5,5 +5,5 @@ with-compiler: @ELEMENTS_GHC@
 index-state: 2026-10-18T12:24:19Z
 tests: False
 jobs: 1
-extra-include-dirs: "@ELEMENTS_GRPC_INCLUDE@"
+extra-include-dirs: "@ELEMENTS_GRPC_INCLUDE@" "@ELEMENTS_GRPC_CPP_INCLUDE@"
 extra-lib-dirs: "@ELEMENTS_GRPC_LIBDIR@"

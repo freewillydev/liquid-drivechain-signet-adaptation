@@ -4429,6 +4429,132 @@ BOOST_AUTO_TEST_CASE(drivechain_activation_block_deposit_is_mintable)
     BOOST_CHECK_EQUAL(deposits[0].block_height, activation_height);
 }
 
+BOOST_AUTO_TEST_CASE(native_deposit_fee_destination_codec)
+{
+    const auto address = EncodeDestination(WitnessV0KeyHash(uint160{ParseHex(std::string(40, '1'))}));
+    const auto expected = GetScriptForDestination(DecodeDestination(address));
+    for (const CAmount fee : {CAmount{0}, CAmount{1}, CAmount{1000}, MAX_MONEY}) {
+        const auto payload = EncodeDrivechainDepositDestination(address, fee);
+        CScript script;
+        CAmount decoded{-1};
+        BOOST_REQUIRE(DecodeDrivechainDepositDestination(payload, script, decoded));
+        BOOST_CHECK(script == expected);
+        BOOST_CHECK_EQUAL(decoded, fee);
+        if (!fee) BOOST_CHECK_EQUAL(payload, address);
+    }
+    for (const auto& prefix : {"dcfee1:0:", "dcfee1:01:", "dcfee1:+1:", "dcfee1:-1:",
+             "dcfee1: 1:", "dcfee1:1.0:", "dcfee1:2100000000000001:",
+             "dcfee1:9223372036854775808:", "dcfee2:1000:", "dcfee1::"}) {
+        CScript script;
+        CAmount fee{42};
+        BOOST_CHECK(!DecodeDrivechainDepositDestination(std::string(prefix) + address, script, fee));
+        BOOST_CHECK(script.empty());
+        BOOST_CHECK_EQUAL(fee, 0);
+    }
+    CScript script;
+    CAmount fee{0};
+    BOOST_CHECK(!DecodeDrivechainDepositDestination("dcfee1:1:not-an-address", script, fee));
+    BOOST_CHECK(!DecodeDrivechainDepositDestination(std::string(129, 'x'), script, fee));
+    BOOST_CHECK_THROW(EncodeDrivechainDepositDestination(address, -1), std::invalid_argument);
+    BOOST_CHECK_THROW(EncodeDrivechainDepositDestination(address, MAX_MONEY + 1), std::invalid_argument);
+}
+
+BOOST_AUTO_TEST_CASE(native_deposit_committed_fee_outputs)
+{
+    const auto address = EncodeDestination(WitnessV0KeyHash(uint160{ParseHex(std::string(40, '2'))}));
+    const auto payload = EncodeDrivechainDepositDestination(address, 1000);
+    const DrivechainMintableDeposit deposit{Bitcoin::COutPoint(uint256S("dd"), 2), uint256S("ee"),
+        1, 100000, {payload.begin(), payload.end()}};
+    const auto tx = CreateNativeDrivechainDeposit(deposit);
+    std::string error;
+    BOOST_REQUIRE(CheckDrivechainDepositOutputs(*tx, 0, error));
+    BOOST_CHECK_EQUAL(tx->vout[0].nValue.GetAmount(), 99000);
+    BOOST_CHECK_EQUAL(tx->vout[1].nValue.GetAmount(), 1000);
+    BOOST_CHECK(tx->vout[1].IsFee());
+    BOOST_CHECK(!IsCanonicalFeeFreeDrivechainDeposit(*tx));
+    const auto key = GetPeginSpentKey(tx->witness.vtxinwit[0].m_pegin_witness, tx->vin[0].prevout);
+    for (unsigned mutation = 0; mutation < 13; ++mutation) {
+        CMutableTransaction changed(*tx);
+        switch (mutation) {
+        case 0: changed.vout[0].nValue = CConfidentialValue(98999); changed.vout[1].nValue = CConfidentialValue(1001); break;
+        case 1: changed.vout[0].nValue = CConfidentialValue(99001); changed.vout[1].nValue = CConfidentialValue(999); break;
+        case 2: changed.vout[1].nValue = CConfidentialValue(999); break;
+        case 3: changed.vout[1].nValue = CConfidentialValue(1001); break;
+        case 4: changed.vout[0].scriptPubKey = CScript() << OP_TRUE; break;
+        case 5: changed.vout[1].scriptPubKey = CScript() << OP_TRUE; break;
+        case 6: changed.vout.push_back(changed.vout[1]); break;
+        case 7: changed.vout.pop_back(); break;
+        case 8: changed.vin.emplace_back(COutPoint(Txid::FromUint256(uint256S("cc")), 0)); changed.witness.vtxinwit.resize(2); break;
+        case 9: changed.vout[1].nAsset = CConfidentialAsset(CAsset(uint256S("aa"))); break;
+        case 10: changed.vout[1].nValue.vchCommitment.assign(33, 8); break;
+        case 11: changed.vout[1].nNonce.vchCommitment.assign(33, 2); break;
+        case 12: changed.witness.vtxinwit[0].m_pegin_witness.stack[7] = {address.begin(), address.end()}; break;
+        }
+        changed.witness.vtxoutwit.resize(changed.vout.size());
+        BOOST_CHECK_MESSAGE(!CheckDrivechainDepositOutputs(CTransaction(changed), 0, error), mutation);
+        BOOST_CHECK(GetPeginSpentKey(changed.witness.vtxinwit[0].m_pegin_witness, changed.vin[0].prevout) == key);
+    }
+    CMutableTransaction reordered(*tx);
+    std::swap(reordered.vout[0], reordered.vout[1]);
+    BOOST_CHECK(CheckDrivechainDepositOutputs(CTransaction(reordered), 0, error));
+    auto too_small = deposit;
+    too_small.value = 1000;
+    BOOST_CHECK_THROW(CreateNativeDrivechainDeposit(too_small), std::invalid_argument);
+    auto legacy = deposit;
+    legacy.address = {address.begin(), address.end()};
+    const auto free_tx = CreateNativeDrivechainDeposit(legacy);
+    BOOST_CHECK(IsCanonicalFeeFreeDrivechainDeposit(*free_tx));
+    BOOST_CHECK_EQUAL(free_tx->vout[0].nValue.GetAmount(), deposit.value);
+    BOOST_CHECK(GetPeginSpentKey(free_tx->witness.vtxinwit[0].m_pegin_witness, free_tx->vin[0].prevout) == key);
+}
+
+BOOST_AUTO_TEST_CASE(parent_deposit_scan_paging_restart_and_corruption)
+{
+    const auto path = m_args.GetDataDirBase() / "deposit_scan";
+    const auto id = uint256S("01");
+    DrivechainParentReplayTip tip;
+    tip.hash = uint256S("02");
+    std::string error;
+    {
+        DrivechainParentReplayStore store(path, 1 << 20, true);
+        BOOST_REQUIRE(store.Reset(id, tip, &error));
+    }
+    std::vector<DrivechainMintableDeposit> records;
+    // Exercise the on-disk reader with bounded synthetic records, not an
+    // authenticated parent-chain or minting fixture.
+    {
+        CDBWrapper db(DBParams{.path=path, .cache_bytes=1 << 20});
+        for (unsigned i = 1; i <= 3; ++i) {
+            auto record = DrivechainMintableDeposit{Bitcoin::COutPoint(uint256S(strprintf("%02x", i)), 0),
+                uint256S("03"), 1, 1000, {'x'}};
+            records.push_back(record);
+            db.Write(std::make_pair(drivechain::DB_REPLAY_DEPOSIT, record.outpoint), record);
+        }
+    }
+    std::optional<Bitcoin::COutPoint> cursor;
+    std::vector<DrivechainMintableDeposit> page;
+    for (unsigned i = 0; i < 3; ++i) {
+        DrivechainParentReplayStore reopened(path, 1 << 20, false);
+        std::optional<Bitcoin::COutPoint> next;
+        BOOST_REQUIRE(reopened.ListDeposits(cursor, 1, page, next, &error));
+        BOOST_REQUIRE_EQUAL(page.size(), 1U);
+        BOOST_CHECK(page[0].outpoint == records[i].outpoint);
+        BOOST_CHECK_EQUAL(next.has_value(), i < 2);
+        cursor = next;
+    }
+    {
+        CDBWrapper db(DBParams{.path=path, .cache_bytes=1 << 20});
+        auto bad = records[1]; bad.value = -1;
+        db.Write(std::make_pair(drivechain::DB_REPLAY_DEPOSIT, bad.outpoint), bad);
+    }
+    DrivechainParentReplayStore reopened(path, 1 << 20, false);
+    BOOST_CHECK(!reopened.ListDeposits({}, 64, page, cursor, &error));
+    BOOST_CHECK(page.empty());
+    BOOST_CHECK(!cursor);
+    BOOST_CHECK(!reopened.ListDeposits({}, 0, page, cursor, &error));
+    BOOST_CHECK(!reopened.ListDeposits({}, 65, page, cursor, &error));
+}
+
 BOOST_AUTO_TEST_CASE(drivechain_deposit_outputs_are_bound_to_mainchain_address)
 {
     const COutPoint deposit_outpoint(

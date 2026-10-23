@@ -284,20 +284,20 @@ static constexpr elements_abi::Binding<elements_hs_exchange_api_v1, 5, int32_t(u
 static constexpr elements_abi::Binding<elements_hs_exchange_api_v1, 6, int32_t(uint32_t, uint8_t*, uint64_t, uint8_t*, uint8_t*, uint8_t*, uint32_t, HsFunPtr)> elements_hs_parse_groth16_v1{};
 static constexpr elements_abi::Binding<elements_hs_exchange_api_v1, 7, int32_t(uint32_t, uint64_t)> elements_hs_jet_height_v1{};
 static constexpr std::array elements_hs_domains_v1{
-    std::pair{elements_hs_configuration_api_v1, elements_hs_configuration_operation_count_v1},
-    std::pair{elements_hs_usdd_api_v1, elements_hs_usdd_operation_count_v1},
-    std::pair{elements_hs_exchange_codec_api_v1, elements_hs_exchange_codec_operation_count_v1},
-    std::pair{elements_hs_exchange_state_api_v1, elements_hs_exchange_state_operation_count_v1},
-    std::pair{elements_hs_exchange_admission_api_v1, elements_hs_exchange_admission_operation_count_v1},
-    std::pair{elements_hs_parent_replay_api_v1, elements_hs_parent_replay_operation_count_v1},
-    std::pair{elements_hs_bmm_proof_api_v1, elements_hs_bmm_proof_operation_count_v1},
-    std::pair{elements_hs_bmm_codec_api_v1, elements_hs_bmm_codec_operation_count_v1},
-    std::pair{elements_hs_bmm_state_api_v1, elements_hs_bmm_state_operation_count_v1},
-    std::pair{elements_hs_deposit_state_api_v1, elements_hs_deposit_state_operation_count_v1},
-    std::pair{elements_hs_withdrawal_api_v1, elements_hs_withdrawal_operation_count_v1},
-    std::pair{elements_hs_deposit_evidence_api_v1, elements_hs_deposit_evidence_operation_count_v1},
-    std::pair{elements_hs_script_policy_api_v1, elements_hs_script_policy_operation_count_v1},
-    std::pair{elements_hs_deposit_api_v1, elements_hs_deposit_operation_count_v1},
-    std::pair{elements_hs_bmm_api_v1, elements_hs_bmm_operation_count_v1},
-    std::pair{elements_hs_exchange_api_v1, elements_hs_exchange_operation_count_v1}
+    std::pair{&elements_hs_configuration_api_v1, elements_hs_configuration_operation_count_v1},
+    std::pair{&elements_hs_usdd_api_v1, elements_hs_usdd_operation_count_v1},
+    std::pair{&elements_hs_exchange_codec_api_v1, elements_hs_exchange_codec_operation_count_v1},
+    std::pair{&elements_hs_exchange_state_api_v1, elements_hs_exchange_state_operation_count_v1},
+    std::pair{&elements_hs_exchange_admission_api_v1, elements_hs_exchange_admission_operation_count_v1},
+    std::pair{&elements_hs_parent_replay_api_v1, elements_hs_parent_replay_operation_count_v1},
+    std::pair{&elements_hs_bmm_proof_api_v1, elements_hs_bmm_proof_operation_count_v1},
+    std::pair{&elements_hs_bmm_codec_api_v1, elements_hs_bmm_codec_operation_count_v1},
+    std::pair{&elements_hs_bmm_state_api_v1, elements_hs_bmm_state_operation_count_v1},
+    std::pair{&elements_hs_deposit_state_api_v1, elements_hs_deposit_state_operation_count_v1},
+    std::pair{&elements_hs_withdrawal_api_v1, elements_hs_withdrawal_operation_count_v1},
+    std::pair{&elements_hs_deposit_evidence_api_v1, elements_hs_deposit_evidence_operation_count_v1},
+    std::pair{&elements_hs_script_policy_api_v1, elements_hs_script_policy_operation_count_v1},
+    std::pair{&elements_hs_deposit_api_v1, elements_hs_deposit_operation_count_v1},
+    std::pair{&elements_hs_bmm_api_v1, elements_hs_bmm_operation_count_v1},
+    std::pair{&elements_hs_exchange_api_v1, elements_hs_exchange_operation_count_v1}
 };

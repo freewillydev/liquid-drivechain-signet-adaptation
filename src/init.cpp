@@ -61,6 +61,7 @@
 #include <node/chainstate.h>
 #include <node/chainstatemanager_args.h>
 #include <node/context.h>
+#include <node/drivechain_deposits.h>
 #include <node/drivechain_withdrawal_bundle.h>
 #include <node/ecx_deployment_identity.h>
 #include <node/interface_ui.h>
@@ -853,7 +854,12 @@ static std::unique_ptr<CBlockTemplate> CreateDrivechainBlockTemplate(NodeContext
         options.commit_scripts = commitments;
         options.authenticated_parent_height = authenticated_parent_height;
         result = BlockAssembler(node.chainman->ActiveChainstate(),node.mempool.get(),options).CreateNewBlock();
-        return bool(result);
+        if (!result) return 0;
+        if (result->block.vtx.size() > 1) return 2;
+        // Only pay for transactions actually selected, not just a nonempty mempool.
+        LogDebug(BCLog::MEMPOOL, "drivechain L1 block sync: idle; no mempool transactions selected for a block\n");
+        result.reset();
+        return 1;
     }
     case 4: LogPrintf("drivechain L1 block sync: failed to create sidechain block template for parent height %d\n",parent_height); break;
     default: throw std::logic_error("invalid template creation action");
@@ -1804,7 +1810,8 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-mainchainrpccookiefile=<file>", "Cookie for the fully validating parent node. Relative paths resolve under Bitcoin's data directory. Native Elements uses the frozen mainnet-ancestry parent (default: .cookie), not historical LayerTwoLabs Signet.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpccredentialfile=<file>", "Explicit absolute path to an owner-only POSIX username:password file for a numeric-loopback parent RPC bridge. Mutually exclusive with cookie and inline credential options. Never interprets static credentials as a rotating cookie.", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpctimeout=<n>", strprintf("Timeout in seconds during mainchain RPC requests, or 0 for no timeout. Native drivechain validation requires 1..2 seconds because these requests may run on consensus paths. (ordinary-network default: %d; drivechain default: 2)", DEFAULT_HTTP_CLIENT_TIMEOUT), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-drivechainl1blocksync", "Mine one sidechain block for every observed parent-chain block using the mainchain RPC connection. Each sidechain block commits to the matching parent block hash. Use -drivechainl1blocksync=0 to disable. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainl1blocksync", "Automatically bid for sidechain blocks containing selected mempool transactions using the mainchain RPC connection. Empty candidates do not trigger bids; already-submitted bids continue waiting for inclusion. Use -drivechainl1blocksync=0 to disable. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-drivechainautodeposit", "Automatically import confirmed native sidechain deposits for all recipients, including external wallets. Fee-free unless L1 explicitly commits an Elements fee; no spending keys required. Uses the authenticated parent index every 30 seconds, independently of block bidding. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainl1blocksyncinterval=<n>", "How often, in seconds, to poll the parent chain when -drivechainl1blocksync is enabled. (default: 10)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmslot=<n>", "Deprecated compatibility setting; accepted only when it exactly matches the selected network's immutable BIP300/301 slot.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainbmmbid=<sats>", strprintf("Minimum positive BIP301 bid, in satoshis, paid by the explicit parent RPC wallet. The submitted bid is max(this value, candidate fees) and is liveness policy, not sidechain consensus evidence. (default: %d)", DEFAULT_DRIVECHAIN_BMM_BID), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
@@ -3607,8 +3614,10 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     //     no further blocks arriving for us to validate.
     // Unfortunately, this unusual case happens in the functional test suite.
     ChainstateManager* pchainman = node.chainman.get();
-    node.reverification_scheduler->scheduleEvery([pchainman, native_drivechain] {
+    node.reverification_scheduler->scheduleEvery([pchainman, native_drivechain, &node,
+        deposit_cursor = std::optional<Sidechain::Bitcoin::COutPoint>{}]() mutable {
         PeriodicChainstateReverification(*pchainman, native_drivechain);
+        if (native_drivechain) node::AutoImportDrivechainDeposits(node, deposit_cursor);
     }, std::chrono::seconds{30});
 
     uiInterface.InitMessage(_("Done loading"));

@@ -326,6 +326,13 @@ struct DrivechainMintableDeposit {
     }
 };
 
+/** Discover mature candidates from the local authenticated index, without doing parent RPC.
+ * Discovery does not authorize minting: normal transaction validation remains mandatory.
+ */
+bool ListDrivechainDepositCandidates(const std::optional<Sidechain::Bitcoin::COutPoint>& after,
+    int child_height, std::vector<DrivechainMintableDeposit>& deposits,
+    std::optional<Sidechain::Bitcoin::COutPoint>& next, std::string* error);
+
 /** One authenticated active-parent P -> Q edge derived during replay. */
 struct DrivechainReplayedBmmEdge {
     uint256 successor_hash;
@@ -413,7 +420,10 @@ bool ValidateDrivechainGrpcTLSConfig(
     const ArgsManager& args,
     std::string* error = nullptr);
 
-/** Call an allowlisted enforcer method through the linked Haskell mTLS client. */
+/** Call an allowlisted enforcer method through the linked Haskell mTLS client.
+ * Canonical gRPC status codes (including TLS rejection) use exit_code and output;
+ * negative local failures use error. Interpret both with ClassifyDrivechainGrpcResult.
+ */
 BoundedCommandResult RunAuthenticatedDrivechainGrpc(
     const ArgsManager& args,
     const std::string& method,

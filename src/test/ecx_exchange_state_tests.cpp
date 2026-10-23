@@ -3177,8 +3177,8 @@ BOOST_AUTO_TEST_CASE(haskell_capital_admission_short_circuit_facts)
             [&] { ++reads; return annex[7]==version; }}),annex.size()>7 && annex[7]==version);
         BOOST_CHECK_EQUAL(reads,size>7 ? 1U : 0U);
     }
-    for (bool empty : {false,true}) for (uint64_t forced : {0ULL,1ULL,UINT64_MAX})
-    for (uint64_t deposits : {0ULL,1ULL,UINT64_MAX}) {
+    for (bool empty : {false,true}) for (uint64_t forced : std::array<uint64_t,3>{0,1,UINT64_MAX})
+    for (uint64_t deposits : std::array<uint64_t,3>{0,1,UINT64_MAX}) {
         BOOST_CHECK_EQUAL(hs::ParentReplayAll<3>({[&] { return empty; },
             [&] { return forced==0; }, [&] { return deposits==0; }}),empty && forced==0 && deposits==0);
     }

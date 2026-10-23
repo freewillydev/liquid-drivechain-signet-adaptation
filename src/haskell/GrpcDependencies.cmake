@@ -2,6 +2,7 @@
 # ELEMENTS_CABAL is selected and checked before dependency downloads.
 find_program(ELEMENTS_PATCH patch REQUIRED)
 find_path(ELEMENTS_GRPC_INCLUDE grpc/grpc.h REQUIRED)
+find_path(ELEMENTS_GRPC_CPP_INCLUDE grpcpp/version_info.h REQUIRED)
 find_library(ELEMENTS_GRPC_LIBRARY grpc REQUIRED)
 get_filename_component(ELEMENTS_GRPC_LIBDIR "${ELEMENTS_GRPC_LIBRARY}" DIRECTORY)
 find_path(ELEMENTS_PROTO_INCLUDE google/protobuf/wrappers.proto REQUIRED)

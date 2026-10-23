@@ -5714,8 +5714,12 @@ outside the probe. Tests cover direct/ABI traces, callback faults and nested
 execution inside BmmWait without making live RPC calls.
 
 `Bmm.TemplateCreationFlow` (244, bound 4) admits the wallet reward destination
-before constructing assembler options or a block template. Failure reporting
-is selected in Haskell. Native options remain alive through reporting, while
+before constructing assembler options or a block template. Template status is
+0 (unavailable), 1 (coinbase-only/idle), or 2 (selected mempool transactions).
+Only status 2 proceeds to either native or ECX bid submission; a nonempty mempool
+whose transactions are excluded by the assembler is still idle. This production
+policy does not reject consensus-valid empty blocks or interrupt already-paid bids.
+Failure reporting is selected in Haskell. Native options remain alive through reporting, while
 their construction is deferred until reward admission succeeds. Shared property
 and native trace/fault fixtures cover this flow and funded submission together.
 

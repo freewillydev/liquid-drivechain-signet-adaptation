@@ -38,7 +38,7 @@ official bindist. The node also needs Rust/Cargo, gRPC C-core and protobuf
 development libraries. For Ubuntu, in addition to the dependencies below:
 
 ```bash
-sudo apt-get install curl ca-certificates xz-utils patch libgrpc-dev libprotobuf-dev protobuf-compiler patchelf
+sudo apt-get install curl ca-certificates xz-utils patch libgrpc-dev libgrpc++-dev libprotobuf-dev protobuf-compiler patchelf
 ```
 
 For **Ubuntu 24.04 x86-64 only**, this bootstraps Cabal without relying on a

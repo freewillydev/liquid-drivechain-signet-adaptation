@@ -149,8 +149,14 @@ instance Validation BiddingFlow where
     SuccessorProbe phase result -> transition phase result [(1,(-10,2)),(2,(-12,-11))]
     RewardWalletFlow phase result -> transition phase result
       [(1,(-10,2)),(2,(-1,3)),(3,(-10,4)),(4,(5,6)),(5,(6,-11)),(6,(-1,3))]
+    -- Template result: unavailable (0), coinbase-only (1), transactions selected (2).
+    TemplateCreationFlow 3 result -> case result of
+      0 -> 4
+      1 -> -10
+      2 -> -11
+      _ -> -1
     TemplateCreationFlow phase result -> transition phase result
-      [(1,(2,3)),(2,(-1,-10)),(3,(4,-11)),(4,(-1,-10))]
+      [(1,(2,3)),(2,(-1,-10)),(4,(-1,-10))]
     FundedSubmissionFlow phase result -> transition phase result
       [(1,(-10,2)),(2,(3,4)),(3,(-1,-10)),(4,(-1,-11))]
     ProductionRoutingFlow phase result -> transition phase result

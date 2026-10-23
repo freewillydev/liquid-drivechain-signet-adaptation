@@ -436,6 +436,46 @@ DrivechainReplayStoreReadStatus DrivechainParentReplayStore::ReadDeposit(
     }
 }
 
+bool DrivechainParentReplayStore::ListDeposits(
+    const std::optional<Sidechain::Bitcoin::COutPoint>& after, size_t limit,
+    std::vector<DrivechainMintableDeposit>& deposits,
+    std::optional<Sidechain::Bitcoin::COutPoint>& next, std::string* error) const
+{
+    deposits.clear();
+    next.reset();
+    if (limit == 0 || limit > 64)
+        return SetStoreError(error, "invalid parent deposit scan limit or unopened index");
+    if (ReadPreflight(m_db.get(), m_schema_version, drivechain::haskell::ReplayStoreFlow::READ_PREFLIGHT,
+        "persistent parent replay database is not open", error)) return false;
+    try {
+        std::unique_ptr<CDBIterator> it(m_db->NewIterator());
+        if (after) it->Seek(std::make_pair(DB_REPLAY_DEPOSIT, *after));
+        else it->Seek(DB_REPLAY_DEPOSIT);
+        std::vector<DrivechainMintableDeposit> page;
+        std::optional<Sidechain::Bitcoin::COutPoint> cursor;
+        while (it->Valid()) {
+            uint8_t prefix{};
+            if (!it->GetKey(prefix)) return SetStoreError(error, "malformed parent replay key");
+            if (prefix != DB_REPLAY_DEPOSIT) break;
+            std::pair<uint8_t, Sidechain::Bitcoin::COutPoint> key;
+            if (!it->GetKey(key)) return SetStoreError(error, "malformed parent deposit key");
+            if (after && key.second == *after) { it->Next(); continue; }
+            if (page.size() == limit) { cursor = page.back().outpoint; break; }
+            DrivechainMintableDeposit deposit;
+            if (!it->GetValue(deposit) || !IsSaneDeposit(deposit) || deposit.outpoint != key.second)
+                return SetStoreError(error, "malformed parent deposit scan record");
+            page.push_back(std::move(deposit));
+            it->Next();
+        }
+        it->CheckStatus();
+        deposits = std::move(page);
+        next = cursor;
+        return true;
+    } catch (const std::exception& e) {
+        return SetStoreError(error, strprintf("parent deposit scan failed: %s", e.what()));
+    }
+}
+
 DrivechainReplayStoreReadStatus DrivechainParentReplayStore::ReadBmmEdge(
     const uint256& parent_hash,
     DrivechainReplayedBmmEdge& edge,

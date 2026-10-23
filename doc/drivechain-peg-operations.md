@@ -19,6 +19,12 @@ authentication on numeric loopback, preferably a private rotating cookie;
 an explicit private credential file is supported for same-host bridges.
 Enforcer requests use the linked Haskell gRPC client with mutual TLS. Keep
 `drivechainl1blocksync=0` while preparing or auditing the deployment.
+
+Automatic bidding only pays for candidates containing at least one selected
+mempool transaction besides the coinbase. Empty candidates remain idle, including
+when the assembler excludes all pending transactions. A bid already submitted
+continues waiting for confirmation even if the mempool changes. This is producer
+policy only; accepting other miners' consensus-valid empty blocks is unchanged.
 No command below is authorization to spend real funds.
 
 ## Deposit
@@ -29,21 +35,86 @@ outpoint and intended destination. The node authenticates parent headers,
 raw blocks, treasury transitions, destination and value from parent replay;
 a bridge assertion or wallet balance is not deposit evidence.
 
-After the required active parent depth (100 blocks in the frozen identity):
+The node automatically imports mature deposits for all recipients, including
+external wallets, by default (`-drivechainautodeposit=1`). Every 30 seconds it
+reads up to 64 records from the authenticated parent index and attempts at most
+eight imports. It needs no loaded wallet or spending key and runs independently
+of block bidding. A cursor wraps through the index; restarting starts another
+pass. Already-claimed or mempool deposits are skipped using the normal peg-in
+spent key. Missing, reorged or immature evidence cannot authorize an import.
+Disable this local submission service with `-drivechainautodeposit=0`; ordinary
+transaction validation remains enabled.
+
+Existing address-only deposits, including BitWindow deposits, continue to
+credit the entire deposit without an Elements fee. BitWindow's existing fee
+field is the **parent transaction fee**, not an Elements fee.
+
+Manual import remains available after the required active parent depth:
+six confirmations for the Betanet slot-24 identity, counting inclusion as one.
+The frozen identity retains its historical 100-block parameter; the effective
+Betanet confirmation policy is six, without changing that identity.
 
 ```sh
 elements-cli -chain=elements -rpcwallet=<wallet> importdrivechaindeposit \
   "<mainchain-txid>" <mainchain-vout> "<mainchain-block-hash>" \
-  "<elements-address>" <value-sats> <fee-sats>
+  "<elements-address>" <value-sats> <fee-sats> <deposit-fee-sats>
 ```
 
-The final fee argument defaults to zero. A nonzero Elements transaction fee
-requires separately spendable wallet funds; it does not reduce the authenticated
-deposit credit. Record the returned sidechain transaction ID. Check
+Both fee arguments default to zero. `fee_sats` retains its old meaning: a
+maximum wallet-sponsored fee requiring separately spendable funds, without
+reducing the deposit credit. `deposit_fee_sats` is instead the exact fee
+committed on L1, as described below. They cannot both be nonzero.
+Record the returned sidechain transaction ID. Check
 `gettransaction`, `listunspent`, and the active confirming block, including
 after restart. A mempool transaction is not confirmed spendable chain state.
 Never substitute a different vout, address, amount, or parent block to work
 around a rejection.
+
+### Committing an Elements fee on L1
+
+**Upgrade all sidechain validators before funding this new destination format.**
+It changes native deposit consensus acceptance; older nodes cannot validate
+fee-bearing claims. This does not change the meaning of existing deposits and
+does not retroactively authorize a fee on them.
+
+Before creating the L1 deposit, obtain its destination without signing or
+broadcasting anything:
+
+```sh
+elements-cli -chain=elements getdrivechaindepositdestination "<elements-address>" 1000
+```
+
+The result's `destination` is the exact opaque M5 address field to pass to the
+parent deposit builder. It encodes `dcfee1:1000:<elements-address>`; the fee is
+a positive canonical integer in satoshis. Zero returns the original address.
+`bitwindow_address` adds the configured `s24_` prefix for BitWindow's generic
+parser. This does not add an Elements-fee control to BitWindow's deposit UI.
+The parent transaction fee remains separate. The complete payload is limited
+to 128 bytes, and the deposit must exceed the committed fee.
+
+For example, a 100,000-satoshi deposit committing 1,000 satoshis credits 99,000
+and pays exactly 1,000 to the Elements block producer. Automatic import uses
+that exact split. The manual equivalent is:
+
+```sh
+elements-cli -chain=elements -rpcwallet=<wallet> importdrivechaindeposit \
+  "<mainchain-txid>" <mainchain-vout> "<mainchain-block-hash>" \
+  "<elements-address>" 100000 0 1000
+```
+
+Parent replay authenticates the full payload, gross value and outpoint. The
+claim must preserve the recipient, exact net credit and exact explicit native
+fee, with no extra inputs or redirected outputs. Changing the RPC fee or
+witness cannot change the L1 authorization. The replay key remains the same
+outpoint regardless of fee encoding. `deposit_value_sats` reports gross value;
+`value_sats` and `amount` report net credit.
+
+Choose a fee sufficient for relay before funding: a positive fee below relay
+policy may remain unrelayed, and the commitment cannot be unilaterally bumped
+or reduced afterward. Do not create another L1 deposit to retry an uncertain
+import. Inspect the original outpoint and its claim first. A successful
+automatic import is logged with its parent outpoint, Elements txid and fee;
+deferred imports appear under validation debug logging.
 
 ## Withdrawal
 

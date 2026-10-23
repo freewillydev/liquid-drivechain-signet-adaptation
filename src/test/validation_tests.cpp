@@ -5089,7 +5089,7 @@ BOOST_AUTO_TEST_CASE(funded_bid_and_template_creation_order)
                     switch (step) {
                     case 1: return current;
                     case 2: return creation ? 1 : submitted;
-                    case 3: return creation ? submitted : 1;
+                    case 3: return creation ? (submitted ? 2 : 0) : 1;
                     case 4: return 1;
                     default: throw std::logic_error("unexpected funded submission action");
                     }
@@ -5101,6 +5101,38 @@ BOOST_AUTO_TEST_CASE(funded_bid_and_template_creation_order)
             });
             const std::vector<uint32_t> prefix(expected.begin(),expected.begin()+std::min(fault+1,expected.size()));
             BOOST_CHECK(trace == prefix);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(automatic_bidding_requires_selected_transactions)
+{
+    namespace hs = drivechain::haskell;
+    for (const bool ecx : {false, true}) {
+        for (const uint32_t candidate : {0U, 1U, 2U}) {
+            unsigned templates{0}, bids{0}, waits{0}, accepts{0};
+            bool mempool_has_transactions = candidate == 2;
+            const bool produced = hs::BmmProduction(ecx, [&](uint32_t stage) {
+                if (stage == (ecx ? 5U : 4U)) {
+                    ++templates;
+                    return hs::ParentReplayStore(hs::ReplayStoreFlow::TEMPLATE_CREATION,
+                        [&](uint32_t step) -> uint32_t { return step == 3 ? candidate : 1; }) != 0;
+                }
+                if (stage == (ecx ? 10U : 7U)) {
+                    ++bids;
+                    BOOST_CHECK(mempool_has_transactions);
+                    mempool_has_transactions = false;
+                }
+                // A paid candidate must finish even if the mempool changes while waiting.
+                if (stage == (ecx ? 11U : 8U)) ++waits;
+                if (stage == (ecx ? 13U : 9U)) ++accepts;
+                return true;
+            });
+            BOOST_CHECK_EQUAL(templates, 1U);
+            BOOST_CHECK_EQUAL(produced, candidate == 2);
+            BOOST_CHECK_EQUAL(bids, candidate == 2 ? 1U : 0U);
+            BOOST_CHECK_EQUAL(waits, bids);
+            BOOST_CHECK_EQUAL(accepts, bids);
         }
     }
 }
@@ -11619,8 +11651,25 @@ BOOST_AUTO_TEST_CASE(drivechain_grpc_requires_authenticated_tls)
     const auto invocation = RunAuthenticatedDrivechainGrpc(args,
         "cusf.mainchain.v1.ValidatorService/GetChainInfo", "{}",
         std::chrono::milliseconds{100}, 4096);
+    BOOST_CHECK(invocation.started);
+    BOOST_CHECK(invocation.exited);
     BOOST_CHECK(invocation.exit_code != 0);
-    BOOST_CHECK(!invocation.error.empty() || invocation.timed_out);
+    // C-core can report TLS rejection as a positive gRPC status with its
+    // diagnostic in output, rather than as a negative local error in error.
+    // Exercise the caller's classifier, including its duplicate-accepting mode.
+    for (const bool accept_duplicate : {false, true}) {
+        std::string diagnostic;
+        const auto status = ClassifyDrivechainGrpcResult(invocation, accept_duplicate, diagnostic);
+        BOOST_CHECK(status != DrivechainGrpcStatus::SUCCESS);
+        BOOST_CHECK(!diagnostic.empty());
+        if (invocation.exit_code > 0) {
+            BOOST_CHECK(status == DrivechainGrpcStatus::NONZERO_EXIT);
+            BOOST_REQUIRE(!invocation.output.empty());
+            BOOST_CHECK(diagnostic.find(invocation.output) != std::string::npos);
+        } else {
+            BOOST_CHECK(!invocation.error.empty() || invocation.timed_out);
+        }
+    }
     const auto cancelled = RunAuthenticatedDrivechainGrpc(args,
         "cusf.mainchain.v1.ValidatorService/GetChainInfo", "{}",
         std::chrono::seconds{1}, 4096, [] { return true; });

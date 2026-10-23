@@ -28,6 +28,15 @@ struct DrivechainDepositEvidence
     std::vector<Sidechain::Bitcoin::CBlockHeader> headers;
 };
 
+struct DrivechainMintableDeposit;
+/** Canonical opaque M5 destination: legacy address, or dcfee1:<satoshis>:<address>.
+ * The parent replay authenticates these exact bytes, including the fee.
+ */
+bool DecodeDrivechainDepositDestination(const std::string& payload, CScript& recipient, CAmount& fee);
+std::string EncodeDrivechainDepositDestination(const std::string& address, CAmount fee);
+/** Construct the exact native claim; normal consensus validation authenticates it. */
+CTransactionRef CreateNativeDrivechainDeposit(const DrivechainMintableDeposit& deposit);
+
 /** Calculates script necessary for p2ch peg-in transactions */
 CScript calculate_contract(const CScript& federationRedeemScript, const CScript& witnessProgram);
 bool GetAmountFromParentChainPegin(CAmount& amount, const Sidechain::Bitcoin::CTransaction& txBTC, unsigned int nOut);
