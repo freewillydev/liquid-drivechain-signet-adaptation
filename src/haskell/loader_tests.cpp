@@ -32,9 +32,15 @@ int main(int argc, char** argv)
                 if (!library) { ok = false; return; }
                 auto initialize = reinterpret_cast<void (*)()>(dlsym(library, "elements_hs_runtime_init"));
                 using Domain = int32_t (*)(uint32_t,uint32_t,uint64_t*,uint32_t,void**,uint32_t,void (**)(),uint64_t*);
-                auto depth = reinterpret_cast<Domain>(dlsym(library, "elements_hs_peg_api_v2"));
+                auto depth = reinterpret_cast<Domain>(dlsym(library, "elements_hs_peg_api_v3"));
                 if (!initialize || !depth || dlsym(library, "elements_hs_deposit_depth_v1") ||
-                    dlsym(library, "elements_hs_deposit_evidence_api_v1")) ok = false;
+                    dlsym(library, "elements_hs_deposit_evidence_api_v1") ||
+                    dlsym(library, "elements_hs_peg_api_v2") ||
+                    dlsym(library, "elements_hs_node_api_v2") ||
+                    dlsym(library, "elements_hs_parent_api_v2") ||
+                    dlsym(library, "elements_hs_bmm_api_v2") ||
+                    dlsym(library, "elements_hs_exchange_api_v2") ||
+                    dlsym(library, "elements_hs_usdd_api_v2")) ok = false;
                 else {
                     initialize();
                     uint64_t args[]{100,105,6}, result{};

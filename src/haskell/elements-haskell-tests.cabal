@@ -8,7 +8,7 @@ test-suite properties
   type: exitcode-stdio-1.0
   main-is: Properties.hs
   hs-source-dirs: test, .
-  other-modules: Abi, DomainABI, AbiTests, Drivechain, Withdrawal, Deposit, NativeDeposit, Bmm, BmmConstants, ParentBlock, ParentHeader, ParentReplay, ParentCache, ReplayStore, Exchange, ExchangeCustody, ExchangeForcedV3, ExchangeForcedV3Block, Usdd, ScriptPolicy, CapabilityContext, Workflow, ExchangeTests, OperationTests, ParentBlockTests, ParentHeaderTests, ParentRpcTests, ReplayStoreTests, DepositConstructionTests, DepositParsingTests, DepositClaimTests, NativeDepositTests, ConfirmationDepthTests, LocalBidTests, BmmContextTests, WalletWithdrawalTests, JournalWorkflowTests, BmmHeaderPolicyTests, BmmStateAccessTests, StateStorageTests, ProofSessionTests, BmmChainTests, CommitmentTests, SignetSessionTests, ForcedOutputTests, ForcedBlockTests, CustodyPolicyTests, CustodyIdentityTests
+  other-modules: Utreexo, Abi, DomainABI, AbiTests, Drivechain, Withdrawal, Deposit, NativeDeposit, Bmm, BmmConstants, ParentBlock, ParentHeader, ParentReplay, ParentCache, ReplayStore, NodeRules, ScriptPolicy, CapabilityContext, Workflow, OperationTests, ParentBlockTests, ParentHeaderTests, ParentRpcTests, ReplayStoreTests, DepositConstructionTests, DepositParsingTests, DepositClaimTests, NativeDepositTests, ConfirmationDepthTests, LocalBidTests, BmmContextTests, WalletWithdrawalTests, JournalWorkflowTests, BmmHeaderPolicyTests, BmmStateAccessTests, StateStorageTests, ProofSessionTests, BmmChainTests, CommitmentTests, SignetSessionTests
   cxx-sources: test/reference.cpp
   if os(osx)
     extra-libraries: c++
@@ -17,22 +17,3 @@ test-suite properties
   build-depends: base >=4.18 && <5, bytestring, binary, containers, transformers >=0.6 && <0.7, QuickCheck ==2.15.0.1, operation-capabilities ==0.3.0.0
   default-language: Haskell2010
   ghc-options: -Wall -Werror -threaded
-
-test-suite swap-projection
-  type: exitcode-stdio-1.0
-  main-is: SwapProjectionTests.hs
-  hs-source-dirs: test, .
-  other-modules: Drivechain, Withdrawal, Bmm, Deposit, NativeDeposit, BmmConstants, ParentBlock, ParentHeader, ParentReplay, ParentCache, ReplayStore, Exchange, ExchangeCustody, ExchangeForcedV3, ExchangeForcedV3Block, Usdd, ScriptPolicy, CapabilityContext, Workflow
-  build-depends: base >=4.18 && <5, bytestring, binary, containers, transformers >=0.6 && <0.7, operation-capabilities ==0.3.0.0
-  default-language: Haskell2010
-  ghc-options: -Wall -Werror
-
-
-test-suite custody-projection
-  type: exitcode-stdio-1.0
-  main-is: CustodyTests.hs
-  hs-source-dirs: test, .
-  other-modules: ExchangeCustody, ExchangeForcedV3, BmmConstants, Withdrawal, ParentReplay, ReplayStore, CapabilityContext, Workflow
-  build-depends: base >=4.18 && <5, bytestring, binary, containers, transformers, operation-capabilities
-  default-language: Haskell2010
-  ghc-options: -Wall -Werror

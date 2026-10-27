@@ -8,8 +8,6 @@
 
 #include <arith_uint256.h>
 #include <consensus/params.h>
-#include <ecx_bond_v2.h>
-#include <ecx_custody_projection.h>
 #include <flatfile.h>
 #include <haskell/bmm_constants.h>
 #include <kernel/cs_main.h>
@@ -17,7 +15,6 @@
 #include <serialize.h>
 #include <sync.h>
 #include <uint256.h>
-#include <usdd_withdrawal_accumulator.h>
 #include <util/time.h>
 
 #include <algorithm>
@@ -249,17 +246,6 @@ public:
     uint256 hashWithdrawalBundle{};
     uint256 hashBmmProof{};
     UtreexoCommitment utreexo;
-    uint256 hashExchangeStateRoot{};
-    uint256 hashForcedInboxRoot{};
-    uint256 hashDepositInboxRoot{};
-    uint32_t ecxParentHeight{0};
-    uint64_t forcedProcessedCursor{0};
-    uint64_t depositProcessedCursor{0};
-    uint64_t sourceBacklogOldestParentHeight{0};
-    std::array<unsigned char, CBlockHeader::SWAP_FORCED_STATE_SIZE> swapForcedState{};
-    //! Verified V2 public capital projection; never part of the block header.
-    std::optional<ecx::BondV2CapitalSnapshot> ecxBondV2Capital{};
-    std::optional<ecx::CustodyProjection> ecxCustodyProjection{};
     uint32_t nTime{0};
     uint32_t nBits{0};
     uint32_t nNonce{0};
@@ -267,8 +253,6 @@ public:
     //! Persisted authenticated parent-chain anchor for drivechain blocks.
     std::optional<DrivechainAnchor> m_drivechain_anchor{};
 
-    //! Derived cumulative canonical Ethereum-withdrawal accumulator at this block.
-    std::optional<usdd::WithdrawalAccumulatorState> m_usdd_withdrawal_accumulator{};
 
 protected:
     std::optional<CProof> proof{};
@@ -351,14 +335,6 @@ public:
           hashWithdrawalBundle{block.hashWithdrawalBundle},
           hashBmmProof{block.hashBmmProof},
           utreexo{block.utreexo},
-          hashExchangeStateRoot{block.hashExchangeStateRoot},
-          hashForcedInboxRoot{block.hashForcedInboxRoot},
-          hashDepositInboxRoot{block.hashDepositInboxRoot},
-          ecxParentHeight{block.ecxParentHeight},
-          forcedProcessedCursor{block.forcedProcessedCursor},
-          depositProcessedCursor{block.depositProcessedCursor},
-          sourceBacklogOldestParentHeight{block.sourceBacklogOldestParentHeight},
-          swapForcedState{block.swapForcedState},
           nTime{block.nTime},
           nBits{block.nBits},
           nNonce{block.nNonce},
@@ -401,14 +377,6 @@ public:
         block.hashWithdrawalBundle = hashWithdrawalBundle;
         block.hashBmmProof = hashBmmProof;
         block.utreexo = utreexo;
-        block.hashExchangeStateRoot = hashExchangeStateRoot;
-        block.hashForcedInboxRoot = hashForcedInboxRoot;
-        block.hashDepositInboxRoot = hashDepositInboxRoot;
-        block.ecxParentHeight = ecxParentHeight;
-        block.forcedProcessedCursor = forcedProcessedCursor;
-        block.depositProcessedCursor = depositProcessedCursor;
-        block.sourceBacklogOldestParentHeight = sourceBacklogOldestParentHeight;
-        block.swapForcedState = swapForcedState;
         block.nTime = nTime;
         // Dynafed headers always serialize block_height as part of their
         // identity (see CBlockHeader::Serialize), so it must be reconstructed
@@ -598,40 +566,6 @@ public:
         } else {
             SER_READ(obj, obj.hashBmmProof.SetNull());
         }
-        if (layout.exchange) {
-            READWRITE(obj.hashExchangeStateRoot);
-        } else {
-            SER_READ(obj, obj.hashExchangeStateRoot.SetNull());
-        }
-        if (layout.forced) {
-            READWRITE(obj.hashForcedInboxRoot);
-        } else {
-            SER_READ(obj, obj.hashForcedInboxRoot.SetNull());
-        }
-        if (layout.deposit) {
-            READWRITE(obj.hashDepositInboxRoot);
-        } else {
-            SER_READ(obj, obj.hashDepositInboxRoot.SetNull());
-        }
-        if (layout.parent_height) {
-            READWRITE(obj.ecxParentHeight);
-        } else {
-            SER_READ(obj, obj.ecxParentHeight = 0);
-        }
-        if (layout.cursors) {
-            READWRITE(obj.forcedProcessedCursor);
-            READWRITE(obj.depositProcessedCursor);
-            READWRITE(obj.sourceBacklogOldestParentHeight);
-        } else {
-            SER_READ(obj, obj.forcedProcessedCursor = 0);
-            SER_READ(obj, obj.depositProcessedCursor = 0);
-            SER_READ(obj, obj.sourceBacklogOldestParentHeight = 0);
-        }
-        if (layout.swap_forced) {
-            READWRITE(obj.swapForcedState);
-        } else {
-            SER_READ(obj, obj.swapForcedState.fill(0));
-        }
         if (g_con_elementsmode && g_con_utreexo && (uint32_t(obj.nVersion) & utreexo::HEADER_BIT)) {
             READWRITE(obj.utreexo);
         } else {
@@ -671,14 +605,6 @@ public:
         block.hashWithdrawalBundle = hashWithdrawalBundle;
         block.hashBmmProof = hashBmmProof;
         block.utreexo = utreexo;
-        block.hashExchangeStateRoot = hashExchangeStateRoot;
-        block.hashForcedInboxRoot = hashForcedInboxRoot;
-        block.hashDepositInboxRoot = hashDepositInboxRoot;
-        block.ecxParentHeight = ecxParentHeight;
-        block.forcedProcessedCursor = forcedProcessedCursor;
-        block.depositProcessedCursor = depositProcessedCursor;
-        block.sourceBacklogOldestParentHeight = sourceBacklogOldestParentHeight;
-        block.swapForcedState = swapForcedState;
         block.nTime = nTime;
         // Dynafed headers always serialize block_height as part of their
         // identity (see CBlockHeader::Serialize), so it must be reconstructed

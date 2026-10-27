@@ -1771,15 +1771,6 @@ bool ReadDrivechainParentBlock(const Consensus::Params& consensus, std::atomic<u
 
 namespace {
 
-bool GetVerifiedActiveMainchainHeader(const uint256& expected_hash, const int min_confirmations,
-                                      VerifiedMainchainHeader& verified, std::string* error)
-{
-    return VerifyDrivechainNetworkHeader(Params().GetConsensus(), g_drivechain_parent_replay_published_epoch,
-        expected_hash, min_confirmations, verified, error,
-        {[]() -> const uint256& { return Params().ParentGenesisBlockHash(); },
-         {}, {}, {}, {}, DrivechainParentDeadlineAction, true});
-}
-
 bool ReadMainchainBlock(const uint256& hash, int min_confirmations, Bitcoin::CBlock& block,
     VerifiedMainchainHeader* verified, std::string* error)
 {
@@ -3939,7 +3930,8 @@ bool GetDrivechainSuccessfulWithdrawal(
 bool WarmDrivechainParentState(std::string* error)
 {
     if (error) error->clear();
-    if (!Params().GetConsensus().drivechain_slot.has_value()) return true;
+    const auto& consensus = Params().GetConsensus();
+    if (!consensus.drivechain_slot.has_value()) return true;
 
     return CatchParentError(error, [&]() -> bool {
         namespace hs = drivechain::haskell;

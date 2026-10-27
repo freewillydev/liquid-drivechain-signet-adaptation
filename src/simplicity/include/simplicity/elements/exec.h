@@ -64,11 +64,10 @@ extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned 
                                               , const unsigned char* program, size_t program_len
                                               , const unsigned char* witness, size_t witness_len);
 
-/* Execute with a fail-closed prior-active ECX root environment. */
+/* Execute with BIP301-authenticated parent context supplied by the caller. */
 extern bool simplicity_elements_execSimplicityWithBlockEnv( simplicity_err* error, unsigned char* ihr
                                               , const elementsTransaction* tx, uint_fast32_t ix, const elementsTapEnv* taproot
                                               , const unsigned char* genesisBlockHash
-                                              , const ecx_prior_active_root_env* ecxRoot
                                               , const rawElementsBlockEnv* blockEnv
                                               , int64_t minCost, int64_t budget
                                               , const unsigned char* amr

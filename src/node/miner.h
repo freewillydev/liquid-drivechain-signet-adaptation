@@ -167,9 +167,6 @@ private:
     uint64_t nBlockSigOpsCost;
     CAmount nFees;
     std::unordered_set<Txid, SaltedTxidHasher> inBlock;
-    uint64_t m_ecx_source_append_budget{0};
-    uint64_t m_ecx_source_appends_selected{0};
-    size_t m_usdd_sp1_namespace_annexes{0};
 
     // Chain context for the block
     int nHeight;

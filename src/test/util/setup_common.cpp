@@ -73,7 +73,7 @@ public:
     explicit TestingSetupSettingsGuard(ArgsManager& args)
         : m_args{args}, m_previous_elements{g_con_elementsmode},
           m_previous_height{g_con_blockheightinheader}, m_previous_signed{g_signed_blocks},
-          m_previous_utreexo{g_con_utreexo}, m_previous_swap_v3{g_con_ecx_swap_v3}
+          m_previous_utreexo{g_con_utreexo}
     {
         m_args.LockSettings([this](common::Settings& settings) {
             m_previous = settings;
@@ -98,7 +98,6 @@ public:
         g_con_blockheightinheader = m_previous_height;
         g_signed_blocks = m_previous_signed;
         g_con_utreexo = m_previous_utreexo;
-        g_con_ecx_swap_v3 = m_previous_swap_v3;
     }
 
     TestingSetupSettingsGuard(const TestingSetupSettingsGuard&) = delete;
@@ -111,7 +110,6 @@ private:
     const bool m_previous_height;
     const bool m_previous_signed;
     const bool m_previous_utreexo;
-    const bool m_previous_swap_v3;
 };
 
 using namespace util::hex_literals;

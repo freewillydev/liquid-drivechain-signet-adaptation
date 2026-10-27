@@ -4,16 +4,12 @@ module DomainABI where
 import Abi (Entry, dispatchFamily, handler)
 import qualified Drivechain as D
 
-foreign export ccall "elements_hs_node_api_v2" node :: Entry
+foreign export ccall "elements_hs_node_api_v3" node :: Entry
 node :: Entry
 node = dispatchFamily
   [ -- configuration: section 0
     [ handler D.elements_hs_grpc_plan
     , handler D.elements_hs_configuration_field
-    , handler D.elements_hs_configuration_hashes
-    , handler D.elements_hs_configuration_identity
-    , handler D.elements_hs_material_name
-    , handler D.elements_hs_identity_write
     , handler D.elements_hs_bmm_replacement
     , handler D.elements_hs_bmm_selected_bid
     , handler D.elements_hs_bmm_reward_address
@@ -35,15 +31,13 @@ node = dispatchFamily
     , handler D.elements_hs_tls_file_admission
     , handler D.elements_hs_peer_strikes
     , handler D.elements_hs_startup_args
-    , handler D.elements_hs_production_identity
     , handler D.elements_hs_network_selection
     , handler D.elements_hs_address_alias
     , handler D.elements_hs_payment_uri
-    , handler D.elements_hs_evaluator_identity
-    , handler D.elements_hs_wide_decimal
+    , handler D.elements_hs_export_range
+    , handler D.elements_hs_jet_height
     , handler D.elements_hs_extra_nonce
     , handler D.elements_hs_next_block_height
-    , handler D.elements_hs_runtime_activation
     , handler D.elements_hs_unsigned32_fields
     , handler D.elements_hs_bounded_wait
     , handler D.elements_hs_bounded_append
@@ -52,24 +46,19 @@ node = dispatchFamily
     , handler D.elements_hs_bmm_sync_heights
     , handler D.elements_hs_bmm_work_measurement
     , handler D.elements_hs_auth_file
+    , handler D.elements_hs_production_identity
     ]
   , -- script_policy: section 1
     [ handler D.elements_hs_ctv_admission
-    , handler D.elements_hs_verifier_startup
-    , handler D.elements_hs_activation_shape
-    , handler D.elements_hs_activation_budget
-    , handler D.elements_hs_verifier_identity
     , handler D.elements_hs_parameter_gate
     , handler D.elements_hs_optional_environment
     , handler D.elements_hs_optional_checkpoint
-    , handler D.elements_hs_annex_retention
     , handler D.elements_hs_merkle_replacement
-    , handler D.elements_hs_return_marker
     , handler D.elements_hs_script_cache_encode
     ]
   ]
 
-foreign export ccall "elements_hs_parent_api_v2" parent :: Entry
+foreign export ccall "elements_hs_parent_api_v3" parent :: Entry
 parent :: Entry
 parent = dispatchFamily
   [ -- parent_replay: section 0
@@ -116,7 +105,7 @@ parent = dispatchFamily
     ]
   ]
 
-foreign export ccall "elements_hs_bmm_api_v2" bmm :: Entry
+foreign export ccall "elements_hs_bmm_api_v3" bmm :: Entry
 bmm :: Entry
 bmm = dispatchFamily
   [ -- bmm: section 0
@@ -177,7 +166,7 @@ bmm = dispatchFamily
     ]
   ]
 
-foreign export ccall "elements_hs_peg_api_v2" peg :: Entry
+foreign export ccall "elements_hs_peg_api_v3" peg :: Entry
 peg :: Entry
 peg = dispatchFamily
   [ -- deposit: section 0
@@ -240,120 +229,5 @@ peg = dispatchFamily
     , handler D.elements_hs_wallet_bundle_anchor
     , handler D.elements_hs_wallet_balance
     , handler D.elements_hs_wallet_issue_amount
-    ]
-  ]
-
-foreign export ccall "elements_hs_exchange_api_v2" exchange :: Entry
-exchange :: Entry
-exchange = dispatchFamily
-  [ -- exchange: section 0
-    [ handler D.elements_hs_muldiv128
-    , handler D.elements_hs_canonical_activation
-    , handler D.elements_hs_canonical_values
-    , handler D.elements_hs_groth16_header
-    , handler D.elements_hs_bond_input
-    , handler D.elements_hs_groth16_proof
-    , handler D.elements_hs_parse_groth16
-    , handler D.elements_hs_jet_height
-    ]
-  , -- exchange_codec: section 1
-    [ handler D.elements_hs_exchange_sources
-    , handler D.elements_hs_exchange_append_marker
-    , handler D.elements_hs_exchange_custody_root
-    , handler D.elements_hs_exchange_annex_header
-    , handler D.elements_hs_exchange_receipts
-    , handler D.elements_hs_exchange_inbox_entry
-    , handler D.elements_hs_exchange_bond_marker
-    , handler D.elements_hs_exchange_registry_decode
-    , handler D.elements_hs_exchange_frozen_profile
-    , handler D.elements_hs_exchange_envelope_header
-    , handler D.elements_hs_exchange_envelope_requirement
-    , handler D.elements_hs_exchange_m6
-    , handler D.elements_hs_exchange_source_marker
-    , handler D.elements_hs_exchange_tranche
-    , handler D.elements_hs_exchange_forced_body
-    ]
-  , -- exchange_state: section 2
-    [ handler D.elements_hs_exchange_genesis_funding
-    , handler D.elements_hs_exchange_genesis_state
-    , handler D.elements_hs_exchange_registry
-    , handler D.elements_hs_exchange_identity_relation
-    , handler D.elements_hs_exchange_frozen_bounds
-    , handler D.elements_hs_exchange_capital
-    , handler D.elements_hs_exchange_cursors
-    , handler D.elements_hs_exchange_inbox
-    , handler D.elements_hs_exchange_genesis_roots
-    , handler D.elements_hs_exchange_frozen_configuration
-    , handler D.elements_hs_exchange_derive_inbox
-    , handler D.elements_hs_exchange_derive_cursors
-    , handler D.elements_hs_exchange_transition
-    , handler D.elements_hs_exchange_snapshot
-    , handler D.elements_hs_exchange_envelope_scan
-    , handler D.elements_hs_exchange_envelope_payload
-    , handler D.elements_hs_source_package
-    , handler D.elements_hs_template_budget
-    , handler D.elements_hs_source_selection
-    , handler D.elements_hs_context_presence
-    , handler D.elements_hs_export_range
-    , handler D.elements_hs_exchange_successor_binding
-    , handler D.elements_hs_tracker_height
-    , handler D.elements_hs_exchange_forced_v3_bytes
-    , handler D.elements_hs_exchange_forced_v3_admission
-    , handler D.elements_hs_exchange_forced_v3_append
-    , handler D.elements_hs_exchange_forced_v3_block_bytes
-    , handler D.elements_hs_exchange_custody_check
-    , handler D.elements_hs_exchange_state_workflow
-    , handler D.elements_hs_exchange_session
-    ]
-  , -- exchange_admission: section 3
-    [ handler D.elements_hs_exchange_source_admission
-    , handler D.elements_hs_exchange_spend_scan
-    , handler D.elements_hs_exchange_parent_target
-    , handler D.elements_hs_exchange_connection
-    , handler D.elements_hs_exchange_disconnect
-    , handler D.elements_hs_exchange_availability
-    , handler D.elements_hs_exchange_configuration
-    , handler D.elements_hs_exchange_checkpoint
-    , handler D.elements_hs_exchange_genesis_initialization
-    , handler D.elements_hs_exchange_deployment
-    , handler D.elements_hs_exchange_required_identities
-    , handler D.elements_hs_exchange_physical_inputs
-    , handler D.elements_hs_exchange_transaction_shape
-    , handler D.elements_hs_exchange_tracker
-    , handler D.elements_hs_exchange_profile
-    , handler D.elements_hs_exchange_authority
-    , handler D.elements_hs_exchange_transaction_admission
-    , handler D.elements_hs_exchange_envelope_workflow
-    ]
-  ]
-
-foreign export ccall "elements_hs_usdd_api_v2" usdd :: Entry
-usdd :: Entry
-usdd = dispatchFamily
-  [ -- usdd: section 0
-    [ handler D.elements_hs_usdd_extract_block
-    , handler D.elements_hs_usdd_claim_hashes
-    , handler D.elements_hs_usdd_checkpoint
-    , handler D.elements_hs_usdd_accumulator
-    , handler D.elements_hs_usdd_annex
-    , handler D.elements_hs_usdd_legacy
-    , handler D.elements_hs_usdd_admission
-    , handler D.elements_hs_usdd_block_resources
-    , handler D.elements_hs_usdd_package_resources
-    , handler D.elements_hs_usdd_policy_weight
-    , handler D.elements_hs_usdd_policy_weight_expanded
-    , handler D.elements_hs_usdd_resources
-    , handler D.elements_hs_usdd_resource_workflow
-    , handler D.elements_hs_usdd_accumulator_count
-    , handler D.elements_hs_usdd_accumulator_version
-    , handler D.elements_hs_transaction_weight
-    , handler D.elements_hs_bond_marker_policy
-    , handler D.elements_hs_taproot_witness_policy
-    , handler D.elements_hs_standardness_gate
-    , handler D.elements_hs_verify_journal
-    , handler D.elements_hs_verify_groth16
-    , handler D.elements_hs_verify_custody
-    , handler D.elements_hs_verify_jet
-    , handler D.elements_hs_frontier_wire
     ]
   ]

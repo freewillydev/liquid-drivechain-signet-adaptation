@@ -22,8 +22,6 @@
 #include <cuckoocache.h>
 #include <deploymentstatus.h>
 #include <drivechain_bmm.h>
-#include <ecx_exchange_state.h>
-#include <script/ecx_activation_annex.h>
 #include <drivechain_peg.h>
 #include <flatfile.h>
 #include <hash.h>
@@ -59,7 +57,6 @@
 #include <txmempool.h>
 #include <uint256.h>
 #include <undo.h>
-#include <usdd_sp1_resources.h>
 #include <util/check.h>
 #include <util/fs.h>
 #include <util/fs_helpers.h>
@@ -74,7 +71,6 @@
 #include <util/trace.h>
 #include <util/translation.h>
 #include <validationinterface.h>
-#include <usdd_withdrawal_accumulator.h>
 
 // ELEMENTS
 #include <block_proof.h> // CheckChallenge, CheckProof
@@ -109,416 +105,18 @@ using node::SnapshotMetadata;
 /** Size threshold for warning about slow UTXO set flush to disk. */
 static constexpr size_t WARN_FLUSH_COINS_SIZE = 1 << 30; // 1 GiB
 
-namespace usdd {
-namespace {
-
-constexpr size_t WITHDRAWAL_SCRIPT_SIZE{
-    2 + ElementsDrivechainIdentity::WITHDRAWAL_SCRIPT_PUSH_SIZE};
-
-bool SetWithdrawalError(std::string* error, const std::string& message)
-{
-    if (error) *error = message;
-    return false;
-}
-
-WithdrawalHash DisplayBytes(const uint256& value)
-{
-    WithdrawalHash result{};
-    std::reverse_copy(value.begin(), value.end(), result.begin());
-    return result;
-}
-
-const std::array<WithdrawalHash, WITHDRAWAL_ACCUMULATOR_DEPTH + 1>& EmptyRoots()
-{
-    static const auto roots = [] {
-        std::array<WithdrawalHash, WITHDRAWAL_ACCUMULATOR_DEPTH + 1> result{};
-        static_assert(sizeof(result) == 2080);
-        std::span<unsigned char,2080> wire{reinterpret_cast<unsigned char*>(result.data()),2080};
-        if (!drivechain::haskell::UsddAccumulator(5, ElementsDrivechainIdentity::WITHDRAWAL_LEAF_PREFIX,
-                ElementsDrivechainIdentity::WITHDRAWAL_NODE_PREFIX, wire, wire, {}))
-            throw std::runtime_error("USDD empty-root construction failed");
-        return result;
-    }();
-    return roots;
-}
-
-} // namespace
-
-WithdrawalHash WithdrawalEmptyRoot(const size_t height)
-{
-    assert(height <= WITHDRAWAL_ACCUMULATOR_DEPTH);
-    return EmptyRoots()[height];
-}
-
-WithdrawalHash WithdrawalNode(const WithdrawalHash& left, const WithdrawalHash& right)
-{
-    const unsigned char prefix{ElementsDrivechainIdentity::WITHDRAWAL_NODE_PREFIX};
-    WithdrawalHash result{};
-    CSHA256().Write(&prefix, 1).Write(left.data(), left.size())
-        .Write(right.data(), right.size()).Finalize(result.data());
-    return result;
-}
-
-static std::array<unsigned char,2080> AccumulatorWire(const WithdrawalAccumulatorState& state)
-{
-    static_assert(WITHDRAWAL_ACCUMULATOR_DEPTH == 64 && sizeof(WithdrawalHash) == 32);
-    std::array<unsigned char,2080> wire;
-    std::copy(state.root.begin(), state.root.end(), wire.begin());
-    for (size_t level = 0; level < WITHDRAWAL_ACCUMULATOR_DEPTH; ++level) {
-        std::copy(state.frontier[level].begin(), state.frontier[level].end(), wire.begin() + 32 * (level + 1));
-    }
-    return wire;
-}
-
-static bool AccumulatorFlow(uint32_t mode, WithdrawalAccumulatorState& state, const WithdrawalHash& leaf = {},
-                            std::span<const unsigned char> batch = {})
-{
-    auto wire = AccumulatorWire(state);
-    const bool complete = drivechain::haskell::UsddAccumulator(mode, state.count,
-            ElementsDrivechainIdentity::WITHDRAWAL_NODE_PREFIX, wire,
-            std::span<const unsigned char,2080>{reinterpret_cast<const unsigned char*>(EmptyRoots().data()),2080},
-            mode == 4 ? batch : std::span<const unsigned char>{leaf}, &state.count);
-    // Rejection preserves wire; partial batches already contain the successful prefix.
-    std::copy_n(wire.begin(), 32, state.root.begin());
-    for (size_t level = 0; level < WITHDRAWAL_ACCUMULATOR_DEPTH; ++level) {
-        std::copy_n(wire.begin() + 32 * (level + 1), 32, state.frontier[level].begin());
-    }
-    return complete;
-}
-
-WithdrawalHash ComputeWithdrawalAccumulatorRoot(const WithdrawalAccumulatorState& state)
-{
-    auto result = state;
-    if (!AccumulatorFlow(0, result)) throw std::runtime_error("USDD accumulator root failed");
-    return result.root;
-}
-
-WithdrawalAccumulatorState WithdrawalAccumulatorState::Empty()
-{
-    WithdrawalAccumulatorState state;
-    state.root = WithdrawalEmptyRoot(WITHDRAWAL_ACCUMULATOR_DEPTH);
-    return state;
-}
-
-bool WithdrawalAccumulatorState::SupportsVersion(uint8_t version)
-{
-    static_assert(WITHDRAWAL_ACCUMULATOR_VERSION == 1);
-    return drivechain::haskell::UsddAccumulatorVersion(version);
-}
-
-bool WithdrawalAccumulatorState::IsSane() const
-{
-    auto state = *this;
-    return AccumulatorFlow(1, state);
-}
-
-bool WithdrawalAccumulatorState::Append(const WithdrawalHash& leaf, std::string* error)
-{
-    if (!AccumulatorFlow(2, *this, leaf)) {
-        return SetWithdrawalError(error, "USDD withdrawal accumulator count overflow");
-    }
-    return true;
-}
-
-static const std::array<unsigned char,69>& ClaimProfile()
-{
-    static const auto profile = [] {
-        std::array<unsigned char,69> result{};
-        result[0] = ElementsDrivechainIdentity::WITHDRAWAL_LEAF_PREFIX;
-        WriteBE32(result.data()+1, WITHDRAWAL_PROTOCOL_VERSION);
-        std::copy(ElementsDrivechainIdentity::WITHDRAWAL_BURN_ID_DOMAIN.begin(), ElementsDrivechainIdentity::WITHDRAWAL_BURN_ID_DOMAIN.end(), result.begin()+5);
-        std::copy(ElementsDrivechainIdentity::WITHDRAWAL_LEAF_DOMAIN.begin(), ElementsDrivechainIdentity::WITHDRAWAL_LEAF_DOMAIN.end(), result.begin()+37);
-        return result;
-    }();
-    return profile;
-}
-
-static std::array<unsigned char,168> ClaimInput(uint32_t mode, const EthereumWithdrawalClaim& claim)
-{
-    std::array<unsigned char,168> input{};
-    std::copy(claim.elements_genesis.begin(),claim.elements_genesis.end(),input.begin());
-    std::copy(claim.asset_id.begin(),claim.asset_id.end(),input.begin()+32);
-    std::copy(claim.vault_id.begin(),claim.vault_id.end(),input.begin()+64);
-    const auto& identifier = mode == 1 ? claim.burn_id : claim.burn_txid_display;
-    std::copy(identifier.begin(),identifier.end(),input.begin()+96);
-    WriteBE32(input.data()+128,claim.burn_vout);
-    WriteBE64(input.data()+132,claim.claim_index);
-    WriteBE64(input.data()+140,claim.amount_usdt_micro);
-    std::copy(claim.recipient.begin(),claim.recipient.end(),input.begin()+148);
-    return input;
-}
-
-static std::array<unsigned char,64> ClaimHashes(uint32_t mode, const EthereumWithdrawalClaim& claim)
-{
-    return drivechain::haskell::UsddClaimHashes(mode,ClaimProfile(),ClaimInput(mode,claim));
-}
-
-WithdrawalHash ComputeWithdrawalBurnId(const WithdrawalHash& elements_genesis,
-                                       const WithdrawalHash& txid_display,
-                                       const uint32_t vout)
-{
-    EthereumWithdrawalClaim claim;
-    claim.elements_genesis = elements_genesis;
-    claim.burn_txid_display = txid_display;
-    claim.burn_vout = vout;
-    const auto hashes = ClaimHashes(0,claim);
-    WithdrawalHash result;
-    std::copy_n(hashes.begin(),32,result.begin());
-    return result;
-}
-
-WithdrawalHash ComputeWithdrawalLeaf(const EthereumWithdrawalClaim& claim)
-{
-    const auto hashes = ClaimHashes(1,claim);
-    WithdrawalHash result;
-    std::copy_n(hashes.begin(),32,result.begin());
-    return result;
-}
-
-static std::vector<unsigned char> CheckpointProfile(const uint256& elements_genesis, uint8_t slot, const uint256& block_hash)
-{
-    std::vector<unsigned char> profile(69);
-    WriteBE32(profile.data(), ElementsDrivechainIdentity::WITHDRAWAL_BIP301_CHECKPOINT_VERSION);
-    const auto genesis = DisplayBytes(elements_genesis), block = DisplayBytes(block_hash);
-    std::copy(genesis.begin(), genesis.end(), profile.begin()+4);
-    std::copy(block.begin(), block.end(), profile.begin()+36);
-    profile[68] = slot;
-    const std::string_view domain{ElementsDrivechainIdentity::WITHDRAWAL_BIP301_CHECKPOINT_DOMAIN};
-    profile.insert(profile.end(), domain.begin(), domain.end());
-    return profile;
-}
-
-static bool WithdrawalBlockFlow(const CBlock& block,
-                                const uint256& elements_genesis,
-                                const uint64_t first_index,
-                                std::vector<EthereumWithdrawalClaim>& claims,
-                                std::string* error,
-                                const WithdrawalAccumulatorState* previous = nullptr,
-                                WithdrawalAccumulatorState* next = nullptr,
-                                uint256* critical = nullptr, uint8_t slot = 0)
-{
-    claims.clear();
-    const WithdrawalHash genesis_display = DisplayBytes(elements_genesis);
-    WithdrawalHash txid_display{};
-    const auto before = previous ? AccumulatorWire(*previous) : std::array<unsigned char,2080>{};
-    const int code = drivechain::haskell::UsddExtractBlock(elements_genesis.IsNull(),ClaimProfile(),
-        [&](uint32_t action, uint64_t tx_index, uint64_t vout, uint64_t count, unsigned char* bytes) -> int64_t {
-            if (action == 6) {
-                if (!critical) throw std::logic_error("unexpected checkpoint request");
-                const auto block_hash = block.GetHash();
-                critical->SetNull();
-                const auto profile = CheckpointProfile(elements_genesis,slot,block_hash);
-                if (profile.size()>215) throw std::length_error("checkpoint metadata too large");
-                bytes[0] = previous == next;
-                std::copy(profile.begin(),profile.end(),bytes+1);
-                return profile.size()+1;
-            }
-            if (action == 7) {
-                if (!critical) throw std::logic_error("unexpected checkpoint publication");
-                std::reverse_copy(bytes,bytes+32,critical->begin());
-                return 0;
-            }
-            if (action == 5) {
-                if (!next) throw std::logic_error("unexpected accumulator publication");
-                std::copy_n(bytes,32,next->root.begin());
-                for (size_t level=0;level<WITHDRAWAL_ACCUMULATOR_DEPTH;++level)
-                    std::copy_n(bytes+32*(level+1),32,next->frontier[level].begin());
-                next->count = count;
-                return 0;
-            }
-            if (action == 0) return block.vtx.size();
-            const auto& tx = block.vtx.at(tx_index);
-            if (action == 1) {
-                if (!tx) return 0;
-                txid_display = DisplayBytes(tx->GetHash());
-                return tx->vout.size()+1;
-            }
-            const CTxOut& output = tx->vout.at(vout);
-            if (action == 3) {
-                EthereumWithdrawalClaim claim;
-                claim.elements_genesis = genesis_display;
-                claim.asset_id = DisplayBytes(output.nAsset.GetAsset().id);
-                std::copy_n(bytes+8,32,claim.vault_id.begin());
-                std::copy_n(bytes+40,20,claim.recipient.begin());
-                claim.burn_txid_display = txid_display;
-                claim.burn_vout = vout;
-                claim.claim_index = first_index + count;
-                claim.amount_usdt_micro = ReadLE64(bytes);
-                std::copy_n(bytes+60,32,claim.burn_id.begin());
-                std::copy_n(bytes+92,32,claim.leaf.begin());
-                claims.push_back(claim);
-                return 0;
-            }
-            const CScript& script = output.scriptPubKey;
-            if (action == 2) {
-                bytes[0] = output.nAsset.IsExplicit() | (output.nValue.IsExplicit()<<1) |
-                    (output.nNonce.IsNull()<<2) |
-                    ((output.nAsset.IsExplicit() && !output.nAsset.GetAsset().IsNull())<<3);
-                bytes[1] = script.empty() ? 0 : script[0];
-                return script.size();
-            }
-            if (action != 4) throw std::logic_error("unknown claim extraction action");
-            const CAsset& asset = output.nAsset.GetAsset();
-            static_assert(WITHDRAWAL_SCRIPT_SIZE == 67);
-            std::span<unsigned char,216> request{bytes,216};
-            std::fill(request.begin(),request.end(),0);
-            WriteLE64(request.data(), first_index);
-            WriteLE64(request.data()+8, count);
-            WriteLE64(request.data()+16, static_cast<uint64_t>(output.nValue.GetAmount()));
-            WriteLE64(request.data()+24, USDD_UNITS_PER_USDT_MICRO);
-            WriteLE64(request.data()+32, MAX_WITHDRAWAL_USDT_MICRO);
-            WriteLE32(request.data()+40, WITHDRAWAL_PROTOCOL_VERSION);
-            std::copy(ElementsDrivechainIdentity::WITHDRAWAL_MAGIC.begin(), ElementsDrivechainIdentity::WITHDRAWAL_MAGIC.end(), request.begin()+44);
-            request[48] = ElementsDrivechainIdentity::WITHDRAWAL_SCRIPT_PUSH_SIZE;
-            std::copy(script.begin(), script.end(), request.begin()+49);
-            const auto asset_display = DisplayBytes(asset.id);
-            std::copy(genesis_display.begin(),genesis_display.end(),request.begin()+116);
-            std::copy(asset_display.begin(),asset_display.end(),request.begin()+148);
-            std::copy(txid_display.begin(),txid_display.end(),request.begin()+180);
-            WriteBE32(request.data()+212,vout);
-            return 1;
-        }, previous ? std::span<const unsigned char>{before} : std::span<const unsigned char>{},
-        previous ? std::span<const unsigned char>{reinterpret_cast<const unsigned char*>(EmptyRoots().data()),2080} : std::span<const unsigned char>{},
-        previous ? previous->count : 0, ElementsDrivechainIdentity::WITHDRAWAL_NODE_PREFIX, critical != nullptr);
-    static constexpr const char* errors[]{"", "zero Elements genesis in withdrawal accumulator",
-        "null transaction in Elements block", "USDD withdrawal claim index overflow",
-        "malformed prior USDD withdrawal accumulator state", "USDD withdrawal accumulator count overflow",
-        "USDD BIP301 checkpoint has a null network or block hash",
-        "USDD BIP301 checkpoint has a malformed accumulator transition",
-        "USDD BIP301 checkpoint unexpectedly produced a null hash"};
-    return code == 0 || SetWithdrawalError(error,errors[code]);
-}
-
-bool ExtractEthereumWithdrawals(const CBlock& block, const uint256& elements_genesis,
-    uint64_t first_index, std::vector<EthereumWithdrawalClaim>& claims, std::string* error)
-{
-    return WithdrawalBlockFlow(block,elements_genesis,first_index,claims,error);
-}
-
-bool ApplyEthereumWithdrawals(const CBlock& block,
-                              const uint256& elements_genesis,
-                              const WithdrawalAccumulatorState& previous,
-                              WithdrawalAccumulatorState& next,
-                              std::vector<EthereumWithdrawalClaim>* claims,
-                              std::string* error)
-{
-    std::vector<EthereumWithdrawalClaim> extracted;
-    if (!WithdrawalBlockFlow(block,elements_genesis,previous.count,extracted,error,&previous,&next)) return false;
-    if (claims) *claims = std::move(extracted);
-    return true;
-}
-
-bool ComputeWithdrawalBip301CriticalHash(
-    const uint256& elements_genesis,
-    const uint8_t sidechain_slot,
-    const uint256& block_hash,
-    const WithdrawalAccumulatorState& previous,
-    const WithdrawalAccumulatorState& next,
-    uint256& critical_hash,
-    std::string* error)
+static bool DeriveBip301CriticalHash(const CBlock& block, const CBlockIndex* predecessor,
+    const Consensus::Params& consensus, uint256& critical_hash, std::string& error)
 {
     critical_hash.SetNull();
-    const auto profile = CheckpointProfile(elements_genesis,sidechain_slot,block_hash);
-    WithdrawalHash digest{};
-    const int result = drivechain::haskell::UsddCheckpoint(previous.count, next.count,
-        ElementsDrivechainIdentity::WITHDRAWAL_NODE_PREFIX, AccumulatorWire(previous), AccumulatorWire(next),
-        std::span<const unsigned char,2080>{reinterpret_cast<const unsigned char*>(EmptyRoots().data()),2080}, profile, digest);
-    static constexpr const char* errors[]{"", "USDD BIP301 checkpoint has a null network or block hash",
-        "USDD BIP301 checkpoint has a malformed accumulator transition",
-        "USDD BIP301 checkpoint unexpectedly produced a null hash"};
-    if (result) return SetWithdrawalError(error, errors[result]);
-    std::reverse_copy(digest.begin(), digest.end(), critical_hash.begin());
+    if (!consensus.drivechain_slot || !predecessor || block.hashPrevBlock != predecessor->GetBlockHash()) {
+        error = "BIP301 commitment requires the configured slot and exact predecessor";
+        return false;
+    }
+    critical_hash = block.GetHash();
     return true;
 }
 
-bool DeriveWithdrawalBip301CriticalHash(
-    const CBlock& block,
-    const uint256& elements_genesis,
-    const uint8_t sidechain_slot,
-    const WithdrawalAccumulatorState& previous,
-    WithdrawalAccumulatorState& next,
-    uint256& critical_hash,
-    std::string* error)
-{
-    std::vector<EthereumWithdrawalClaim> extracted;
-    return WithdrawalBlockFlow(block,elements_genesis,previous.count,extracted,error,
-        &previous,&next,&critical_hash,sidechain_slot);
-}
-
-bool BuildWithdrawalInclusionProof(const std::vector<EthereumWithdrawalClaim>& claims,
-                                   const uint64_t index,
-                                   WithdrawalInclusionProof& proof,
-                                   WithdrawalHash& root,
-                                   std::string* error)
-{
-    if (index >= claims.size()) {
-        return SetWithdrawalError(error, "USDD withdrawal proof index is outside the claim prefix");
-    }
-    std::vector<unsigned char> layer, encoded;
-    if (claims.size() > layer.max_size()/32) throw std::length_error("USDD claim prefix is too large");
-    layer.reserve(claims.size()*32);
-    encoded.reserve(128*200);
-    for (size_t start = 0; start < claims.size();) {
-        const size_t end = start + std::min<size_t>(128,claims.size()-start);
-        for (size_t i = start; i < end; ++i) {
-            const auto input = ClaimInput(1,claims[i]);
-            encoded.insert(encoded.end(),input.begin(),input.end());
-            encoded.insert(encoded.end(),claims[i].leaf.begin(),claims[i].leaf.end());
-        }
-        std::vector<unsigned char> leaves;
-        if (drivechain::haskell::UsddClaimPrefix(start,ClaimProfile(),encoded,leaves))
-            return SetWithdrawalError(error, "noncanonical USDD withdrawal claim prefix");
-        layer.insert(layer.end(),leaves.begin(),leaves.end());
-        encoded.clear();
-        start = end;
-    }
-
-    proof.claim = claims[index];
-    std::array<unsigned char,2080> wire{};
-    if (!drivechain::haskell::UsddAccumulator(3, index,
-            ElementsDrivechainIdentity::WITHDRAWAL_NODE_PREFIX, wire,
-            std::span<const unsigned char,2080>{reinterpret_cast<const unsigned char*>(EmptyRoots().data()),2080},
-            layer)) {
-        return SetWithdrawalError(error, "internally inconsistent USDD withdrawal proof");
-    }
-    std::copy_n(wire.begin(), 32, root.begin());
-    for (size_t level = 0; level < WITHDRAWAL_ACCUMULATOR_DEPTH; ++level) {
-        std::copy_n(wire.begin() + 32 * (level + 1), 32, proof.siblings[level].begin());
-    }
-    return true;
-}
-
-} // namespace usdd
-
-/**
- * Recompute the only BIP301 critical hash accepted for `block` from its
- * predecessor's persisted consensus accumulator. This is intentionally kept
- * beside block validation so no caller can substitute an RPC/indexer view.
- */
-static bool DeriveUsddBip301CriticalHash(
-    const CBlock& block,
-    const CBlockIndex* predecessor,
-    const Consensus::Params& consensus,
-    uint256& critical_hash,
-    std::string& error)
-{
-    usdd::WithdrawalAccumulatorState derived;
-    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::USDD_CHECKPOINT_CONNECTION, [&](uint32_t step) -> uint32_t {
-        switch (step) {
-        case 1: critical_hash.SetNull(); return 1;
-        case 2: return consensus.drivechain_slot.has_value();
-        case 3: error = "USDD BIP301 checkpoint requires a configured sidechain slot"; return 0;
-        case 4: return predecessor != nullptr;
-        case 5: return predecessor->m_usdd_withdrawal_accumulator.has_value();
-        case 6: error = "USDD BIP301 checkpoint requires the predecessor accumulator; reindex required"; return 0;
-        case 7: return usdd::DeriveWithdrawalBip301CriticalHash(
-            block, consensus.hashGenesisBlock, *consensus.drivechain_slot,
-            *predecessor->m_usdd_withdrawal_accumulator, derived,
-            critical_hash, &error);
-        default: throw std::logic_error("invalid USDD checkpoint connection step");
-        }
-    });
-}
 /** Time to wait between writing blocks/block index to disk. */
 static constexpr std::chrono::minutes DATABASE_WRITE_INTERVAL{5};
 /** Time to wait between flushing chainstate to disk. */
@@ -544,295 +142,6 @@ TRACEPOINT_SEMAPHORE(validation, block_connected);
 TRACEPOINT_SEMAPHORE(utxocache, flush);
 TRACEPOINT_SEMAPHORE(mempool, replaced);
 TRACEPOINT_SEMAPHORE(mempool, rejected);
-
-static void ClearBondScriptContext(PrecomputedTransactionData& txdata)
-{
-    txdata.m_bond_v2_configuration_hash.reset();
-    txdata.m_bond_v2_asset_id.reset();
-    txdata.m_bond_v2_deployment_commitment.reset();
-    txdata.m_bond_v2_transition_cmr.reset();
-    txdata.m_bond_v2_collateral_vault_script_sha256.reset();
-    txdata.m_bond_v2_collateral_vault_cmr.reset();
-    txdata.m_bond_v2_insurance_reserve_script_sha256.reset();
-    txdata.m_bond_v2_insurance_reserve_cmr.reset();
-    txdata.m_bond_v2_incremental_activation_program_id.reset();
-    txdata.m_bond_v2_incremental_activation_configuration_hash.reset();
-    txdata.m_bond_v2_incremental_activation_cmr.reset();
-    txdata.m_incremental_successor_program_id.reset();
-    txdata.m_bond_v2_incremental_successor_configuration_hash.reset();
-    txdata.m_incremental_successor_transition_cmr.reset();
-    txdata.m_incremental_successor_state_node_domain_sha256.reset();
-    txdata.m_prior_active_bond_inbox_root.reset();
-    txdata.m_prior_active_bond_inbox_count.reset();
-    txdata.m_current_sidechain_height.reset();
-}
-
-static void ClearExchangeScriptContext(PrecomputedTransactionData& txdata)
-{
-    txdata.m_prior_active_exchange_state_root.reset();
-    txdata.m_prior_active_forced_inbox_root.reset();
-    txdata.m_prior_active_deposit_inbox_root.reset();
-    txdata.m_prior_active_forced_processed_cursor.reset();
-    txdata.m_prior_active_deposit_processed_cursor.reset();
-    txdata.m_current_bmm_parent_block_hash.reset();
-    txdata.m_current_bmm_parent_height.reset();
-    txdata.m_current_bmm_parent_mtp.reset();
-    ClearBondScriptContext(txdata);
-}
-
-static void BindPriorActiveExchangeStateRoot(
-    PrecomputedTransactionData& txdata,
-    const CBlockIndex* previous,
-    const drivechain::BmmParentContext* authenticated_parent)
-{
-    uint256 exchange_root;
-    uint256 forced_root;
-    uint256 deposit_root;
-    uint64_t forced_cursor{0};
-    uint64_t deposit_cursor{0};
-    std::string error;
-    const auto admitted = drivechain::haskell::ParentReplayAll<4>({
-        [&] { return ecx::GetPriorActiveExchangeStateRoot(previous, exchange_root, error); },
-        [&] { return ecx::GetPriorActiveForcedInboxRoot(previous, forced_root, error); },
-        [&] { return ecx::GetPriorActiveDepositInboxRoot(previous, deposit_root, error); },
-        [&] { return ecx::GetPriorActiveInboxCursors(previous, forced_cursor, deposit_cursor, error); },
-    });
-    if (admitted) {
-        txdata.m_prior_active_exchange_state_root = exchange_root;
-        txdata.m_prior_active_forced_inbox_root = forced_root;
-        txdata.m_prior_active_deposit_inbox_root = deposit_root;
-        txdata.m_prior_active_forced_processed_cursor = forced_cursor;
-        txdata.m_prior_active_deposit_processed_cursor = deposit_cursor;
-    } else {
-        txdata.m_prior_active_exchange_state_root.reset();
-        txdata.m_prior_active_forced_inbox_root.reset();
-        txdata.m_prior_active_deposit_inbox_root.reset();
-        txdata.m_prior_active_forced_processed_cursor.reset();
-        txdata.m_prior_active_deposit_processed_cursor.reset();
-    }
-
-    if (authenticated_parent) {
-        txdata.m_current_bmm_parent_block_hash = authenticated_parent->block_hash;
-        txdata.m_current_bmm_parent_height = authenticated_parent->height;
-        txdata.m_current_bmm_parent_mtp = authenticated_parent->median_time_past;
-    } else {
-        txdata.m_current_bmm_parent_block_hash.reset();
-        txdata.m_current_bmm_parent_height.reset();
-        txdata.m_current_bmm_parent_mtp.reset();
-    }
-
-    const auto& deployment{ecx::LayerTwoLabsExchangeConsensus()};
-    const auto& frozen{deployment.bond_v2};
-    const auto have_capital = drivechain::haskell::ParentReplayAll<2>({
-        [&] { return previous != nullptr; },
-        [&] { return previous->ecxBondV2Capital.has_value(); },
-    });
-    if (have_capital) {
-        const auto& capital{*previous->ecxBondV2Capital};
-        const bool swaps = capital.proof_profile == 2;
-        const auto& successor_program = swaps ? deployment.swap_successor.program_id : frozen.incremental_successor_program_id;
-        const auto& successor_configuration = swaps ? deployment.swap_successor.configuration_hash : frozen.incremental_successor_configuration_hash;
-        const auto& successor_cmr = swaps ? deployment.swap_successor.transition_cmr : frozen.incremental_successor_transition_cmr;
-        const auto& successor_domain = swaps ? deployment.swap_successor.state_node_domain_sha256 : frozen.incremental_successor_state_node_domain_sha256;
-        uint64_t prior_bond_inbox_count{0};
-        const auto matches_identity = [&](const auto& configuration, const auto& program, const auto& cmr) {
-            return drivechain::haskell::ParentReplayAll<3>({
-                [&] { return capital.configuration_hash == configuration; },
-                [&] { return capital.transition_program_id == program; },
-                [&] { return capital.transition_cmr == cmr; },
-            });
-        };
-        const bool finite_identity = !swaps && matches_identity(frozen.configuration_hash,
-            frozen.transition_program_id, frozen.transition_cmr);
-        const bool successor_identity = matches_identity(successor_configuration,successor_program,successor_cmr) &&
-            (!swaps || ecx::CheckCapitalProjectionIdentity(capital,previous->hashExchangeStateRoot,deployment));
-        const auto admitted_bond = drivechain::haskell::ParentReplayStore(
-            drivechain::haskell::ReplayStoreFlow::BOND_CONTEXT_ADMISSION, [&](uint32_t step) -> uint32_t {
-            switch (step) {
-            case 1: return frozen.activation_enabled;
-            case 2: return frozen.identities_frozen;
-            case 3: return unsigned{finite_identity} | (unsigned{successor_identity} << 1);
-            case 4: return capital.bond_asset_id == frozen.bond_asset_id;
-            case 5: return capital.bond_deployment_commitment == frozen.bond_deployment_commitment;
-            case 6: return capital.node_bond_inbox_entry_count.ToU64(prior_bond_inbox_count);
-            case 7: return !frozen.insurance_reserve_script_sha256.IsNull();
-            case 8: return !frozen.insurance_reserve_covenant_cmr.IsNull();
-            case 9: return !frozen.collateral_vault_covenant_cmr.IsNull();
-            case 10: return !frozen.incremental_activation_program_id.IsNull();
-            case 11: return !frozen.incremental_activation_configuration_hash.IsNull();
-            case 12: return !frozen.incremental_activation_cmr.IsNull();
-            case 13: return !successor_program.IsNull();
-            case 14: return !successor_configuration.IsNull();
-            case 15: return !successor_cmr.IsNull();
-            case 16: return !successor_domain.IsNull();
-            case 17: return 0;
-            default: throw std::logic_error("invalid bond context admission action");
-            }
-        });
-        if (admitted_bond) {
-            txdata.m_bond_v2_configuration_hash = frozen.configuration_hash;
-            txdata.m_bond_v2_asset_id = frozen.bond_asset_id;
-            txdata.m_bond_v2_deployment_commitment =
-                frozen.bond_deployment_commitment;
-            txdata.m_bond_v2_transition_cmr = frozen.transition_cmr;
-            txdata.m_bond_v2_collateral_vault_script_sha256 =
-                ecx::LayerTwoLabsExchangeConsensus().collateral_vault_script_hash;
-            txdata.m_bond_v2_collateral_vault_cmr =
-                frozen.collateral_vault_covenant_cmr;
-            txdata.m_bond_v2_insurance_reserve_script_sha256 =
-                frozen.insurance_reserve_script_sha256;
-            txdata.m_bond_v2_insurance_reserve_cmr =
-                frozen.insurance_reserve_covenant_cmr;
-            txdata.m_bond_v2_incremental_activation_program_id =
-                frozen.incremental_activation_program_id;
-            txdata.m_bond_v2_incremental_activation_configuration_hash =
-                frozen.incremental_activation_configuration_hash;
-            txdata.m_bond_v2_incremental_activation_cmr =
-                frozen.incremental_activation_cmr;
-            txdata.m_incremental_successor_program_id =
-                successor_program;
-            txdata.m_bond_v2_incremental_successor_configuration_hash =
-                successor_configuration;
-            txdata.m_incremental_successor_transition_cmr =
-                successor_cmr;
-            txdata.m_incremental_successor_state_node_domain_sha256 =
-                successor_domain;
-            txdata.m_prior_active_bond_inbox_root =
-                capital.node_bond_inbox_head_root;
-            txdata.m_prior_active_bond_inbox_count =
-                prior_bond_inbox_count;
-            txdata.m_current_sidechain_height =
-                drivechain::haskell::NextBondContextHeight(previous->nHeight);
-        } else {
-            ClearBondScriptContext(txdata);
-        }
-    } else {
-        ClearBondScriptContext(txdata);
-    }
-}
-
-// Version-5 one-shot activation alone exposes its historical execution anchor
-// through the frozen leaf's parent jets. The BIP301 parent and locktime clock
-// remain separate and are never overwritten by this transaction context.
-static void BindActivationExecutionAnchor(PrecomputedTransactionData& data,
-    const CTransaction& tx, const CBlockIndex* previous)
-{
-    data.m_ecx_activation_execution_anchor_authenticated = false;
-    const auto& consensus = Params().GetConsensus();
-    const auto& config = ecx::LayerTwoLabsExchangeConsensus();
-    std::array<unsigned char, 32> program{};
-    std::array<unsigned char, 364> values{};
-    const auto equal_hash = [](const auto& bytes, size_t offset, const auto& hash) {
-        return std::equal(bytes.begin() + offset, bytes.begin() + offset + 32,
-            hash.begin(), [](unsigned char a, auto b) { return a == static_cast<unsigned char>(b); });
-    };
-    DrivechainParentBlockContext bid, anchor;
-    uint256 hash;
-    uint64_t mtp{0};
-    std::string error;
-    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::ACTIVATION_ANCHOR,
-        [&](uint32_t step) -> uint32_t {
-        switch (step) {
-        case 1: return consensus.drivechain_slot.has_value();
-        case 2: return previous != nullptr;
-        case 3: return previous->ecxBondV2Capital.has_value();
-        case 4: return previous->ecxBondV2Capital->proof_profile == 0;
-        case 5: return config.bond_v2.activation_enabled;
-        case 6: return config.bond_v2.identities_frozen;
-        case 7: return !tx.vin.empty();
-        case 8: return tx.vin[0].prevout == config.genesis_state_outpoint;
-        case 9: return !tx.witness.vtxinwit.empty();
-        case 10: return ecx::ParseActivationAnnex(tx.witness.vtxinwit[0].scriptWitness.stack, program, values);
-        case 11: return equal_hash(program, 0, config.bond_v2.incremental_activation_program_id);
-        case 12: return equal_hash(tx.witness.vtxinwit[0].scriptWitness.stack[2], 0, config.bond_v2.incremental_activation_cmr);
-        case 13: return equal_hash(values, 4, config.bond_v2.incremental_activation_configuration_hash);
-        case 14: return equal_hash(values, 36, config.bond_v2.configuration_hash);
-        case 15: return equal_hash(values, 100, config.bond_v2.incremental_successor_configuration_hash);
-        case 16: return equal_hash(values, 164, tx.GetHash());
-        case 17: return equal_hash(values, 228, config.chain_id);
-        case 18: return data.m_current_bmm_parent_block_hash.has_value();
-        case 19: return data.m_current_bmm_parent_height.has_value();
-        case 20: return data.m_current_bmm_parent_mtp.has_value();
-        case 21:
-            bid.parent_hash = *data.m_current_bmm_parent_block_hash;
-            bid.parent_height = *data.m_current_bmm_parent_height;
-            bid.parent_median_time_past = *data.m_current_bmm_parent_mtp;
-            return 1;
-        case 22:
-            // Clear before authentication, including unavailable/reorged anchors.
-            data.m_current_bmm_parent_block_hash.reset();
-            data.m_current_bmm_parent_height.reset();
-            data.m_current_bmm_parent_mtp.reset();
-            return 1;
-        case 23: return previous->m_drivechain_anchor.has_value();
-        case 24: return !bid.parent_hash.IsNull();
-        case 25:
-            std::copy_n(values.begin() + 196, 32, hash.begin());
-            mtp = ReadBE64(values.data() + 332);
-            return 1;
-        case 26: return GetDrivechainExecutionAnchor(*consensus.drivechain_slot, hash,
-            previous->m_drivechain_anchor->parent_height, bid, anchor, &error);
-        case 27: return mtp == anchor.parent_median_time_past;
-        case 28:
-            data.m_current_bmm_parent_block_hash = anchor.parent_hash;
-            data.m_current_bmm_parent_height = anchor.parent_height;
-            data.m_current_bmm_parent_mtp = anchor.parent_median_time_past;
-            data.m_ecx_activation_execution_anchor_authenticated = true;
-            return 1;
-        default: throw std::logic_error("invalid activation anchor action");
-        }
-    });
-}
-
-static void BindPriorActiveExchangeStateRootFromView(
-    PrecomputedTransactionData& txdata,
-    const CBlockIndex* previous,
-    const CCoinsViewCache& view,
-    const bool elements_mode)
-{
-    drivechain::BmmParentContext parent;
-    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::PARENT_CONTEXT,
-        [&](uint32_t step) -> uint32_t {
-        switch (step) {
-        case 1: return elements_mode;
-        // Bitcoin-mode admission must also clear any previously bound context.
-        case 2: ClearExchangeScriptContext(txdata); return 1;
-        case 3: return Params().GetConsensus().drivechain_slot.has_value();
-        case 4: {
-            // Native admission uses the bidder's active parent, not private BMM
-            // state. Block validation authenticates its coinbase parent; the
-            // script cache key includes the complete parent tuple.
-            DrivechainParentBlockContext native_parent;
-            const auto& frozen = ecx::LayerTwoLabsExchangeConsensus().bond_v2;
-            std::string error;
-            const bool have_parent = drivechain::haskell::ParentReplayAll<4>({
-                [&] { return previous != nullptr; },
-                [&] { return frozen.activation_enabled || ecx::LayerTwoLabsExchangeConsensus().custody_successor.activation_enabled; },
-                [&] { return drivechain::haskell::BmmActivation(4, 1, previous->nHeight,
-                    ecx::LayerTwoLabsExchangeConsensus().activation_height) != 0; },
-                [&] { return GetDrivechainMempoolParentContext(*Params().GetConsensus().drivechain_slot, native_parent, &error); },
-            });
-            if (have_parent) {
-                parent.block_hash = native_parent.parent_hash;
-                parent.height = native_parent.parent_height;
-                parent.median_time_past = native_parent.parent_median_time_past;
-            }
-            return have_parent;
-        }
-        case 5: {
-            drivechain::BmmL1State prior_bmm_state;
-            std::string error;
-            return drivechain::haskell::ParentReplayAll<2>({
-                [&] { return drivechain::GetEffectiveBmmState(view, previous, prior_bmm_state, error); },
-                [&] { return drivechain::GetBmmParentContext(prior_bmm_state, parent, error); },
-            });
-        }
-        case 6: BindPriorActiveExchangeStateRoot(txdata, previous, &parent); return 1;
-        case 7: BindPriorActiveExchangeStateRoot(txdata, previous, nullptr); return 1;
-        default: throw std::logic_error("invalid parent context action");
-        }
-    });
-}
 
 const CBlockIndex* Chainstate::FindForkInGlobalIndex(const CBlockLocator& locator) const
 {
@@ -1799,7 +1108,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws, std::span<const CTr
     TxValidationState& state = ws.m_state;
     std::set<std::pair<uint256, COutPoint>>& setPeginsSpent = ws.m_set_pegins_spent;
 
-    if (!CheckTransaction(tx, state, chainparams.GetConsensus().ExplicitOnlyActive(drivechain::haskell::NextBlockHeight(true, m_active_chainstate.m_chain.Height())))) {
+    if (!CheckTransaction(tx, state)) {
         return false; // state filled in by CheckTransaction
     }
 
@@ -1807,32 +1116,9 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws, std::span<const CTr
     if (tx.IsCoinBase())
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "coinbase");
 
-    std::string ecx_source_error;
-    if (chainparams.GetConsensus().elements_mode &&
-        !ecx::CheckCustodyReservedSpendPolicy(tx,m_active_chainstate.m_chain.Tip(),ecx_source_error,
-            ecx::LayerTwoLabsExchangeConsensus(),[&](const Txid& parent) {
-                // Package parents are not in the main mempool during prechecks.
-                for (const auto& candidate : package) if (candidate->GetHash()==parent) return candidate;
-                return m_pool.get(parent.ToUint256());
-            }))
-        return state.Invalid(TxValidationResult::TX_NOT_STANDARD,"ecx-custody-pair-policy",ecx_source_error);
-    PrecomputedTransactionData exact_admission_context;
-    if (ecx::LayerTwoLabsExchangeConsensus().custody_successor.activation_enabled)
-        BindPriorActiveExchangeStateRootFromView(exact_admission_context,m_active_chainstate.m_chain.Tip(),
-            m_active_chainstate.CoinsTip(),chainparams.GetConsensus().elements_mode);
-    if (drivechain::haskell::ParentReplayAll<2>({
-        [&] { return chainparams.GetConsensus().elements_mode; },
-        [&] { return !ecx::CheckSourceTransactionPolicy(tx,
-            drivechain::haskell::NextBlockHeight(true, m_active_chainstate.m_chain.Height()), ecx_source_error,
-            ecx::LayerTwoLabsExchangeConsensus(),exact_admission_context.m_current_bmm_parent_height); },
-    })) {
-        return state.Invalid(TxValidationResult::TX_NOT_STANDARD, "ecx-source-policy", ecx_source_error);
-    }
-
     // Rather not work on nonstandard transactions (unless -testnet/-regtest)
     std::string reason;
-    if (m_pool.m_opts.require_standard && !IsStandardTx(tx, m_pool.m_opts.max_datacarrier_bytes, m_pool.m_opts.permit_bare_multisig, m_pool.m_opts.dust_relay_feerate, reason,
-            chainparams.GetConsensus().elements_mode ? &ecx::LayerTwoLabsExchangeConsensus() : nullptr)) {
+    if (m_pool.m_opts.require_standard && !IsStandardTx(tx, m_pool.m_opts.max_datacarrier_bytes, m_pool.m_opts.permit_bare_multisig, m_pool.m_opts.dust_relay_feerate, reason)) {
         return state.Invalid(TxValidationResult::TX_NOT_STANDARD, reason);
     }
 
@@ -2001,13 +1287,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws, std::span<const CTr
         return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "non-BIP68-final");
     }
 
-    // The mempool holds txs for the next block, so pass height+1 to CheckTxInputs
-    if (drivechain::haskell::ParentReplayAll<2>({
-        [&] { return chainparams.GetConsensus().ExplicitOnlyActive(drivechain::haskell::NextBlockHeight(true, m_active_chainstate.m_chain.Height())); },
-        [&] { return !Consensus::HasOnlyExplicitCreations(tx); },
-    })) {
-        return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-confidential-disabled");
-    }
+    // The mempool holds transactions for the next block.
     CAmountMap fee_map;
     if (!Consensus::CheckTxInputs(tx, state, m_view, m_active_chainstate.m_chain.Height() + 1, fee_map, setPeginsSpent, nullptr, true, true, fedpegscripts)) {
         return false; // state filled in by CheckTxInputs
@@ -2030,7 +1310,7 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws, std::span<const CTr
     }
 
     // Check for non-standard witnesses.
-    if (tx.HasWitness() && m_pool.m_opts.require_standard && !IsWitnessStandard(tx, m_view, chainparams.GetConsensus().elements_mode ? &ecx::LayerTwoLabsExchangeConsensus() : nullptr)) {
+    if (tx.HasWitness() && m_pool.m_opts.require_standard && !IsWitnessStandard(tx, m_view)) {
         return state.Invalid(TxValidationResult::TX_WITNESS_MUTATED, "bad-witness-nonstandard");
     }
 
@@ -2408,12 +1688,6 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
             m_active_chainstate.m_chain.Tip(),
             args.m_chainparams.GetConsensus());
     unsigned int scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS;
-    BindPriorActiveExchangeStateRootFromView(
-        ws.m_precomputed_txdata,
-        m_active_chainstate.m_chain.Tip(),
-        m_active_chainstate.CoinsTip(),
-        args.m_chainparams.GetConsensus().elements_mode);
-    BindActivationExecutionAnchor(ws.m_precomputed_txdata, tx, m_active_chainstate.m_chain.Tip());
 
     // Temporarily add additional script flags based on the activation of
     // Dynamic Federations. This can be included in the
@@ -2453,12 +1727,6 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     const uint256& hash = ws.m_hash;
     TxValidationState& state = ws.m_state;
     const CChainParams& chainparams = args.m_chainparams;
-    BindPriorActiveExchangeStateRootFromView(
-        ws.m_precomputed_txdata,
-        m_active_chainstate.m_chain.Tip(),
-        m_active_chainstate.CoinsTip(),
-        chainparams.GetConsensus().elements_mode);
-    BindActivationExecutionAnchor(ws.m_precomputed_txdata, tx, m_active_chainstate.m_chain.Tip());
 
     // Re-read the still-locked active tip for the consensus-flags pass and
     // clear any stale context if the network, tip, or anchor is unsuitable.
@@ -3368,29 +2636,11 @@ V11AtomicBmmScriptCacheSuffix EncodeV11AtomicBmmScriptCacheSuffix(
     return suffix;
 }
 
-static std::array<unsigned char,822> EncodeForkScriptCacheContext(const PrecomputedTransactionData& data)
+static DataStream EncodeForkScriptCacheContext(const PrecomputedTransactionData& data)
 {
-    DataStream input;
-    input << data.m_ecx_activation_execution_anchor_authenticated;
-    for (const auto* value : {
-        &data.m_prior_active_exchange_state_root, &data.m_prior_active_forced_inbox_root,
-        &data.m_prior_active_deposit_inbox_root, &data.m_current_bmm_parent_block_hash,
-        &data.m_bond_v2_configuration_hash, &data.m_bond_v2_asset_id,
-        &data.m_bond_v2_deployment_commitment, &data.m_bond_v2_transition_cmr,
-        &data.m_bond_v2_collateral_vault_script_sha256, &data.m_bond_v2_collateral_vault_cmr,
-        &data.m_bond_v2_insurance_reserve_script_sha256, &data.m_bond_v2_insurance_reserve_cmr,
-        &data.m_bond_v2_incremental_activation_program_id, &data.m_bond_v2_incremental_activation_configuration_hash,
-        &data.m_bond_v2_incremental_activation_cmr, &data.m_incremental_successor_program_id,
-        &data.m_bond_v2_incremental_successor_configuration_hash, &data.m_incremental_successor_transition_cmr,
-        &data.m_incremental_successor_state_node_domain_sha256, &data.m_prior_active_bond_inbox_root})
-        WriteScriptCacheField(input,*value);
-    for (const auto* value : {&data.m_current_bmm_parent_height, &data.m_current_bmm_parent_mtp,
-        &data.m_prior_active_forced_processed_cursor, &data.m_prior_active_deposit_processed_cursor,
-        &data.m_prior_active_bond_inbox_count, &data.m_current_sidechain_height, &data.m_bmm_parent_mtp})
-        WriteScriptCacheField(input,*value);
-    WriteScriptCacheField(input,data.m_prior_active_bmm_parent_checkpoint);
-    std::array<unsigned char,822> encoded;
-    drivechain::haskell::ScriptCacheEncode(false,input,encoded);
+    DataStream encoded;
+    WriteScriptCacheField(encoded, data.m_bmm_parent_mtp);
+    WriteScriptCacheField(encoded, data.m_prior_active_bmm_parent_checkpoint);
     return encoded;
 }
 
@@ -3449,18 +2699,11 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
     uint256 hashCacheEntry;
     CSHA256 hasher = validation_cache.ScriptExecutionCacheHasher();
     const auto context = EncodeForkScriptCacheContext(txdata);
-    hasher.Write(context.data(),1);
-    static const uint256 ecx_cache_domain = [] {
-        static constexpr unsigned char tag[]{
-             'E','C','X','/','S','i','m','p','l','i','c','i','t','y','-','c','a','c','h','e','/','v','1','0'};
-        uint256 digest;
-        CSHA256().Write(tag, sizeof(tag)).Finalize(digest.begin());
-        return digest;
-    }();
+    static constexpr unsigned char cache_domain[]{"Elements/BMM-script-cache/v1"};
     hasher.Write(tx.GetWitnessHash().ToUint256().begin(), 32)
-        .Write((unsigned char*)&flags, sizeof(flags))
-        .Write(ecx_cache_domain.begin(), 32)
-        .Write(context.data()+1,context.size()-1)
+        .Write(reinterpret_cast<const unsigned char*>(&flags), sizeof(flags))
+        .Write(cache_domain, sizeof(cache_domain))
+        .Write(reinterpret_cast<const unsigned char*>(context.data()), context.size())
         .Finalize(hashCacheEntry.begin());
     AssertLockHeld(cs_main); //TODO: Remove this requirement by making CuckooCache not require external locks
     if (validation_cache.m_script_execution_cache.contains(hashCacheEntry, !cacheFullScriptStore)) {
@@ -3711,18 +2954,10 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
     if (!drivechain::haskell::ParentReplayChoose({
         [&] { return m_chainman.GetParams().GetConsensus().elements_mode; },
         [&] {
-            const auto restore = [&](bool exchange) {
-                std::string error;
-                const bool restored = exchange
-                    ? ecx::DisconnectExchangeState(block, pindex->pprev, view, pindex->nHeight, error)
-                    : drivechain::DisconnectBmmState(block, pindex->pprev, view, pindex->nHeight, error);
-                if (!restored) LogError("DisconnectBlock(): cannot restore %s state: %s",
-                    exchange ? "ECX exchange" : "deterministic BMM", error);
-                return restored;
-            };
-            return drivechain::haskell::ParentReplayAll<2>({
-                [&] { return restore(true); }, [&] { return restore(false); },
-            });
+            std::string error;
+            const bool restored = drivechain::DisconnectBmmState(block, pindex->pprev, view, pindex->nHeight, error);
+            if (!restored) LogError("DisconnectBlock(): cannot restore deterministic BMM state: %s", error);
+            return restored;
         },
         [] { return true; },
     })) return DISCONNECT_FAILED;
@@ -3812,11 +3047,6 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index,
         flags |= SCRIPT_VERIFY_SIMPLICITY;
     }
 
-    drivechain::haskell::ParentReplayAll<2>({
-        [&] { return consensusparams.enable_usdd_sp1_annex; },
-        [&] { flags |= SCRIPT_VERIFY_USDD_SP1_ANNEX; return true; },
-    });
-
     return flags;
 }
 
@@ -3852,8 +3082,6 @@ bool CheckNativeCandidateTransactionScripts(
     context.height = parent.parent_height;
     context.median_time_past = parent.parent_median_time_past;
     PrecomputedTransactionData txdata(params.HashGenesisBlock());
-    BindPriorActiveExchangeStateRoot(txdata, previous, &context);
-    BindActivationExecutionAnchor(txdata, tx, previous);
     txdata.m_bmm_parent_mtp = parent.parent_median_time_past;
     txdata.m_prior_active_bmm_parent_checkpoint =
         GetPriorActiveBmmParentCheckpoint(previous, params.GetConsensus());
@@ -4130,16 +3358,10 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
     const Consensus::Params& consensusParams = params.GetConsensus();
     // Add genesis outputs but don't validate.
     if (block_hash == consensusParams.hashGenesisBlock) {
-        const auto empty_accumulator = usdd::WithdrawalAccumulatorState::Empty();
-        if (drivechain::haskell::ParentReplayAll<2>({
-            [&] { return pindex->m_usdd_withdrawal_accumulator.has_value(); },
-            [&] { return *pindex->m_usdd_withdrawal_accumulator != empty_accumulator; },
-        })) return state.Error("genesis has a nonempty USDD withdrawal accumulator");
         if (!fJustCheck) {
             if (consensusParams.connect_genesis_outputs) {
                 for (const auto& tx : block.vtx) AddCoins(view, *tx, 0);
             }
-            pindex->m_usdd_withdrawal_accumulator = empty_accumulator;
             m_blockman.m_dirty_blockindex.insert(pindex);
             view.SetBestBlock(pindex->GetBlockHash());
         }
@@ -4162,9 +3384,9 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
             // Candidate P is authenticated, but has no successor/M7 before its self-check.
             authenticated_parent_mtp = candidate_context->parent_median_time_past;
             return 1;
-        case 6: return DeriveUsddBip301CriticalHash(block, pindex->pprev, consensusParams,
+        case 6: return DeriveBip301CriticalHash(block, pindex->pprev, consensusParams,
             expected_critical_hash, checkpoint_error);
-        case 7: return state.Error(strprintf("cannot derive USDD BIP301 checkpoint for block %s: %s",
+        case 7: return state.Error(strprintf("cannot derive BIP301 block commitment for block %s: %s",
             block_hash.GetHex(), checkpoint_error));
         case 8: return finalized_context != nullptr;
         case 9: return finalized_context->critical_hash == expected_critical_hash;
@@ -4243,72 +3465,14 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
         LogError("%s: Consensus::CheckBlock: %s\n", __func__, state.ToString());
         return false;
     }
-    // Re-enforce the witness-dependent proof lane during every authoritative
-    // connect, including reindex-chainstate where ContextualCheckBlock is
-    // skipped.  This is deliberately outside CheckBlock because CheckBlock
-    // may run before the witness commitment has been authenticated.
-    if (!CheckUsddSp1AnnexBlockResources(block, state, consensusParams)) {
-        return (LogError("%s: USDD SP1 annex resource limit: %s",
-                     __func__, state.ToString()), false);
+    const DrivechainParentBlockContext* parent = candidate_context ? candidate_context :
+        (bmm_context ? &*bmm_context : nullptr);
+    if (consensusParams.elements_mode) {
+        std::string error;
+        if (!drivechain::CheckBmmHeader(block, pindex->pprev, error, allow_incomplete_candidate) ||
+            !drivechain::ConnectBmmState(block, pindex->pprev, view, pindex->nHeight, allow_incomplete_candidate, error))
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-drivechain-bmm-proof", error);
     }
-
-    // Capture the already-authenticated parent context before this block's
-    // BMM proof advances chainstate. Simplicity deliberately receives this
-    // known prior context, never the future successor that approved the block.
-    std::optional<drivechain::BmmL1State> prior_bmm_state;
-    std::optional<drivechain::BmmParentContext> exchange_parent;
-    const DrivechainParentBlockContext* parent{nullptr};
-    // Bind authenticated P, never successor Q. A present candidate takes
-    // priority even if unusable; it must not fall back to another context.
-    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EXCHANGE_PARENT,
-        [&](uint32_t step) -> uint32_t {
-            switch (step) {
-            case 1: return consensusParams.drivechain_slot.has_value();
-            case 2: parent = candidate_context; return parent != nullptr;
-            case 3: parent = bmm_context ? &*bmm_context : nullptr; return parent != nullptr;
-            case 4: return !parent->parent_hash.IsNull();
-            case 5: return parent->parent_median_time_past != 0;
-            case 6: exchange_parent = drivechain::BmmParentContext{parent->parent_hash, parent->parent_height, parent->parent_median_time_past}; return 1;
-            default: throw std::logic_error("invalid exchange parent selection action");
-            }
-        });
-    drivechain::BmmL1State prior_bmm_candidate;
-    drivechain::BmmParentContext private_parent;
-    std::string prior_bmm_error, bmm_error, exchange_error;
-    if (!drivechain::haskell::ParentReplayStore(
-        drivechain::haskell::ReplayStoreFlow::CONNECTION_STATE, [&](uint32_t step) -> uint32_t {
-        switch (step) {
-        case 1: return consensusParams.elements_mode;
-        case 2: return drivechain::GetEffectiveBmmState(view, pindex->pprev, prior_bmm_candidate, prior_bmm_error);
-        case 3: prior_bmm_state = std::move(prior_bmm_candidate); return 1;
-        case 4: return drivechain::haskell::ParentReplayAll<2>({
-            [&] { return !consensusParams.drivechain_slot.has_value(); },
-            [&] { return prior_bmm_state.has_value(); },
-        });
-        case 5: return drivechain::GetBmmParentContext(*prior_bmm_state, private_parent, prior_bmm_error);
-        case 6: exchange_parent = private_parent; return 1;
-        case 7: return drivechain::haskell::ParentReplayAll<2>({
-            [&] { return drivechain::CheckBmmHeader(block, pindex->pprev, bmm_error, allow_incomplete_candidate); },
-            [&] { return drivechain::ConnectBmmState(block, pindex->pprev, view,
-                pindex->nHeight, allow_incomplete_candidate, bmm_error); },
-        });
-        case 8: return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-drivechain-bmm-proof", bmm_error);
-        case 9: return ecx::ConnectExchangeState(block, pindex->pprev, view, pindex->nHeight,
-                exchange_error, ecx::LayerTwoLabsExchangeConsensus(),
-                drivechain::haskell::ParentReplayAll<2>({
-                    [&] { return consensusParams.drivechain_slot.has_value(); },
-                    [&] { return exchange_parent.has_value(); },
-                })
-                    ? std::optional<uint64_t>{exchange_parent->height}
-                    : std::nullopt,
-                allow_incomplete_candidate);
-        case 10: return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-ecx-exchange-state", exchange_error);
-        case 11: return ecx::CheckWithdrawalBundleEnvelope(block, pindex->pprev, pindex->nHeight,
-                exchange_error, ecx::LayerTwoLabsExchangeConsensus());
-        case 12: return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-ecx-withdrawal-bundle", exchange_error);
-        default: throw std::logic_error("invalid connection state action");
-        }
-    })) return false;
 
     m_chainman.num_blocks_total++;
 
@@ -4355,10 +3519,6 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
         }
     }
 
-    // Fresh custody snapshots require actual proof/script verification, even
-    // when historical assume-valid optimization is available for other lanes.
-    if (ecx::LayerTwoLabsExchangeConsensus().custody_successor.activation_enabled &&
-        pindex->nHeight>=ecx::LayerTwoLabsExchangeConsensus().activation_height) fScriptChecks=true;
 
     assert(m_chainman.num_blocks_total > 0);
     const auto time_1{SteadyClock::now()};
@@ -4483,16 +3643,6 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
         GetPriorActiveBmmParentCheckpoint(pindex->pprev, m_chainman.GetParams().GetConsensus());
     for (unsigned int i = 0; i< block.vtx.size(); i++ ){
         txsdata.emplace_back(m_chainman.GetParams().HashGenesisBlock());
-        drivechain::haskell::ParentReplayChoose({
-            [&] { return m_chainman.GetParams().GetConsensus().elements_mode; },
-            [&] {
-                BindPriorActiveExchangeStateRoot(txsdata.back(), pindex->pprev,
-                    exchange_parent ? &*exchange_parent : nullptr);
-                BindActivationExecutionAnchor(txsdata.back(), *block.vtx[i], pindex->pprev);
-                return true;
-            },
-            [&] { ClearExchangeScriptContext(txsdata.back()); return true; },
-        });
         txsdata.back().m_bmm_parent_mtp = authenticated_parent_mtp;
         txsdata.back().m_prior_active_bmm_parent_checkpoint = prior_active_parent;
     }
@@ -4539,23 +3689,6 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
     {
         if (!state.IsValid()) break;
         const CTransaction &tx = *(block.vtx[i]);
-
-        // Recheck here: historical/reindex paths may omit ContextualCheckBlock.
-        if (!drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CONTEXTUAL_OUTPUTS,
-            [&](uint32_t step) -> uint32_t {
-                switch (step) {
-                case 1: return m_chainman.GetConsensus().ExplicitOnlyConfigured();
-                case 2: {
-                    TxValidationState tx_state;
-                    return CheckTransaction(tx, tx_state, m_chainman.GetConsensus().ExplicitOnlyActive(pindex->nHeight)) ||
-                        state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, tx_state.GetRejectReason(), tx_state.GetDebugMessage());
-                }
-                case 3: return m_chainman.GetConsensus().ExplicitOnlyActive(pindex->nHeight);
-                case 4: return Consensus::HasOnlyExplicitCreations(tx) ||
-                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-confidential-disabled");
-                default: throw std::logic_error("invalid connection output action");
-                }
-            })) return false;
 
         nInputs += tx.vin.size();
 
@@ -4720,89 +3853,6 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
     if (next_utreexo && next_utreexo->commitment != block.utreexo)
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-utreexo-root");
 
-    // Capital is projected only after every potentially parallel Simplicity
-    // input and its SP1 verifier have succeeded. It is never derived from an
-    // RPC/operator summary. The per-block record follows the block index, so a
-    // reorg selects the corresponding already-verified predecessor snapshot.
-    const ecx::ExchangeConsensus& exchange_consensus{
-        ecx::LayerTwoLabsExchangeConsensus()};
-    // A configured future activation must not project capital for historical
-    // blocks. The projection routine deliberately rejects pre-activation calls.
-    std::string capital_error;
-    ecx::BondV2CapitalSnapshot capital;
-    std::optional<uint256> activation_execution_hash;
-    std::optional<uint64_t> activation_execution_mtp;
-    size_t activation_index{1};
-    if (!drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CAPITAL_CONNECTION,
-        [&](uint32_t step) -> uint32_t {
-        switch (step) {
-        case 1: return exchange_consensus.bond_v2.activation_enabled;
-        case 2: return drivechain::haskell::BmmActivation(4, 0, pindex->nHeight, exchange_consensus.activation_height);
-        case 3: return exchange_parent.has_value();
-        case 4: return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
-            "bad-ecx-bond-v2-parent-context", "ECX bond V2 requires authenticated BMM parent context");
-        case 5: return activation_index < block.vtx.size();
-        case 6: return !block.vtx[activation_index]->vin.empty();
-        case 7: return block.vtx[activation_index]->vin[0].prevout == exchange_consensus.genesis_state_outpoint;
-        case 8:
-            // Preserve last-match selection from the successfully checked scripts.
-            activation_execution_hash = txsdata[activation_index].m_current_bmm_parent_block_hash;
-            activation_execution_mtp = txsdata[activation_index].m_current_bmm_parent_mtp;
-            return 1;
-        case 9: ++activation_index; return 1;
-        case 10: return ecx::DeriveBondV2CapitalProjectionAfterScripts(block, pindex->pprev,
-            view, pindex->nHeight, exchange_parent->block_hash, exchange_parent->height,
-            exchange_parent->median_time_past, capital, capital_error, exchange_consensus,
-            &blockundo, activation_execution_hash, activation_execution_mtp);
-        case 11: return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
-            "bad-ecx-bond-v2-capital", capital_error);
-        case 12: return fJustCheck;
-        case 13:
-            pindex->ecxBondV2Capital = std::move(capital);
-            m_blockman.m_dirty_blockindex.insert(pindex);
-            return 1;
-        default: throw std::logic_error("invalid capital connection action");
-        }
-    })) return false;
-    if (exchange_consensus.custody_successor.activation_enabled && pindex->nHeight>=exchange_consensus.activation_height) {
-        if (exchange_consensus.bond_v2.activation_enabled || !g_con_ecx_swap_v3 || !exchange_parent)
-            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,"bad-ecx-custody-profile",
-                "fresh custody requires its independent native/header/BMM profile");
-        ecx::CustodyProjection custody;
-        const bool custody_valid = pindex->nHeight==exchange_consensus.activation_height ?
-            ecx::InitializeCustodyProjection(block,view,pindex->nHeight,custody,capital_error,exchange_consensus) :
-            ecx::DeriveCustodyProjectionAfterScripts(block,pindex->pprev,blockundo,pindex->nHeight,
-                exchange_parent->block_hash,exchange_parent->height,exchange_parent->median_time_past,
-                custody,capital_error,exchange_consensus);
-        if (!custody_valid)
-            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,"bad-ecx-custody-projection",capital_error);
-        if (!fJustCheck) {
-            pindex->ecxCustodyProjection=std::move(custody);
-            pindex->ecxBondV2Capital.reset();
-            m_blockman.m_dirty_blockindex.insert(pindex);
-        }
-    }
-    usdd::WithdrawalAccumulatorState next_withdrawal_accumulator;
-    std::string withdrawal_accumulator_error;
-    if (!drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::USDD_ACCUMULATOR_CONNECTION, [&](uint32_t step) -> uint32_t {
-        switch (step) {
-        case 1: return pindex->pprev != nullptr;
-        case 2: return pindex->pprev->m_usdd_withdrawal_accumulator.has_value();
-        case 3: return state.Error("missing prior USDD withdrawal accumulator; reindex required");
-        case 4: return usdd::ApplyEthereumWithdrawals(
-            block, consensusParams.hashGenesisBlock,
-            *pindex->pprev->m_usdd_withdrawal_accumulator,
-            next_withdrawal_accumulator, nullptr, &withdrawal_accumulator_error);
-        case 5: return state.Error(strprintf(
-            "failed to derive USDD withdrawal accumulator: %s",
-            withdrawal_accumulator_error));
-        case 6: return pindex->m_usdd_withdrawal_accumulator.has_value();
-        case 7: return *pindex->m_usdd_withdrawal_accumulator == next_withdrawal_accumulator;
-        case 8: return state.Error("persisted USDD withdrawal accumulator disagrees with validated block");
-        default: throw std::logic_error("invalid USDD accumulator connection step");
-        }
-    })) return false;
-
     const auto time_4{SteadyClock::now()};
     m_chainman.time_verify += time_4 - time_2;
     LogDebug(BCLog::BENCH, "    - Verify %u txins: %.2fms (%.3fms/txin) [%.2fs (%.2fms/blk)]\n", nInputs - 1,
@@ -4822,7 +3872,6 @@ bool Chainstate::ConnectBlockInternal(const CBlock& block, BlockValidationState&
     if (next_utreexo && !utreexo::Store(*m_blockman.m_block_tree_db, block_hash, *next_utreexo))
         return state.Error("Unable to persist Utreexo snapshot");
 
-    pindex->m_usdd_withdrawal_accumulator = std::move(next_withdrawal_accumulator);
     m_blockman.m_dirty_blockindex.insert(pindex);
 
     const auto time_5{SteadyClock::now()};
@@ -5348,13 +4397,13 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
         case 2: return blockConnecting.GetHash() != m_chainman.GetParams().GetConsensus().hashGenesisBlock;
         case 3:
             finalized_bmm_context.emplace();
-            return DeriveUsddBip301CriticalHash(
+            return DeriveBip301CriticalHash(
                 blockConnecting, pindexNew->pprev, m_chainman.GetParams().GetConsensus(),
                 expected_critical_hash, bmm_error);
         case 4:
             return FatalError(
                 m_chainman.GetNotifications(), state,
-                Untranslated(strprintf("Failed to derive USDD BIP301 checkpoint for block %s: %s",
+                Untranslated(strprintf("Failed to derive BIP301 block commitment for block %s: %s",
                           blockConnecting.GetHash().GetHex(), bmm_error)));
         case 5:
             bmm_status = GetDrivechainBmmBlockStatus(blockConnecting, expected_critical_hash,
@@ -5726,12 +4775,12 @@ bool Chainstate::ReconcileDrivechainAnchors(BlockValidationState& state, bool& b
         return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::ANCHOR_REPLACEMENT,
             [&](uint32_t step) -> uint32_t {
             switch (step) {
-            case 1: return DeriveUsddBip301CriticalHash(
+            case 1: return DeriveBip301CriticalHash(
                 stored_block, candidate->pprev, m_chainman.GetParams().GetConsensus(),
                 expected_critical_hash, replacement_error);
             case 2:
                 stalled = true;
-                LogPrintf("cannot derive USDD BIP301 checkpoint while reanchoring sidechain block %s: %s\n",
+                LogPrintf("cannot derive BIP301 block commitment while reanchoring sidechain block %s: %s\n",
                           candidate->GetBlockHash().GetHex(), replacement_error);
                 return 1;
             case 3:
@@ -6782,14 +5831,7 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
     // Must check for duplicate inputs (see CVE-2018-17144)
     for (const auto& tx : block.vtx) {
         TxValidationState tx_state;
-        // Height is unavailable here. Defer only the aggregate total, retaining
-        // per-output limits and all other checks. Both contextual paths below
-        // enforce the historical or activated total even when fChecked is set.
-        const bool valid = drivechain::haskell::ParentReplayChoose({
-            [&] { return consensusParams.ExplicitOnlyConfigured(); },
-            [&] { return CheckTransactionWithoutAggregateTotals(*tx, tx_state); },
-            [&] { return CheckTransaction(*tx, tx_state); },
-        });
+        const bool valid = CheckTransaction(*tx, tx_state);
         if (!valid) {
             // CheckBlock() does context-free validation checks. The only
             // possible failures are consensus failures.
@@ -6829,73 +5871,6 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
         block.fChecked = true;
 
     return true;
-}
-
-static bool CheckEnabledUsddSp1AnnexBlockResources(const CBlock& block, BlockValidationState& state)
-{
-    usdd::ResourceReader resources;
-    const auto source = resources.Source();
-    const auto result = drivechain::haskell::UsddBlockResources(block.vtx.size(),
-        usdd::SP1_ANNEXES_PER_BLOCK, usdd::SP1_PROOF_TX_MAX_WEIGHT,
-        [&](uint32_t step, uint64_t index) -> uint64_t {
-            const auto& tx = *block.vtx.at(index);
-            switch (step) {
-            case 0: return resources.Select(tx);
-            case 2: return GetTransactionWeight(tx);
-            default: throw std::runtime_error("Unknown USDD resource read");
-            }
-        },&source);
-    const auto reject = [&](const char* reason, const std::string& detail) {
-        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, reason, detail);
-    };
-    switch (result) {
-        case 0: return true;
-        case 1:
-            return reject("bad-usdd-sp1-annex-size",
-                strprintf("USDD SP1 namespace annex exceeds %u bytes",
-                          static_cast<unsigned int>(usdd::SP1_ANNEX_MAX_SIZE)));
-        case 2:
-            return reject("bad-usdd-sp1-annex-envelope",
-                "reserved USDD SP1 namespace annex is not canonical");
-        case 3:
-            return reject("bad-usdd-sp1-annex-spend-shape",
-                "reserved USDD SP1 annex is not an exact Tapsimplicity script-path witness");
-        case 4:
-            return reject("bad-usdd-sp1-tx-weight",
-                strprintf("USDD SP1 proof transaction exceeds %u weight units",
-                          static_cast<unsigned int>(
-                              usdd::SP1_PROOF_TX_MAX_WEIGHT)));
-        case 5:
-            return reject("bad-usdd-sp1-annex-count",
-                strprintf("block contains more than %u USDD SP1 namespace annexes",
-                          static_cast<unsigned int>(usdd::SP1_ANNEXES_PER_BLOCK)));
-        case 6:
-            return reject("bad-usdd-sp1-annex-controller-cmr",
-                "reserved USDD SP1 annex is not spent by the frozen controller");
-        case 7:
-            return reject("bad-usdd-sp1-annex-guest-program-id",
-                "reserved USDD SP1 annex does not name the frozen guest program");
-        case 8:
-            return reject("bad-usdd-sp1-annex-public-values",
-                "reserved USDD SP1 annex does not contain a canonical inbound strict-journal identity");
-        case 9:
-            return reject("bad-usdd-sp1-deployment-unconfigured",
-                "canonical USDD inbound deployment domain is not frozen");
-        case 10:
-            return reject("bad-usdd-sp1-annex-inbound-domain",
-                "reserved USDD SP1 annex authenticates a noncanonical deployment domain");
-        default: throw std::runtime_error("Unknown USDD resource rejection");
-    }
-}
-
-bool CheckUsddSp1AnnexBlockResources(const CBlock& block, BlockValidationState& state,
-                                   const Consensus::Params& consensusParams)
-{
-    return drivechain::haskell::ParentReplayChoose({
-        [&] { return consensusParams.enable_usdd_sp1_annex; },
-        [&] { return CheckEnabledUsddSp1AnnexBlockResources(block,state); },
-        [] { return true; },
-    });
 }
 
 void ChainstateManager::UpdateUncommittedBlockStructures(CBlock& block, const CBlockIndex* pindexPrev) const
@@ -7166,19 +6141,9 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
     }
 
     std::string error;
-    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CONTEXTUAL_HEADER,
-        [&](uint32_t step) -> uint32_t {
-            switch (step) {
-            case 1: return consensusParams.elements_mode;
-            case 2: return drivechain::CheckBmmHeader(block, pindexPrev, error, allow_incomplete_candidate) ||
-                state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-drivechain-bmm-header", error);
-            case 3:
-                error.clear();
-                return ecx::CheckExchangeStateHeader(block, nHeight, error, ecx::LayerTwoLabsExchangeConsensus()) ||
-                    state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-ecx-exchange-header", error);
-            default: throw std::logic_error("invalid contextual header action");
-            }
-        });
+    return !consensusParams.elements_mode ||
+        drivechain::CheckBmmHeader(block, pindexPrev, error, allow_incomplete_candidate) ||
+        state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-drivechain-bmm-header", error);
 }
 
 /** NOTE: This function is not currently invoked by ConnectBlock(), so we
@@ -7189,26 +6154,7 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
  */
 static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& state, const ChainstateManager& chainman, const CBlockIndex* pindexPrev)
 {
-    const auto& consensusParams = chainman.GetConsensus();
     const int nHeight = pindexPrev == nullptr ? 0 : pindexPrev->nHeight + 1;
-    if (!drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CONTEXTUAL_OUTPUTS,
-        [&](uint32_t step) -> uint32_t {
-            switch (step) {
-            case 1: return consensusParams.ExplicitOnlyConfigured();
-            case 2: return drivechain::haskell::ParentReplayEach(block.vtx, [&](const auto& tx) {
-                TxValidationState tx_state;
-                return CheckTransaction(*tx, tx_state, consensusParams.ExplicitOnlyActive(nHeight)) ||
-                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, tx_state.GetRejectReason(), tx_state.GetDebugMessage());
-            });
-            case 3: return consensusParams.ExplicitOnlyActive(nHeight);
-            case 4: return drivechain::haskell::ParentReplayEach(block.vtx, [&](const auto& tx) {
-                return Consensus::HasOnlyExplicitCreations(*tx) ||
-                    state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-confidential-disabled");
-            });
-            default: throw std::logic_error("invalid contextual output action");
-            }
-        })) return false;
-
     // Enforce BIP113 (Median Time Past).
     bool enforce_locktime_median_time_past{false};
     if (DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_CSV)) {
@@ -7267,13 +6213,6 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
     // failed).
     if (GetBlockWeight(block) > MAX_BLOCK_WEIGHT) {
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-weight", strprintf("%s : weight limit failed", __func__));
-    }
-
-    // Witness bytes are now committed, so this failure can safely mark the
-    // block invalid. ConnectBlock repeats the rule for reindex-chainstate and
-    // all other paths that skip this contextual admission pass.
-    if (!CheckUsddSp1AnnexBlockResources(block, state, chainman.GetConsensus())) {
-        return false;
     }
 
     return true;
@@ -7589,8 +6528,8 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
         case 10: return ContextualCheckBlock(block, state, *this, predecessor);
         case 11:
             preauthenticated_bmm_context.emplace();
-            return DeriveUsddBip301CriticalHash(block, predecessor, consensus, preauth_critical_hash, preauth_error);
-        case 12: return state.Error(strprintf("cannot derive USDD BIP301 checkpoint for block %s: %s",
+            return DeriveBip301CriticalHash(block, predecessor, consensus, preauth_critical_hash, preauth_error);
+        case 12: return state.Error(strprintf("cannot derive BIP301 block commitment for block %s: %s",
             block.GetHash().GetHex(), preauth_error));
         case 13:
             preauth_status = GetDrivechainBmmBlockStatus(block, preauth_critical_hash,
@@ -7693,10 +6632,10 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
         case 2: return GetParams().GetConsensus().drivechain_slot.has_value();
         case 3: return preauthenticated_bmm_context.has_value();
         case 4: bmm_context = *preauthenticated_bmm_context; return 1;
-        case 5: return DeriveUsddBip301CriticalHash(block, pindex->pprev, GetParams().GetConsensus(),
+        case 5: return DeriveBip301CriticalHash(block, pindex->pprev, GetParams().GetConsensus(),
             expected_critical_hash, bmm_error);
         case 6:
-            state.Error(strprintf("cannot derive USDD BIP301 checkpoint for block %s: %s", block.GetHash().GetHex(), bmm_error));
+            state.Error(strprintf("cannot derive BIP301 block commitment for block %s: %s", block.GetHash().GetHex(), bmm_error));
             return 1;
         case 7:
             bmm_status = GetDrivechainBmmBlockStatus(
@@ -8200,10 +7139,6 @@ static bool BranchRequiresValidatedReplay(
     requires_validated_replay = false;
     constexpr uint32_t state_mask{
         CBlockHeader::BMM_PROOF_HF_MASK |
-        CBlockHeader::EXCHANGE_STATE_HF_MASK |
-        CBlockHeader::FORCED_INBOX_HF_MASK |
-        CBlockHeader::DEPOSIT_INBOX_HF_MASK |
-        CBlockHeader::INBOX_CURSOR_HF_MASK |
         utreexo::HEADER_BIT};
     const CBlockIndex* cursor = tip;
     CBlock block;
@@ -8236,7 +7171,7 @@ static bool BranchRequiresValidatedReplay(
         case 13: input = 0; return 1;
         case 14: return input < block.vtx[transaction]->vin.size();
         case 15: return block.vtx[transaction]->vin[input].m_is_pegin;
-        case 17: return ecx::IsExchangeStateInternalOutpoint(block.vtx[transaction]->vin[input].prevout);
+        case 17: return false;
         case 18: return drivechain::IsBmmStateInternalOutpoint(block.vtx[transaction]->vin[input].prevout);
         case 19: return drivechain::IsCtipStateInternalOutpoint(block.vtx[transaction]->vin[input].prevout);
         case 20: ++input; return 1;
@@ -8316,7 +7251,7 @@ bool Chainstate::ReplayBlocks()
     }
 
     // The legacy replay algorithm below is intentionally idempotent only for
-    // ordinary transaction outputs. ECX and BMM trackers are synthetic UTXOs
+    // ordinary transaction outputs. BMM trackers are synthetic UTXOs
     // derived by ConnectBlock, and a crash may leave any subset of them from
     // either side of the interrupted flush. Replaying only transaction inputs
     // and outputs could therefore commit a best-block marker with stale or
@@ -8333,12 +7268,12 @@ bool Chainstate::ReplayBlocks()
         case 2: return BranchRequiresValidatedReplay(pindexNew, pindexFork, m_blockman,
             m_chainman.GetConsensus(), new_requires_validated_replay);
         case 3: return m_chainman.GetConsensus().elements_mode;
-        case 4: return ecx::HasPersistedExchangeConsensusState(db);
+        case 4: return false; // Reserved non-BMM state discriminator.
         case 5: return drivechain::HasPersistedBmmConsensusState(db);
         case 6: return old_requires_validated_replay;
         case 7: return new_requires_validated_replay;
         case 8: return (LogError(
-            "ReplayBlocks(): interrupted flush touches ECX/BMM/pegin consensus state; "
+            "ReplayBlocks(): interrupted flush touches BMM/pegin consensus state; "
             "restart with -reindex-chainstate"), false);
         default: throw std::logic_error("invalid recovery admission action");
         }

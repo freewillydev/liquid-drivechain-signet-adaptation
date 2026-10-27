@@ -12,7 +12,6 @@ import Data.List (isPrefixOf)
 import Data.Word (Word8)
 import qualified Deposit as D
 import qualified Bmm
-import qualified Exchange
 import qualified ParentReplay
 import Drivechain
 import Foreign.Marshal.Alloc (allocaBytes)
@@ -63,10 +62,6 @@ lazyWorkflows = conjoin $
   , absent (undefined :: DSL Bmm.FingerprintRequest)
   , absent (undefined :: DSL Bmm.SignetRequest)
   , absent (undefined :: DSL Bmm.BodyRecovery)
-  , absent (undefined :: DSL Exchange.GenesisRequest)
-  , absent (undefined :: DSL Exchange.FrozenRequest)
-  , absent (undefined :: DSL Exchange.CapitalRequest)
-  , absent (undefined :: DSL Exchange.InboxRequest)
   , cold (undefined :: WithdrawalRequest) withdrawRules
   , cold (undefined :: WalletBundleRequest) buildWalletBundle
   , cold (undefined :: Bmm.GrpcPlan) Bmm.planGrpc
@@ -76,12 +71,8 @@ lazyWorkflows = conjoin $
   , cold (undefined :: Bmm.StateWrite) Bmm.replaceState
   , cold (undefined :: Bmm.SignetRequest) Bmm.extractSignetRequest
   , cold (undefined :: Bmm.BodyRecovery) Bmm.RecoverBody
-  , cold (undefined :: Exchange.GenesisRequest) Exchange.buildGenesisRoots
-  , cold (undefined :: Exchange.FrozenRequest) Exchange.decodeFrozenRequest
-  , cold (undefined :: Exchange.CapitalRequest) Exchange.bindAndProject
-  , cold (undefined :: Exchange.InboxRequest) (Exchange.deriveInbox undefined undefined undefined)
   ] ++ [cold (undefined :: Bmm.FingerprintRequest) (Bmm.fingerprint format)
-        | format <- [Bmm.BmmFormat,Bmm.ExchangeFormat,Bmm.ActivationFormat]]
+        | format <- [Bmm.BmmFormat]]
   where
     absent :: Operation op caps => DSL op -> Property
     absent request = (() <$ interpret (SomeOperation (undefined :: Probe)) request) === Nothing
@@ -166,7 +157,6 @@ dispatchMatrix = forAllShrink arbitrary shrink $ \(d,t,n,script,opcode,burn,fee,
     commitmentResult <- sequence (interpret op (Validate @Bmm.Commitment))
     signetResult <- sequence (interpret op Bmm.extractSignetRequest)
     fingerprintResult <- sequence (interpret op (Bmm.fingerprint Bmm.BmmFormat))
-    exchangeFingerprintResult <- sequence (interpret op (Bmm.fingerprint Bmm.ExchangeFormat))
     storageResult <- sequence (interpret op Bmm.replaceState)
     encodingResult <- sequence (interpret op Bmm.encodeState)
     pure $ conjoin
@@ -201,7 +191,6 @@ dispatchMatrix = forAllShrink arbitrary shrink $ \(d,t,n,script,opcode,burn,fee,
        interpret op (Validate @Bmm.Lifecycle) === expected i 32 2,
        interpret op (Validate @Bmm.StateFlow) === expected i 33 1,
        fingerprintResult === expected i 34 ([0,0,0,4] ++ replicate 95 0),
-       exchangeFingerprintResult === expected i 34 (replicate 267 0),
        interpret op (Validate @Bmm.TargetScale) === expected i 35 (replicate 32 0),
        storageResult === expected i 36 (), encodingResult === expected i 37 (),
        interpret op (Validate @Bmm.PrivateTemplate) === expected i 38
@@ -274,7 +263,6 @@ mismatchIsLazy = forAll (chooseInt (0,53)) $ \index -> ioProperty $ do
                   SomeOperation (bottom :: Check D.ConfirmationPolicy)]
       op = payloads !! index
   fingerprintResult <- if index == 34 then pure Nothing else sequence (interpret op (Bmm.fingerprint Bmm.BmmFormat))
-  exchangeFingerprintResult <- if index == 34 then pure Nothing else sequence (interpret op (Bmm.fingerprint Bmm.ExchangeFormat))
   storageResult <- if index == 36 then pure Nothing else sequence (interpret op Bmm.replaceState)
   encodingResult <- if index == 37 then pure Nothing else sequence (interpret op Bmm.encodeState)
   witnessResult <- if index == 4 then pure Nothing else sequence (interpret op (Validate @D.DepositWitness))
@@ -321,7 +309,6 @@ mismatchIsLazy = forAll (chooseInt (0,53)) $ \index -> ioProperty $ do
      if index == 32 then property True else interpret op (Validate @Bmm.Lifecycle) === Nothing,
      if index == 33 then property True else interpret op (Validate @Bmm.StateFlow) === Nothing,
      fingerprintResult === Nothing,
-     exchangeFingerprintResult === Nothing,
      if index == 35 then property True else interpret op (Validate @Bmm.TargetScale) === Nothing,
      storageResult === Nothing, encodingResult === Nothing,
      if index == 38 then property True else interpret op (Validate @Bmm.PrivateTemplate) === Nothing,
@@ -376,13 +363,11 @@ maximumMoney = 21000000 * 100000000
 withdrawalDispatch :: Property
 withdrawalDispatch = forAll (B.pack <$> vectorOf 150 arbitrary) $ \bytes -> ioProperty $ do
   -- Explicit table freezes the existing ABI numbers, independently of Enum order.
-  checks <- forM (zip [1..] [(BuildScript,150),(ParseScript,150),(BuildReference,69),
+  checks <- forM (filter ((/= Reserved12) . fst . snd) $ zip [1..] [(BuildScript,150),(ParseScript,150),(BuildReference,69),
     (ParseReference,150),(LegacyFrame,150),(DecodeFee,8),(EncodeFee,8),(BuildOutput,150),
-    (ParseOutput,150),(BuildM6,150),(ParseM6,150),(ExtractEthereumClaim,116),(StateAnchor,132),(WalletBundle,25),
+    (ParseOutput,150),(BuildM6,150),(ParseM6,150),(Reserved12,116),(StateAnchor,132),(WalletBundle,25),
     (WalletAnchor,132),(StateMarker,32),(WalletTransport,150),(RpcFee,16),(EventPolicy,150),(BundleAdmission,65),(NativeAmount,17),(ParentDust,5),(NativeGuard,2),(NativeGuardResult,2),(InputsCommitment,40),(NativePayout,13),(NativeBurnPlan,70),(NativeOutputSelection,140)]) $ \(tag,(action,size)) -> do
-      let input = if action == ExtractEthereumClaim then B.take 24 bytes <> wordLE 8 100 <>
-            wordLE 8 20000000000000 <> wordLE 4 1 <> C.pack "USDD" <> B.singleton 65 <> B.take 67 bytes
-            else if action == NativeAmount then B.singleton (B.head bytes `mod` 2) <> B.take 16 (B.drop 1 bytes)
+      let input = if action == NativeAmount then B.singleton (B.head bytes `mod` 2) <> B.take 16 (B.drop 1 bytes)
             else if action == ParentDust then B.take 4 bytes <> B.singleton (B.index bytes 4 `mod` 2)
             else if action == NativeGuard || action == NativeGuardResult then B.pack [B.head bytes `mod` 4,B.index bytes 1 `mod` 2]
             else if action == NativePayout then B.take 12 bytes <> B.singleton (B.index bytes 12 `mod` 2)

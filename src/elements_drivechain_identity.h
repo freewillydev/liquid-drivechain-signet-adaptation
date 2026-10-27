@@ -29,22 +29,17 @@ namespace ElementsDrivechainIdentity {
 inline constexpr char NETWORK_ID[]{"elements"};
 inline constexpr uint8_t SIDECHAIN_SLOT{24};
 
-// Explicit operator-authorized Betanet testing on activated Elements slot 24.
-// The existing proposal describes replay v4; this distinct child uses Beta v5.
-// Enabling this requires a new frozen child identity/genesis, not a runtime
-// bypass. The exact parent proposal remains authenticated by normal replay.
-inline constexpr bool BETANET_EXISTING_ELEMENTS_TEST_PROFILE{true};
-inline constexpr char BETANET_EXISTING_ELEMENTS_PROPOSAL_HEX[]{"0008456c656d656e7473456c656d656e7473204472697665636861696e207631313b20706172616d65746572697a656420636f6e74726f6c6c65722070726f66696c653b207265706c61792076343b20616e6e65782076323b206f6e65204d362070657220706172656e7420626c6f636b3b207769746864726177616c20616363756d756c61746f722076313b2042495033303120636865636b706f696e742076313b2053696d706c6963697479206163746976653b20736c6f74203234e6092dd9fb9b1510a02ac535bbdde72f8b06716131c289337a0e0e592258d5fb28406cdece9df4823d01a88eca6b5793560fea88"};
-inline constexpr char BETANET_EXISTING_ELEMENTS_PROPOSAL_HASH[]{
-    "866e33f1e4c854fadea9f9792064708ced3633bc963b000a03d4d4ac2e1a2400"};
+// Fresh child profile. An existing parent proposal cannot authorize this chain.
+inline constexpr bool BETANET_EXISTING_ELEMENTS_TEST_PROFILE{false};
+inline constexpr char PROPOSAL_TEXT[]{"Elements Native v1; native BIP300/301; replay v5; sequential M6; BMM block hash; Simplicity active; slot 24"};
 
-inline constexpr char P2P_MAGIC_DOMAIN[]{"ecash-elements-drivechain-betanet-slot24-p2p-v1"};
-inline constexpr std::array<uint8_t, 4> P2P_MESSAGE_START{{0x3b, 0x5f, 0xf1, 0x8b}};
-inline constexpr uint16_t P2P_PORT{7066};
-inline constexpr uint16_t RPC_PORT{7065};
+inline constexpr char P2P_MAGIC_DOMAIN[]{"ecash-elements-native-slot24-p2p-v1"};
+inline constexpr std::array<uint8_t, 4> P2P_MESSAGE_START{{0x97, 0xb2, 0x0d, 0x51}};
+inline constexpr uint16_t P2P_PORT{7072};
+inline constexpr uint16_t RPC_PORT{7071};
 inline constexpr uint16_t MAINCHAIN_RPC_PORT{28532};
-inline constexpr uint16_t ONION_TARGET_PORT{37066};
-inline constexpr char DATA_DIR[]{"elements-betanet-slot24-v1"};
+inline constexpr uint16_t ONION_TARGET_PORT{37072};
+inline constexpr char DATA_DIR[]{"elements-native-v1"};
 
 // Canonical child coinbase commitment: OP_RETURN || PUSHBYTES_37 ||
 // "ELMTP" || parent_hash_internal_bytes.
@@ -134,85 +129,6 @@ inline constexpr uint16_t WITHDRAWAL_BUNDLE_MAX_AGE{26300};
 inline constexpr uint16_t WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD{13150};
 inline constexpr uint32_t PARENT_REPLAY_VERSION{5};
 inline constexpr uint32_t ANNEX_FEATURE_VERSION{2};
-inline constexpr uint32_t WITHDRAWAL_ACCUMULATOR_VERSION{1};
-// The BIP301 critical hash is an opaque 32-byte value to the parent enforcer.
-// Elements v7 assigns that value a single consensus meaning: a SHA-256
-// commitment to the exact child block and its validated withdrawal-accumulator
-// transition. Changing either constant is a new, incompatible child network.
-inline constexpr uint32_t WITHDRAWAL_BIP301_CHECKPOINT_VERSION{1};
-inline constexpr char WITHDRAWAL_BIP301_CHECKPOINT_DOMAIN[]{
-    "Elements/USDD/BIP301-checkpoint/v1"};
-
-// Pre-genesis resource schedule for the sole built-in Elements network.  A
-// measured stock SP1 v6.3.1 compressed proof does not fit the old 512 KiB
-// annex lane.  The enlarged lane is therefore inseparable from this V7
-// network identity and its new genesis/datadir. V7 activates this lane for
-// prototype consensus testing; P99 and independent audit gates remain release
-// requirements rather than mutable consensus switches.
-// Values are generated from Haskell; retain native compile-time relationships.
-static_assert(USDD_SP1_PROOF_TX_MAX_WEIGHT * 4U <=
-              CONSENSUS_MAX_BLOCK_WEIGHT);
-static_assert(USDD_SP1_MEASURED_RAW_PROOF_BYTES +
-                  USDD_SP1_MEASURED_PUBLIC_VALUES_BYTES + 55U ==
-              USDD_SP1_MEASURED_ANNEX_BYTES);
-static_assert(USDD_SP1_MEASURED_ANNEX_BYTES <=
-              USDD_SP1_ANNEX_MAX_BYTES);
-static_assert(USDD_SP1_MAX_ANNEX_WEIGHT <
-              USDD_SP1_PROOF_TX_MAX_WEIGHT);
-static_assert(USDD_SP1_MAX_NON_ANNEX_TX_WEIGHT +
-                  USDD_SP1_MAX_ANNEX_WEIGHT ==
-              USDD_SP1_PROOF_TX_MAX_WEIGHT);
-
-// V7 activates the verifier as a generic Elements consensus facility. The
-// host pins the exact controller CMR, guest, verifier semantics, and resource
-// schedule; the controller binds each nonzero inbound-mint domain to its
-// authenticated on-chain configuration state. This avoids a cryptographic
-// cycle in which a genesis-frozen deployment domain would itself depend on the
-// Elements genesis and post-genesis issuance identities.
-inline constexpr bool USDD_SP1_VERIFIER_ACTIVATION_CONFIGURED{true};
-inline constexpr uint32_t REQUIRED_USDD_SP1_VERIFIER_ABI_VERSION{1};
-inline constexpr uint32_t REQUIRED_USDD_SP1_VERIFIER_SEMANTIC_IDENTITY_VERSION{1};
-inline constexpr std::array<uint8_t, 32> USDD_SP1_VERIFIER_SEMANTIC_IDENTITY{{
-    0x6b, 0x02, 0x92, 0x57, 0x0f, 0xa1, 0x20, 0xae,
-    0x88, 0x57, 0x43, 0xa3, 0x91, 0xeb, 0xa1, 0x8a,
-    0x1e, 0x53, 0x04, 0x55, 0x28, 0x46, 0x48, 0xcf,
-    0xde, 0x30, 0xdc, 0x28, 0xbf, 0x3b, 0x64, 0xa9,
-}};
-
-inline constexpr uint32_t USDD_SP1_PROOF_BUNDLE_VERSION{1};
-inline constexpr char USDD_SP1_VERSION[]{"6.3.1"};
-inline constexpr char USDD_SP1_GIT_COMMIT[]{
-    "8252c2905ce32964df68248117015c61ebb854db"};
-inline constexpr uint32_t USDD_SP1_COMPRESSED_CIRCUIT_VERSION{1};
-inline constexpr uint32_t USDD_SP1_COMPRESSED_CODEC_VERSION{1};
-inline constexpr char USDD_SP1_PROOF_MODE[]{"SP1Proof::Compressed"};
-inline constexpr char USDD_SP1_PROOF_CODEC[]{
-    "bincode-1.3.3;fixed-int;little-endian;reject-trailing-bytes"};
-inline constexpr char USDD_SP1_PUBLIC_VALUES_DIGEST_MODE[]{"SHA256_ONLY"};
-inline constexpr std::array<uint8_t, 32> USDD_SP1_RECURSION_CONSTANTS_COMMITMENT{{
-    0x0f, 0x4d, 0x8d, 0x04, 0x95, 0xd4, 0x3e, 0x37,
-    0x09, 0x80, 0x3b, 0x60, 0x06, 0x74, 0xe1, 0xe9,
-    0x48, 0xa5, 0xcd, 0xcb, 0x16, 0xd1, 0x66, 0x39,
-    0x45, 0xad, 0x83, 0x8d, 0xe5, 0xef, 0xad, 0xba,
-}};
-
-inline constexpr uint8_t USDD_SP1_ANNEX_ENVELOPE_VERSION{1};
-inline constexpr uint8_t USDD_SP1_ANNEX_PROOF_SYSTEM{1};
-inline constexpr uint8_t USDD_SP1_ANNEX_STATEMENT_KIND{3};
-inline constexpr uint8_t USDD_SP1_ANNEX_DIGEST_MODE{1};
-// Binding version 2 deliberately carries no genesis-global deployment domain.
-// The exact generic controller derives a nonzero inboundMintDomainId from its
-// committed configuration hash and verifies that same domain in the strict
-// SP1 journal. The zero array below therefore means "no global domain" under
-// version 2; it is not the version-0 preactivation sentinel.
-inline constexpr uint32_t USDD_SP1_DEPLOYMENT_BINDING_VERSION{2};
-inline constexpr std::array<uint8_t, 32> USDD_SP1_INBOUND_MINT_DOMAIN_ID{{
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-}};
-
 inline constexpr uint16_t CURRENT_BMM_PARENT_MTP_JET_CATALOGUE_ITEM{51};
 inline constexpr std::array<uint8_t, 3> CURRENT_BMM_PARENT_MTP_JET_ENCODING{{
     0x7c, 0x38, 0xcc,
@@ -225,86 +141,15 @@ inline constexpr std::array<uint8_t, 32> CURRENT_BMM_PARENT_MTP_JET_CMR{{
 }};
 inline constexpr uint64_t CURRENT_BMM_PARENT_MTP_JET_COST_MWU{108};
 
-inline constexpr uint16_t VERIFY_SP1_COMPRESSED_SHA256_JET_CATALOGUE_ITEM{52};
-inline constexpr std::array<uint8_t, 3> VERIFY_SP1_COMPRESSED_SHA256_JET_ENCODING{{
-    0x7c, 0x38, 0xd0,
-}};
-inline constexpr std::array<uint8_t, 32> VERIFY_SP1_COMPRESSED_SHA256_JET_CMR{{
-    0x59, 0x5c, 0xfa, 0x3a, 0xdb, 0xc8, 0x3e, 0x61,
-    0x69, 0x18, 0xa6, 0xa5, 0x14, 0x41, 0xba, 0x84,
-    0x7f, 0x19, 0xfa, 0xf7, 0xe7, 0x7f, 0x3c, 0xb9,
-    0x7d, 0x21, 0x31, 0x4e, 0x28, 0x92, 0x83, 0x99,
-}};
-inline constexpr uint64_t VERIFY_SP1_COMPRESSED_SHA256_JET_COST_MWU{900'007'720ULL};
-
-// V11 commits the parameterized controller family before genesis. Concrete
-// controller/anchor program identities are selected by, and authenticated
-// from, the executed configuration-bound leaf; they are not global network
-// allow-list entries.
-inline constexpr bool V11_PARAMETERIZED_CONTROLLER_PROFILE{true};
-inline constexpr std::array<uint8_t, 32> PARAMETERIZED_CONTROLLER_PROFILE_ID{{
-    0x6f, 0xd5, 0xa5, 0xe5, 0x57, 0x69, 0x32, 0x0c,
-    0xc1, 0xc6, 0xa4, 0x97, 0x64, 0x4d, 0x0b, 0xc7,
-    0xa6, 0x42, 0xee, 0xd8, 0x44, 0x2a, 0xb1, 0x70,
-    0x3a, 0xf3, 0x04, 0xcf, 0xac, 0x25, 0x3d, 0x25,
-}};
-// Retained solely by the explicitly parameterized historical V7/V8 helper
-// tests. It is not serialized into, nor consulted by, the V11 identity/gate.
-inline constexpr std::array<uint8_t, 32> HISTORICAL_V8_CONTROLLER_CMR{{
-    0xa3, 0xbe, 0x18, 0x4f, 0x5f, 0xbf, 0xf9, 0x9b,
-    0x3b, 0xb9, 0x61, 0xb2, 0x65, 0x05, 0x51, 0x9c,
-    0xc1, 0xcd, 0x44, 0xfe, 0xc3, 0x31, 0x05, 0x7a,
-    0x9a, 0xc0, 0xee, 0x12, 0x5b, 0x16, 0xb0, 0xa1,
-}};
-inline constexpr std::array<uint8_t, 32> USDD_SP1_GUEST_PROGRAM_ID{{
-    0x4e, 0x44, 0xd1, 0x8d, 0x51, 0x2d, 0x56, 0x11,
-    0x28, 0xda, 0xe5, 0x3d, 0x10, 0xbe, 0xe2, 0xb3,
-    0x6b, 0xd5, 0x39, 0x0d, 0x1e, 0x4c, 0x4b, 0x72,
-    0x68, 0x84, 0x64, 0xea, 0x54, 0x49, 0x43, 0xec,
-}};
-inline constexpr uint64_t USDD_SP1_GUEST_ELF_BYTES{527'432ULL};
-inline constexpr std::array<uint8_t, 32> USDD_SP1_GUEST_ELF_SHA256{{
-    0x19, 0x30, 0xe2, 0x4d, 0x92, 0x8f, 0x02, 0x42,
-    0xe1, 0x08, 0x78, 0xa3, 0xe0, 0x51, 0x77, 0xa5,
-    0xe5, 0x8e, 0x82, 0x75, 0xee, 0x0a, 0x54, 0xe4,
-    0x71, 0xad, 0x81, 0x10, 0xd5, 0x76, 0x06, 0x13,
-}};
-
-// Exact generic withdrawal-accumulator codec committed by the protocol
-// manifest and genesis. This pre-deployment index is deliberately not an
-// authorizing USDD root by itself. This sole Elements network identity is
-// final; the exact production asset ID and Ethereum vault ID must instead be
-// frozen by the separate immutable USDD deployment manifest and vault.
-inline constexpr std::array<uint8_t, 4> WITHDRAWAL_MAGIC{{'U', 'S', 'D', 'D'}};
-inline constexpr uint8_t WITHDRAWAL_SCRIPT_PUSH_SIZE{65};
-inline constexpr uint32_t WITHDRAWAL_PROTOCOL_VERSION{1};
-inline constexpr uint8_t WITHDRAWAL_LEAF_PREFIX{0x00};
-inline constexpr uint8_t WITHDRAWAL_NODE_PREFIX{0x01};
-inline constexpr uint8_t WITHDRAWAL_TREE_DEPTH{64};
-inline constexpr uint64_t USDD_UNITS_PER_USDT_MICRO{100};
-inline constexpr uint64_t MAX_WITHDRAWAL_USDT_MICRO{20'000'000ULL * 1'000'000ULL};
-inline constexpr std::array<uint8_t, 32> WITHDRAWAL_BURN_ID_DOMAIN{{
-    0x58, 0x11, 0xf3, 0xff, 0x8b, 0x8f, 0x31, 0xfb,
-    0x49, 0xff, 0xb9, 0x1a, 0xfa, 0xb1, 0x31, 0x97,
-    0xc3, 0xd7, 0x2e, 0x92, 0x65, 0x49, 0xae, 0x29,
-    0xdb, 0xda, 0x46, 0xc6, 0x99, 0x8a, 0x3e, 0x45,
-}};
-inline constexpr std::array<uint8_t, 32> WITHDRAWAL_LEAF_DOMAIN{{
-    0xa2, 0x04, 0x23, 0x80, 0x92, 0x68, 0x79, 0x09,
-    0x8c, 0x0f, 0x42, 0x3f, 0x49, 0xe3, 0xa0, 0x7a,
-    0x12, 0x48, 0xed, 0x08, 0x53, 0x57, 0x93, 0xa4,
-    0xa1, 0xc4, 0xaf, 0xe6, 0x2d, 0x99, 0x88, 0x69,
-}};
-
 // Filled from the reproducible CElementsDrivechainParams construction. These
 // strings are compared by the release-mode startup identity gate.
-inline constexpr char PROTOCOL_MANIFEST_HASH[]{"5c3d0dab899b95e05a47691bed1a0bdca87938faca69ab04985a4c43a970a673"};
-inline constexpr char PROPOSAL_DESCRIPTION_HEX[]{"0008456c656d656e7473456c656d656e7473204472697665636861696e207631313b20706172616d65746572697a656420636f6e74726f6c6c65722070726f66696c653b207265706c61792076343b20616e6e65782076323b206f6e65204d362070657220706172656e7420626c6f636b3b207769746864726177616c20616363756d756c61746f722076313b2042495033303120636865636b706f696e742076313b2053696d706c6963697479206163746976653b20736c6f74203234e6092dd9fb9b1510a02ac535bbdde72f8b06716131c289337a0e0e592258d5fb28406cdece9df4823d01a88eca6b5793560fea88"};
-inline constexpr char PROPOSAL_HASH[]{"866e33f1e4c854fadea9f9792064708ced3633bc963b000a03d4d4ac2e1a2400"};
-inline constexpr char IDENTITY_COMMITMENT[]{"8e69c7b145bdf13b59d2866fbc8d8a167fdac4cb114666765a26c0bccbf95cde"};
-inline constexpr char GENESIS_HASH[]{"a7754ce0debc40baddbd8c47e79d19209685f22c63edaaf8b69cf54116374d7f"};
-inline constexpr char GENESIS_MERKLE_ROOT[]{"4dfba0f3ac9d10a3dd44eb16f2925693b47787c4060bdf5b5bab2dd97f99505f"};
-inline constexpr char PEGGED_ASSET[]{"5836dcc06130dcf6a65b6ac493813fd65559955283e44cc3f07966294eccb2c8"};
+inline constexpr char PROTOCOL_MANIFEST_HASH[]{"94831880cee118fe5266ebf3945528b370b1a0f668fb76cf2c3ca756b8d1068c"};
+inline constexpr char PROPOSAL_DESCRIPTION_HEX[]{"0008456c656d656e7473456c656d656e7473204e61746976652076313b206e6174697665204249503330302f3330313b207265706c61792076353b2073657175656e7469616c204d363b20424d4d20626c6f636b20686173683b2053696d706c6963697479206163746976653b20736c6f742032348c06d1b856a73c2ccf76fb68f6a0b170b3285594f3eb6652fe18e1ce8018839490448700bdaa1ef40ccf2a02d8d07b9fb5cd598f"};
+inline constexpr char PROPOSAL_HASH[]{"a9980eaa8bb6893d4baea100f484000b4f72e4640fc0d9f3ebf8a2f29ae63460"};
+inline constexpr char IDENTITY_COMMITMENT[]{"948c7254ea3df2c1e84f5b4e0f85b631e55ec44aad0b54f3ad624f2aea4ff7d3"};
+inline constexpr char GENESIS_HASH[]{"fe05f7c76cfb50ef4f5594c761df25581e95a9946a64bc9d8f567235ffa485c9"};
+inline constexpr char GENESIS_MERKLE_ROOT[]{"d5a55d8261a4baaceca67e2c6b21bdeb4f3d56d579d05c188516be02b96b90d6"};
+inline constexpr char PEGGED_ASSET[]{"2e69819685c22252a706f69ce67ab9ab36a633b91e61f6ee69216d6e1c7e90d3"};
 
 } // namespace ElementsDrivechainIdentity
 

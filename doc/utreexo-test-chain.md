@@ -59,7 +59,8 @@ Reorgs select the predecessor snapshot, without mutating another branch. A crash
 may leave an unused snapshot but not a script-valid tip with an unwritten one.
 Full reindex rebuilds the snapshots; chainstate reindex verifies/recreates them.
 Missing or corrupt snapshots fail closed and require reindex, not silent reset.
-Prefix U remains exclusively owned by the existing USDD withdrawal accumulator.
+Prefix U remains reserved; the Utreexo namespace is unchanged by the removal of
+the previous exchange implementation.
 
 This first parallel implementation intentionally follows Thunder's full-forest
 snapshot approach. It keeps a serialized forest for each validated block, has

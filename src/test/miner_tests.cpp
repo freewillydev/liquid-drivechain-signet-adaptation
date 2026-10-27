@@ -413,7 +413,6 @@ void MinerTestingSetup::TestBasicMining(const CScript& scriptPubKey, const std::
             m_node.chainman->ActiveChainstate().CoinsTip().SetBestBlock(next->GetBlockHash());
             next->pprev = prev;
             next->nHeight = prev->nHeight + 1;
-            next->m_usdd_withdrawal_accumulator = prev->m_usdd_withdrawal_accumulator;
             next->BuildSkip();
             m_node.chainman->ActiveChain().SetTip(*next);
         }
@@ -426,7 +425,6 @@ void MinerTestingSetup::TestBasicMining(const CScript& scriptPubKey, const std::
             m_node.chainman->ActiveChainstate().CoinsTip().SetBestBlock(next->GetBlockHash());
             next->pprev = prev;
             next->nHeight = prev->nHeight + 1;
-            next->m_usdd_withdrawal_accumulator = prev->m_usdd_withdrawal_accumulator;
             next->BuildSkip();
             m_node.chainman->ActiveChain().SetTip(*next);
         }

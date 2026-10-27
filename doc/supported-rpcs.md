@@ -24,26 +24,20 @@ configured RPC credentials and a protected transport. See
 Key export methods expose secrets; send, submission, import, wallet and administrative
 methods can change state or spend funds. Listing a method is not advice to execute it.
 
-## Drivechain, exchange and proof interfaces
+## Drivechain interfaces
 
 | RPC | Purpose and important limits |
 | --- | --- |
-| `importdrivechaindeposit` | Wallet call constructing a deposit claim. Native arguments are `mainchain_txid mainchain_vout mainchain_block_hash address value_sats (fee_sats deposit_fee_sats)`. Verifies exact deposit evidence, activation and confirmation depth using authenticated parent replay. `fee_sats` remains wallet-sponsored; `deposit_fee_sats` must exactly match the fee committed in the L1 destination and is deducted from the credit. Cannot combine both. Existing address-only deposits remain fee-free. Historical ECX routing has a different signature; consult the selected network's help. |
+| `importdrivechaindeposit` | Wallet call constructing a deposit claim. Arguments are `mainchain_txid mainchain_vout mainchain_block_hash address value_sats (fee_sats deposit_fee_sats)`. Verifies exact deposit evidence, activation and confirmation depth using authenticated parent replay. `fee_sats` remains wallet-sponsored; `deposit_fee_sats` must exactly match the fee committed in the L1 destination and is deducted from the credit. Cannot combine both. Existing address-only deposits remain fee-free. |
 | `getdrivechaindepositdestination` | Encodes an Elements recipient and exact fee into the opaque L1 M5 destination, with optional BitWindow slot prefix in the result. Does not sign or broadcast. Requires native Drivechain mode. Use before funding, and upgrade validators before using nonzero committed fees. |
 | `sendtomainchain` | Wallet peg-out entry point. Behavior depends on the configured network and peg-out policy; does not imply immediate L1 payout. |
 | `getdrivechainpegevents` | Scans active-chain peg events. Optional `include_l1` queries the enforcer's `GetTwoWayPegData`; this is not the native deposit-validation authority. |
 | `getdrivechainwithdrawalbundle` | Derives a canonical blinded M6 from a confirmed native pegged-asset burn. Does not submit it. |
 | `verifydrivechainwithdrawalbundle` | Checks a proposed blinded M6 against its confirmed burn. Does not submit it or cast a vote. |
 | `submitdrivechainwithdrawal` | Derives and idempotently submits the burn's bundle to the miner enforcer's wallet-free `BlockProducerService/ProposeWithdrawalBundle`. Submission is not approval or mined M6 inclusion. |
-| `getbmmconsensuscontext` | Returns the active tip's authenticated prior-parent context. Does not choose a future block's parent or activate ECX. |
+| `getbmmconsensuscontext` | Returns the active tip's authenticated prior-parent context. Does not choose a future block's parent. |
 | `submitbmmworkbid` | Constructs, funds, signs and broadcasts a BIP301 M8 transaction through the explicit `drivechainbmmwallet` on parent RPC, subject to candidate fee, verification-work and reserve limits. Can spend bid funds; never falls back to an enforcer wallet. |
-| `getecxconsensuscontext` | Returns ECX source heads and authenticated BMM clock used by mempool/next-block Simplicity execution. |
-| `getecxstateutxoroot` | Computes the ECX header root for an existing unspent output; intended for freezing an activated-regtest genesis singleton. |
-| `getecxbondinboxentries` | Reconstructs a bounded range of node-verified bond-inbox entries and source transactions from archival blocks. |
-| `getusddwithdrawalaccumulator` | Returns the generic Ethereum-withdrawal accumulator. The root alone does not authorize USDD release; external deployment asset/vault identities must match. |
-| `getusddwithdrawalproof` | Reconstructs withdrawal inclusion evidence from retained blocks; requires unpruned withdrawal blocks, with a 10,000-leaf and ten-second work bound. This is not an SP1 proof generator. |
 | `getalphacheckpointevidence` | Captures bounded raw evidence at an exact active tip. Flushes the coins cache and holds the chain lock; not a lightweight polling call or a qualified proof. |
-| `getsimplicityinfo` | Reports Simplicity information for the node. |
 | `getsidechaininfo` | Reports Elements sidechain configuration/information. |
 
 Enforcer gRPC methods are **not Elements JSON-RPC methods**. Withdrawals use
@@ -71,12 +65,10 @@ in their registered categories for completeness.
 `getblockhash`, `getblockheader`, `getblockstats`, `getbmmconsensuscontext`,
 `getchainstates`, `getchaintips`, `getchaintxstats`, `getdeploymentinfo`,
 `getdescriptoractivity`, `getdifficulty`, `getdrivechaindepositdestination`, `getdrivechainpegevents`,
-`getdrivechainwithdrawalbundle`, `getecxbondinboxentries`,
-`getecxconsensuscontext`, `getecxstateutxoroot`, `getmempoolancestors`,
+`getdrivechainwithdrawalbundle`, `getmempoolancestors`,
 `getmempooldescendants`, `getmempoolentry`, `getmempoolinfo`, `getrawmempool`,
-`getsidechaininfo`, `getsimplicityinfo`, `gettxout`, `gettxoutproof`,
-`gettxoutsetinfo`, `gettxspendingprevout`, `getusddwithdrawalaccumulator`,
-`getusddwithdrawalproof`, `importmempool`, `loadtxoutset`, `preciousblock`,
+`getsidechaininfo`, `gettxout`, `gettxoutproof`,
+`gettxoutsetinfo`, `gettxspendingprevout`, `importmempool`, `loadtxoutset`, `preciousblock`,
 `pruneblockchain`, `savemempool`, `scanblocks`, `scantxoutset`,
 `submitdrivechainwithdrawal`, `verifychain`, `verifydrivechainwithdrawalbundle`,
 `verifytxoutproof`.

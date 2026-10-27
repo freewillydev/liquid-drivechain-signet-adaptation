@@ -1,117 +1,52 @@
-# Elements Drivechain node
+# Elements Native
 
-RPC documentation: [Supported calls, availability and fork-specific methods](doc/supported-rpcs.md).
+This branch contains upstream Elements, native BIP300/BIP301 deposits,
+withdrawals and BMM bidding, and the parallel Utreexo test-chain accumulator.
+Confidential transaction range proofs, surjection proofs and amount validation
+remain native Elements features.
 
-Elements sidechain implementation targeting ECX Betanet **slot 24**. Use `-chain=elements`.
-This is not Liquid, Bitcoin mainnet, or the historical signet demo.
-Confidential transactions and explicit payments are supported. Rangeproof,
-surjection-proof and amount-conservation checks remain mandatory.
+No exchange, USDD bridge, SP1 jet, proof program or external verifier archive is
+part of this branch. The fairmint exchange is maintained on `fairmint-exchange`.
+The previous complete implementation is preserved on
+`archive/exchange-usdd-sp1-20261027`.
 
-## Betanet migration status
+## Chain Isolation
 
-This checkout freezes a new Betanet identity at parent checkpoint 967679. It is
-an **operator-authorized existing Elements slot-24 test profile**: the existing
-Elements proposal bytes, name and hash are unchanged.
-Parent replay must authenticate that exact proposal and activation. The child
-manifest, genesis and native asset are independently bound; the existing parent
-proposal describes replay v4, while this distinct child uses replay v5.
-See the [generated identity table](doc/drivechain-network-identity.md). Production
-eCash mainnet support is a separate release target, not this built-in identity.
+This branch targets a **fresh child chain**, not an upgrade of the running
+Betanet child. Its data subdirectory is `elements-native-v1`, with P2P port
+7072 and RPC port 7071. Never reuse another chain's databases or wallets.
+The frozen identity is in `src/elements_drivechain_identity.h`; its independent
+serializer is `contrib/devtools/elements_identity_refreeze.py`.
 
-The independent serializer reproduces the frozen identity, but native build,
-continuous pruned-parent operation and fresh node/indexer deployment still need
-qualification. This is **not yet a Betanet-ready sidechain release**. Never reuse
-Alpha chain, index or wallet databases as Betanet data. Retained Alpha domain
-separators and test vectors are historical protocol data, not current network
-selection. Never replace their strings without recomputing and validating the
-entire dependent identity.
+The current parent profile remains ECX Betanet, slot 24. A new matching sidechain
+proposal must be activated before that parent can authenticate blocks and peg
+operations for this fresh child. The former existing-proposal override is off.
+This is not a production ECX identity. Its genesis, network magic and data
+directory also differ from the fairmint branch; they are separate fresh chains.
 
-The configuration below targets the new identity. Keep automatic production and
-bidding disabled until deployment qualification is complete.
+## Build and Test
 
-Nodes built from the former explicit-only Alpha branch must upgrade before
-accepting confidential payments. This consensus change does not alter the
-genesis or address prefixes; do not send confidential payments until your
-validators have upgraded. The optional explicit-only validation fixtures are
-not activated on Alpha. Before replacing an explicit-only deployment, replay
-its existing chain in an isolated copy: that branch also selected different
-per-asset aggregate limits, so source integration alone is not a historical
-chain-compatibility or deployment certification.
-
-## 1. Build
-
-Follow the [build instructions](doc/upstream-merge-20260902.md).
-You need CMake 3.22+, a C++20 compiler, and the matching USDD and ECX native
-verifier archives. A source checkout alone does not supply those archives.
-Supplied archives require [trusted SHA-256 pins](doc/verifier-build-integrity.md)
-in addition to the existing ABI and semantic checks.
-
-## 2. Configure
-
-You need a synced parent node matching the frozen identity. A miner-operated
-enforcer endpoint is needed for withdrawal proposal submission, not deposits
-or locally funded BMM bids.
-Complete the [parent RPC and enforcer mTLS setup](doc/drivechain-rpc-security.md)
-first. Keep RPC private; do not expose either node's RPC port to the internet.
-
-Create a private data directory and an `elements.conf` inside it:
-
-```ini
-chain=elements
-# Explicitly acknowledge this existing-proposal test chain, not a production chain.
-acceptbetanettestprofile=1
-server=1
-rpcbind=127.0.0.1
-rpcallowip=127.0.0.1
-mainchainrpchost=127.0.0.1
-mainchainrpcport=28532
-mainchainrpccookiefile=/absolute/path/to/parent/.cookie
-
-# Start without automatic block production or bidding.
-drivechainl1blocksync=0
-```
-
-Replace the cookie path and parent port with your authenticated local endpoint.
-For a local credential bridge, use `mainchainrpccredentialfile` instead of
-`mainchainrpccookiefile`, as described in the security guide. Add the enforcer
-TLS settings from that guide; this minimal excerpt does not replace them.
-
-The defaults are P2P **7066**, RPC **7065**, and chain subdirectory
-`elements-betanet-slot24-v1`. The [frozen network identity](src/elements_drivechain_identity.h)
-defines the required Betanet parent checkpoint. Do not reuse another chain's data.
-Parent RPC must also serve the [post-fork Betanet identity](doc/betanet-slot24-test.md),
-not just the Bitcoin-shared genesis and pre-fork bootstrap checkpoint.
-
-## 3. Run
-
-Replace the build and data paths:
+Use the platform instructions in `doc/build-unix.md` or `doc/build-osx.md` and the
+Haskell requirements in `src/haskell/README.md`. CMake builds the Haskell library
+and native node together. No USDD or SP1 verifier archive is required.
 
 ```sh
-/absolute/path/to/build/bin/elementsd -datadir=/absolute/path/to/data
+cmake -S . -B build -DBUILD_TESTS=ON
+cmake --build build -j1
+ctest --test-dir build --output-on-failure
 ```
 
-In another terminal:
+Keep RPC private and authenticated. Configure a synced parent matching the frozen
+network identity, using a local cookie or the authenticated TLS transport
+described in `doc/drivechain-rpc-security.md`. Start with
+`drivechainl1blocksync=0`; enabling a producer and funding its dedicated bidding
+wallet are separate operator decisions.
 
-```sh
-/absolute/path/to/build/bin/elements-cli -datadir=/absolute/path/to/data getblockchaininfo
-/absolute/path/to/build/bin/elements-cli -datadir=/absolute/path/to/data getpeerinfo
-```
+## Documentation
 
-To stop cleanly:
-
-```sh
-/absolute/path/to/build/bin/elements-cli -datadir=/absolute/path/to/data stop
-```
-
-Only expose P2P if you intend to accept public peers. Running directly from home
-can reveal your IP to peers; use an isolated relay/VPN setup if privacy is needed.
-
-## More
-
+- [Fresh-chain identity](doc/drivechain-network-identity.md)
+- [Utreexo test chain](doc/utreexo-test-chain.md)
 - [Deposits and withdrawals](doc/drivechain-peg-operations.md)
-- [Verifier requirements](doc/usdd-sp1-verifier-jet.md)
-- [Security and qualification limits](doc/security-report-remediation.md)
-- [Report a vulnerability](SECURITY.md)
+- [RPC reference](doc/supported-rpcs.md)
+- [Security reporting](SECURITY.md)
 - [MIT license](COPYING)
-
-This is experimental software, not a real-money production release.

@@ -15,7 +15,6 @@
 #include <consensus/consensus.h>
 #include <elements_drivechain_identity.h>
 #include <drivechain_parent_rules.h>
-#include <usdd_sp1_resources.h>
 #include <consensus/amount.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
@@ -778,7 +777,6 @@ public:
 
         // Alpha supports confidential payments. Do not activate the optional
         // explicit-only rule used by isolated validation fixtures.
-        consensus.explicit_only_height = -1;
 
         // The sidechain itself uses an OP_TRUE signed-block challenge. Its
         // security boundary is the mandatory, independently verified BIP301
@@ -822,7 +820,7 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height =
             ElementsDrivechainIdentity::DEPLOYMENT_MIN_ACTIVATION_HEIGHT;
 
-        // USDD controllers may exist from the first spendable block. Never
+        // Simplicity covenants may exist from the first spendable block. Never
         // leave 0xbe leaves to upgradable-leaf semantics on this chain.
         consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].bit =
             ElementsDrivechainIdentity::SIMPLICITY_DEPLOYMENT_BIT;
@@ -895,7 +893,6 @@ public:
             ElementsDrivechainIdentity::PARENT_REPLAY_VERSION;
         consensus.drivechain_annex_feature_version =
             ElementsDrivechainIdentity::ANNEX_FEATURE_VERSION;
-        consensus.enable_usdd_sp1_annex = true;
         consensus.drivechain_m6_withdrawal_validation = true;
         consensus.total_valid_epochs = 1;
         consensus.dynamic_epoch_length = std::numeric_limits<uint32_t>::max();
@@ -948,46 +945,8 @@ public:
                 << consensus.genesis_style
                 << consensus.signblockscript
                 << consensus.max_block_signature_size
-                << consensus.enable_usdd_sp1_annex
                 << consensus.drivechain_m6_withdrawal_validation
                 << consensus.drivechain_annex_feature_version
-                << ElementsDrivechainIdentity::USDD_SP1_VERIFIER_ACTIVATION_CONFIGURED
-                << ElementsDrivechainIdentity::USDD_SP1_PROOF_BUNDLE_VERSION
-                << ElementsDrivechainIdentity::REQUIRED_USDD_SP1_VERIFIER_ABI_VERSION
-                << ElementsDrivechainIdentity::REQUIRED_USDD_SP1_VERIFIER_SEMANTIC_IDENTITY_VERSION
-                << std::vector<unsigned char>(
-                       ElementsDrivechainIdentity::USDD_SP1_VERIFIER_SEMANTIC_IDENTITY.begin(),
-                       ElementsDrivechainIdentity::USDD_SP1_VERIFIER_SEMANTIC_IDENTITY.end())
-                << std::string{ElementsDrivechainIdentity::USDD_SP1_VERSION}
-                << std::string{ElementsDrivechainIdentity::USDD_SP1_GIT_COMMIT}
-                << ElementsDrivechainIdentity::USDD_SP1_COMPRESSED_CIRCUIT_VERSION
-                << ElementsDrivechainIdentity::USDD_SP1_COMPRESSED_CODEC_VERSION
-                << std::string{ElementsDrivechainIdentity::USDD_SP1_PROOF_MODE}
-                << std::string{ElementsDrivechainIdentity::USDD_SP1_PROOF_CODEC}
-                << std::string{ElementsDrivechainIdentity::USDD_SP1_PUBLIC_VALUES_DIGEST_MODE}
-                << std::vector<unsigned char>(
-                       ElementsDrivechainIdentity::USDD_SP1_RECURSION_CONSTANTS_COMMITMENT.begin(),
-                       ElementsDrivechainIdentity::USDD_SP1_RECURSION_CONSTANTS_COMMITMENT.end())
-                << ElementsDrivechainIdentity::USDD_SP1_ANNEX_ENVELOPE_VERSION
-                << ElementsDrivechainIdentity::USDD_SP1_ANNEX_PROOF_SYSTEM
-                << ElementsDrivechainIdentity::USDD_SP1_ANNEX_STATEMENT_KIND
-                << ElementsDrivechainIdentity::USDD_SP1_ANNEX_DIGEST_MODE
-                << ElementsDrivechainIdentity::USDD_SP1_ANNEX_MAX_BYTES
-                << ElementsDrivechainIdentity::USDD_SP1_PUBLIC_VALUES_MAX_BYTES
-                << ElementsDrivechainIdentity::USDD_SP1_DEPLOYMENT_BINDING_VERSION
-                << std::vector<unsigned char>(
-                       ElementsDrivechainIdentity::USDD_SP1_INBOUND_MINT_DOMAIN_ID.begin(),
-                       ElementsDrivechainIdentity::USDD_SP1_INBOUND_MINT_DOMAIN_ID.end())
-                << std::vector<unsigned char>(
-                       ElementsDrivechainIdentity::USDD_SP1_GUEST_PROGRAM_ID.begin(),
-                       ElementsDrivechainIdentity::USDD_SP1_GUEST_PROGRAM_ID.end())
-                << ElementsDrivechainIdentity::USDD_SP1_GUEST_ELF_BYTES
-                << std::vector<unsigned char>(
-                       ElementsDrivechainIdentity::USDD_SP1_GUEST_ELF_SHA256.begin(),
-                       ElementsDrivechainIdentity::USDD_SP1_GUEST_ELF_SHA256.end())
-                << std::vector<unsigned char>(
-                       ElementsDrivechainIdentity::PARAMETERIZED_CONTROLLER_PROFILE_ID.begin(),
-                       ElementsDrivechainIdentity::PARAMETERIZED_CONTROLLER_PROFILE_ID.end())
                 << std::string{"current_bmm_parent_mtp"}
                 << ElementsDrivechainIdentity::CURRENT_BMM_PARENT_MTP_JET_CATALOGUE_ITEM
                 << std::vector<unsigned char>(
@@ -997,51 +956,11 @@ public:
                        ElementsDrivechainIdentity::CURRENT_BMM_PARENT_MTP_JET_CMR.begin(),
                        ElementsDrivechainIdentity::CURRENT_BMM_PARENT_MTP_JET_CMR.end())
                 << ElementsDrivechainIdentity::CURRENT_BMM_PARENT_MTP_JET_COST_MWU
-                << std::string{"verify_sp1_compressed_sha256"}
-                << ElementsDrivechainIdentity::VERIFY_SP1_COMPRESSED_SHA256_JET_CATALOGUE_ITEM
-                << std::vector<unsigned char>(
-                       ElementsDrivechainIdentity::VERIFY_SP1_COMPRESSED_SHA256_JET_ENCODING.begin(),
-                       ElementsDrivechainIdentity::VERIFY_SP1_COMPRESSED_SHA256_JET_ENCODING.end())
-                << std::vector<unsigned char>(
-                       ElementsDrivechainIdentity::VERIFY_SP1_COMPRESSED_SHA256_JET_CMR.begin(),
-                       ElementsDrivechainIdentity::VERIFY_SP1_COMPRESSED_SHA256_JET_CMR.end())
-                << ElementsDrivechainIdentity::VERIFY_SP1_COMPRESSED_SHA256_JET_COST_MWU
-                << std::string{"USDD_SP1_RESOURCE_SCHEDULE_V1"}
                 << ElementsDrivechainIdentity::CONSENSUS_MAX_BLOCK_SERIALIZED_SIZE
                 << ElementsDrivechainIdentity::CONSENSUS_MAX_BLOCK_WEIGHT
-                << ElementsDrivechainIdentity::USDD_SP1_ANNEXES_PER_BLOCK
-                << ElementsDrivechainIdentity::USDD_SP1_PROOF_TX_MAX_WEIGHT
-                << ElementsDrivechainIdentity::USDD_SP1_ANNEX_MAX_BYTES
-                << ElementsDrivechainIdentity::USDD_SP1_PUBLIC_VALUES_MAX_BYTES
-                << ElementsDrivechainIdentity::USDD_SP1_MEASURED_RAW_PROOF_BYTES
-                << ElementsDrivechainIdentity::USDD_SP1_MEASURED_PUBLIC_VALUES_BYTES
-                << ElementsDrivechainIdentity::USDD_SP1_MEASURED_ANNEX_BYTES
-                << ElementsDrivechainIdentity::USDD_SP1_MEASURED_ANNEX_WEIGHT
-                << ElementsDrivechainIdentity::USDD_SP1_MAX_ANNEX_WEIGHT
-                << ElementsDrivechainIdentity::USDD_SP1_MAX_NON_ANNEX_TX_WEIGHT
                 << std::string{ElementsDrivechainIdentity::BIP300301_ENFORCER_REVISION}
                 << std::string{ElementsDrivechainIdentity::BIP300301_LOCAL_RULE_DOMAIN}
                 << std::string{ElementsDrivechainIdentity::BIP300301_LOCAL_RULE_ID}
-                << ElementsDrivechainIdentity::WITHDRAWAL_ACCUMULATOR_VERSION
-                << ElementsDrivechainIdentity::WITHDRAWAL_BIP301_CHECKPOINT_VERSION
-                << std::string{
-                       ElementsDrivechainIdentity::WITHDRAWAL_BIP301_CHECKPOINT_DOMAIN}
-                << std::vector<unsigned char>(
-                       ElementsDrivechainIdentity::WITHDRAWAL_MAGIC.begin(),
-                       ElementsDrivechainIdentity::WITHDRAWAL_MAGIC.end())
-                << ElementsDrivechainIdentity::WITHDRAWAL_SCRIPT_PUSH_SIZE
-                << ElementsDrivechainIdentity::WITHDRAWAL_PROTOCOL_VERSION
-                << ElementsDrivechainIdentity::WITHDRAWAL_LEAF_PREFIX
-                << ElementsDrivechainIdentity::WITHDRAWAL_NODE_PREFIX
-                << ElementsDrivechainIdentity::WITHDRAWAL_TREE_DEPTH
-                << ElementsDrivechainIdentity::USDD_UNITS_PER_USDT_MICRO
-                << ElementsDrivechainIdentity::MAX_WITHDRAWAL_USDT_MICRO
-                << std::vector<unsigned char>(
-                       ElementsDrivechainIdentity::WITHDRAWAL_BURN_ID_DOMAIN.begin(),
-                       ElementsDrivechainIdentity::WITHDRAWAL_BURN_ID_DOMAIN.end())
-                << std::vector<unsigned char>(
-                       ElementsDrivechainIdentity::WITHDRAWAL_LEAF_DOMAIN.begin(),
-                       ElementsDrivechainIdentity::WITHDRAWAL_LEAF_DOMAIN.end())
                 << consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit
                 << consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime
                 << consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout
@@ -1052,7 +971,7 @@ public:
                 << consensus.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].min_activation_height;
         };
         HashWriter manifest_writer{};
-        manifest_writer << std::string{"ELEMENTS_DRIVECHAIN_PROTOCOL_MANIFEST_V11"};
+        manifest_writer << std::string{"ELEMENTS_DRIVECHAIN_PROTOCOL_MANIFEST_V13"};
         write_identity_fields(manifest_writer);
         manifest_writer
             << parentGenesisBlockHash
@@ -1082,29 +1001,19 @@ public:
             << consensus.drivechain_parent_state_replay_version;
         consensus.drivechain_protocol_manifest_hash = manifest_writer.GetHash();
 
-        const std::string source_domain{"ELEMENTS_DRIVECHAIN_PROTOCOL_SOURCE_V11"};
+        const std::string source_domain{"ELEMENTS_DRIVECHAIN_PROTOCOL_SOURCE_V13"};
         std::vector<unsigned char> source_preimage(
             source_domain.begin(), source_domain.end());
         source_preimage.insert(source_preimage.end(),
                                consensus.drivechain_protocol_manifest_hash.begin(),
                                consensus.drivechain_protocol_manifest_hash.end());
         const uint160 source_id = Hash160(source_preimage);
-        std::string proposal_payload{drivechain::FROZEN_PARENT_RULES.proposal_text};
+        std::string proposal_payload{ElementsDrivechainIdentity::PROPOSAL_TEXT};
         proposal_payload.append(reinterpret_cast<const char*>(consensus.drivechain_protocol_manifest_hash.begin()), 32);
         proposal_payload.append(reinterpret_cast<const char*>(source_id.begin()), 20);
         consensus.drivechain_proposal_description = drivechain::haskell::ParseConfigurationField(
             drivechain::haskell::ConfigurationField::PROPOSAL_DESCRIPTION, proposal_payload,
             "Invalid Elements proposal payload", "Invalid Elements proposal payload");
-        if constexpr (ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_TEST_PROFILE) {
-            // Preserve the existing parent title and proposal; the independently
-            // calculated child manifest is still bound into the child identity.
-            consensus.drivechain_proposal_description = ParseHex(
-                ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_PROPOSAL_HEX);
-            if (Hash(consensus.drivechain_proposal_description) != uint256S(
-                    ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_PROPOSAL_HASH)) {
-                throw std::runtime_error("Elements test proposal hash mismatch");
-            }
-        }
         consensus.drivechain_proposal_hash = Hash(consensus.drivechain_proposal_description);
         assert(consensus.drivechain_protocol_manifest_hash == uint256S(
             ElementsDrivechainIdentity::PROTOCOL_MANIFEST_HASH));
@@ -1134,7 +1043,7 @@ public:
         // both the pegged-asset entropy and child genesis transaction.
         const std::vector<unsigned char> base_commitment = CommitToArguments(consensus, m_chain_type.chain_name);
         HashWriter identity_writer{};
-        identity_writer << std::string{"ELEMENTS_DRIVECHAIN_NETWORK_V11"};
+        identity_writer << std::string{"ELEMENTS_DRIVECHAIN_NETWORK_V13"};
         write_identity_fields(identity_writer);
         identity_writer
             << base_commitment
@@ -2541,17 +2450,9 @@ bool IsCanonicalElementsProductionIdentity(const CChainParams& params,
             case 76: return consensus.drivechain_withdrawal_bundle_inclusion_threshold == ElementsDrivechainIdentity::WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD;
             case 77: return consensus.drivechain_parent_state_replay_version == ElementsDrivechainIdentity::PARENT_REPLAY_VERSION;
             case 78: return consensus.drivechain_annex_feature_version == ElementsDrivechainIdentity::ANNEX_FEATURE_VERSION;
-            case 79: return bool(consensus.enable_usdd_sp1_annex);
             case 80: return bool(consensus.drivechain_m6_withdrawal_validation);
             case 81: return MAX_BLOCK_SERIALIZED_SIZE == ElementsDrivechainIdentity::CONSENSUS_MAX_BLOCK_SERIALIZED_SIZE;
             case 82: return MAX_BLOCK_WEIGHT == ElementsDrivechainIdentity::CONSENSUS_MAX_BLOCK_WEIGHT;
-            case 83: return usdd::SP1_ANNEXES_PER_BLOCK == ElementsDrivechainIdentity::USDD_SP1_ANNEXES_PER_BLOCK;
-            case 84: return usdd::SP1_PROOF_TX_MAX_WEIGHT == ElementsDrivechainIdentity::USDD_SP1_PROOF_TX_MAX_WEIGHT;
-            case 85: return usdd::SP1_ANNEX_MAX_SIZE == ElementsDrivechainIdentity::USDD_SP1_ANNEX_MAX_BYTES;
-            case 86: return SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE == ElementsDrivechainIdentity::USDD_SP1_ANNEX_MAX_BYTES;
-            case 87: return bool(ElementsDrivechainIdentity::USDD_SP1_VERIFIER_ACTIVATION_CONFIGURED);
-            case 88: return ElementsDrivechainIdentity::USDD_SP1_DEPLOYMENT_BINDING_VERSION == 2;
-            case 89: return bool(std::all_of( ElementsDrivechainIdentity::USDD_SP1_INBOUND_MINT_DOMAIN_ID.begin(), ElementsDrivechainIdentity::USDD_SP1_INBOUND_MINT_DOMAIN_ID.end(), [](const uint8_t byte) { return byte == 0; }));
             case 90: return consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit == ElementsDrivechainIdentity::TAPROOT_DEPLOYMENT_BIT;
             case 91: return consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime == ElementsDrivechainIdentity::DEPLOYMENT_ALWAYS_ACTIVE;
             case 92: return consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout == ElementsDrivechainIdentity::DEPLOYMENT_NO_TIMEOUT;

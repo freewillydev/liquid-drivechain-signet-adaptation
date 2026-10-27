@@ -131,7 +131,6 @@
         case 49: *result = GENESIS_BLOCK_HASH; return SIMPLICITY_NO_ERROR;
         case 50: *result = TRANSACTION_ID; return SIMPLICITY_NO_ERROR;
         case 51: *result = CURRENT_BMM_PARENT_MTP; return SIMPLICITY_NO_ERROR;
-        case 52: *result = VERIFY_SP1_COMPRESSED_SHA256; return SIMPLICITY_NO_ERROR;
         case 53: *result = CURRENT_BMM_PARENT_MTP_REQUIRED; return SIMPLICITY_NO_ERROR;
         case 54: *result = ISSUANCE_IS_NONE; return SIMPLICITY_NO_ERROR;
         case 55: *result = INPUT_IS_PEGIN; return SIMPLICITY_NO_ERROR;
@@ -139,11 +138,5 @@
         case 57: *result = PRIOR_ACTIVE_BMM_PARENT_CHECKPOINT_REQUIRED; return SIMPLICITY_NO_ERROR;
       }
       break;
-#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
-#include "ecxPrivateE2eDecodeElementsJets.inc"
-#endif
-#ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
-#include "ecxDecodeElementsJets.inc"
-#endif
   }
 }

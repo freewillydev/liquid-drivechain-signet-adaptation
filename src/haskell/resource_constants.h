@@ -3,22 +3,11 @@
 #define ELEMENTS_HASKELL_RESOURCE_CONSTANTS_H
 #include <cstdint>
 namespace ElementsDrivechainIdentity {
-inline constexpr uint32_t CONSENSUS_MAX_BLOCK_SERIALIZED_SIZE{6000000U};
-inline constexpr uint32_t CONSENSUS_MAX_BLOCK_WEIGHT{6000000U};
-inline constexpr uint32_t USDD_SP1_ANNEXES_PER_BLOCK{1U};
-inline constexpr uint32_t USDD_SP1_PROOF_TX_MAX_WEIGHT{1500000U};
-inline constexpr uint32_t USDD_SP1_ANNEX_MAX_BYTES{1310720U};
-inline constexpr uint32_t USDD_SP1_PUBLIC_VALUES_MAX_BYTES{16384U};
-inline constexpr uint32_t USDD_SP1_MEASURED_RAW_PROOF_BYTES{1272546U};
-inline constexpr uint32_t USDD_SP1_MEASURED_PUBLIC_VALUES_BYTES{1001U};
-inline constexpr uint32_t USDD_SP1_MEASURED_ANNEX_BYTES{1273602U};
-inline constexpr uint32_t USDD_SP1_MEASURED_ANNEX_WEIGHT{1273607U};
-inline constexpr uint32_t USDD_SP1_MAX_ANNEX_WEIGHT{1310725U};
-inline constexpr uint32_t USDD_SP1_MAX_NON_ANNEX_TX_WEIGHT{189275U};
+inline constexpr uint32_t CONSENSUS_MAX_BLOCK_SERIALIZED_SIZE{4000000U};
+inline constexpr uint32_t CONSENSUS_MAX_BLOCK_WEIGHT{4000000U};
 inline constexpr uint32_t MAX_DRIVECHAIN_DEPOSITS_PER_BLOCK{64U};
 inline constexpr int ALPHA_PEGIN_ONE_CONFIRMATION_HEIGHT{64};
 inline constexpr uint32_t DEPOSIT_ADDRESS_LIMIT{128U};
-inline constexpr uint32_t STANDARD_SCRIPT_VERIFY_FLAGS{134217728U};
 inline constexpr unsigned char DEPOSIT_MARKER[]{100,114,105,118,101,99,104,97,105,110,45,100,101,112,111,115,105,116,45,118,50};
 inline constexpr unsigned char LEGACY_DEPOSIT_MARKER[]{100,114,105,118,101,99,104,97,105,110,45,100,101,112,111,115,105,116,45,118,49};
 inline constexpr unsigned char LEGACY_DEPOSIT_LAYOUT[]{0,1,2,3,255,4};

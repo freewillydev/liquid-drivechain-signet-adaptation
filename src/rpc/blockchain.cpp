@@ -22,7 +22,6 @@
 #include <drivechain_bmm.h>
 #include <haskell/bmm_constants.h>
 #include <drivechain_peg.h>
-#include <ecx_exchange_state.h>
 #include <drivechain_withdrawal.h>
 #include <flatfile.h>
 #include <hash.h>
@@ -60,7 +59,6 @@
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <util/translation.h>
-#include <usdd_withdrawal_accumulator.h>
 #include <validation.h>
 #include <validationinterface.h>
 #include <versionbits.h>
@@ -96,14 +94,6 @@ PrepareUTXOSnapshot(
     const std::function<void()>& interruption_point = {})
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
-static std::mutex g_usdd_withdrawal_proof_mutex;
-
-UniValue EcxWideNumberToJSON(std::span<const unsigned char,16> bytes, bool signed_value)
-{
-    UniValue number;
-    number.setNumStr(drivechain::haskell::WideDecimal(bytes,signed_value));
-    return number;
-}
 
 UniValue WriteUTXOSnapshot(
     Chainstate& chainstate,
@@ -260,19 +250,6 @@ UniValue blockheaderToJSON(const CBlockIndex& tip, const CBlockIndex& blockindex
     if (Params().GetConsensus().elements_mode) {
         result.pushKV("withdrawalbundlehash", blockindex->hashWithdrawalBundle.GetHex());
         result.pushKV("bmmproofhash", blockindex->hashBmmProof.GetHex());
-        result.pushKV("exchangestateroot", blockindex->hashExchangeStateRoot.GetHex());
-        result.pushKV("forcedinboxroot", blockindex->hashForcedInboxRoot.GetHex());
-        if (CBlockHeader::GetLayout(blockindex->nVersion, false, false, true).swap_forced) {
-            // Exact canonical bytes retain all128 count/cursor bits for clients.
-            result.pushKV("swapforcedstate", HexStr(blockindex->swapForcedState));
-        }
-        result.pushKV("depositinboxroot", blockindex->hashDepositInboxRoot.GetHex());
-        result.pushKV("ecxparentheight", static_cast<uint64_t>(blockindex->ecxParentHeight));
-        result.pushKV("forcedprocessedcursor", blockindex->forcedProcessedCursor);
-        result.pushKV("depositprocessedcursor", blockindex->depositProcessedCursor);
-        result.pushKV(
-            "sourcebacklogoldestparentheight",
-            blockindex->sourceBacklogOldestParentHeight);
     }
     result.pushKV("time", (int64_t)blockindex->nTime);
     result.pushKV("mediantime", (int64_t)blockindex->GetMedianTimePast());
@@ -689,7 +666,6 @@ static RPCHelpMan getblockheader()
                             {RPCResult::Type::STR_HEX, "merkleroot", "The merkle root"},
                             {RPCResult::Type::STR_HEX, "withdrawalbundlehash", "The current drivechain withdrawal bundle hash committed by this block header"},
                             {RPCResult::Type::STR_HEX, "bmmproofhash", "The BMM proof commitment appended by the existing header extension"},
-                            {RPCResult::Type::STR_HEX, "exchangestateroot", "The append-only ECX state singleton root, or zero before activation"},
                             {RPCResult::Type::NUM_TIME, "time", "The block time expressed in " + UNIX_EPOCH_TIME},
                             {RPCResult::Type::NUM_TIME, "mediantime", "The median block time expressed in " + UNIX_EPOCH_TIME},
                             {RPCResult::Type::NUM, "nonce", /*optional=*/true, "The nonce"},
@@ -897,7 +873,6 @@ static RPCHelpMan getblock()
                     {RPCResult::Type::STR_HEX, "merkleroot", "The merkle root"},
                     {RPCResult::Type::STR_HEX, "withdrawalbundlehash", "The current drivechain withdrawal bundle hash committed by this block header"},
                     {RPCResult::Type::STR_HEX, "bmmproofhash", "The BMM proof commitment appended by the existing header extension"},
-                    {RPCResult::Type::STR_HEX, "exchangestateroot", "The append-only ECX state singleton root, or zero before activation"},
                     {RPCResult::Type::ARR, "tx", "The transaction ids",
                         {{RPCResult::Type::STR_HEX, "", "The transaction id"}}},
                     {RPCResult::Type::NUM_TIME, "time",       "The block time expressed in " + UNIX_EPOCH_TIME},
@@ -1391,631 +1366,6 @@ static RPCHelpMan gettxout()
     };
 }
 
-static RPCHelpMan getecxstateutxoroot()
-{
-    return RPCHelpMan{"getecxstateutxoroot",
-        "Compute the exact consensus ECX header root for an existing unspent output.\n"
-        "This is intended for freezing an activated-regtest genesis singleton.\n",
-        {
-            {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The singleton transaction id"},
-            {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "The singleton output index"},
-        },
-        RPCResult{RPCResult::Type::OBJ, "", "", {
-            {RPCResult::Type::STR_HEX, "root", "ECX/header-state/v1 root in display hex"},
-            {RPCResult::Type::BOOL, "eligible", "Whether the output has the required explicit asset/value, null nonce and P2TR shape"},
-            {RPCResult::Type::NUM, "height", "UTXO creation height"},
-        }},
-        RPCExamples{
-            HelpExampleCli("getecxstateutxoroot", "\"txid\" 0") +
-            HelpExampleRpc("getecxstateutxoroot", "\"txid\", 0")},
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    if (!drivechain::haskell::ExchangeAvailable(drivechain::haskell::Availability::RPC,
-            [](uint32_t) { return Params().GetConsensus().elements_mode; })) {
-        throw JSONRPCError(
-            RPC_MISC_ERROR,
-            "ECX state is unavailable outside an Elements-mode chain");
-    }
-    NodeContext& node = EnsureAnyNodeContext(request.context);
-    ChainstateManager& chainman = EnsureChainman(node);
-    LOCK(cs_main);
-
-    const uint256 txid{ParseHashV(request.params[0], "txid")};
-    const int vout = request.params[1].getInt<int>();
-    COutPoint outpoint;
-    std::optional<Coin> coin;
-    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::REQUIRED_PAIR_ERRORS,
-        [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
-        switch (step) {
-        case 1: return vout >= 0;
-        case 2: throw JSONRPCError(RPC_INVALID_PARAMETER, "vout must be nonnegative");
-        case 3:
-            outpoint = COutPoint{Txid::FromUint256(txid), static_cast<uint32_t>(vout)};
-            coin = chainman.ActiveChainstate().CoinsTip().GetCoin(outpoint);
-            return coin.has_value();
-        case 4: throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "ECX singleton UTXO not found");
-        default: throw std::logic_error("invalid ECX UTXO admission action");
-        }
-    });
-
-    UniValue result(UniValue::VOBJ);
-    result.pushKV(
-        "root",
-        ecx::ComputeStateUtxoRoot(
-            Params().GetConsensus().hashGenesisBlock,
-            outpoint,
-            coin->out).GetHex());
-    result.pushKV("eligible", ecx::IsStateAuthorityOutput(coin->out));
-    result.pushKV("height", static_cast<uint64_t>(coin->nHeight));
-    return result;
-},
-    };
-}
-
-static RPCHelpMan getecxconsensuscontext()
-{
-    return RPCHelpMan{"getecxconsensuscontext",
-        "Return the fail-closed ECX source heads and authenticated BMM clock "
-        "used for mempool and next-block Simplicity execution.\n",
-        {},
-        RPCResult{RPCResult::Type::OBJ, "", "", {
-            {RPCResult::Type::NUM, "sidechainheight", "Active sidechain height"},
-            {RPCResult::Type::STR_HEX, "sidechainblockhash", "Active sidechain block hash"},
-            {RPCResult::Type::STR_HEX, "exchangestateroot", "Active ECX singleton root"},
-            {RPCResult::Type::OBJ, "forcedinbox", "Consensus forced-action source head", {
-                {RPCResult::Type::STR_HEX, "headroot", "Append-only forced inbox root"},
-                {RPCResult::Type::NUM, "entrycount", "Number of forced actions committed through this head"},
-                {RPCResult::Type::NUM, "nextindex", "Index assigned to the next forced action"},
-                {RPCResult::Type::NUM, "processedcursor", "First unprocessed forced-action index"},
-            }},
-            {RPCResult::Type::OBJ, "depositinbox", "Consensus confidential-deposit source head", {
-                {RPCResult::Type::STR_HEX, "headroot", "Append-only deposit inbox root"},
-                {RPCResult::Type::NUM, "entrycount", "Number of deposits committed through this head"},
-                {RPCResult::Type::NUM, "nextindex", "Index assigned to the next deposit"},
-                {RPCResult::Type::NUM, "processedcursor", "First unprocessed deposit index"},
-            }},
-            {RPCResult::Type::OBJ, "bmm", "Authenticated prior-parent context", {
-                {RPCResult::Type::BOOL, "authenticated", "Whether the context was derived from verified BMM state rather than the explicit regtest clock"},
-                {RPCResult::Type::NUM, "parentheight", "BMM-authenticated parent height"},
-                {RPCResult::Type::NUM, "parentmtp", "BMM-authenticated parent median time past"},
-                {RPCResult::Type::STR_HEX, "parentblockhash", "BMM-authenticated parent block hash"},
-            }},
-            {RPCResult::Type::NUM, "sourceparentheight", "Approval height committed by the active ECX header"},
-            {RPCResult::Type::NUM, "bridgeversion", /*optional=*/true, "Verified swap projection schema (2 for V24; 3 for exact custody)"},
-            {RPCResult::Type::STR_HEX, "bridgestateroot", /*optional=*/true, "Bridge root in consensus byte order"},
-            {RPCResult::Type::BOOL, "profitlockinsolvent", /*optional=*/true, "Proof-derived swap profit insolvency flag"},
-            {RPCResult::Type::OBJ, "forcedinboxv3", /*optional=*/true, "Authenticated full-width exact source state", {
-                {RPCResult::Type::STR_HEX, "canonicalstate", "Canonical145 source bytes"},
-                {RPCResult::Type::STR, "entrycount", "Unsigned128-bit decimal source count"},
-                {RPCResult::Type::STR, "processedcursor", "Unsigned128-bit decimal cursor"},
-                {RPCResult::Type::NUM, "oldestpendingparentheight", "Authenticated pending age; zero when empty"},
-            }},
-            {RPCResult::Type::OBJ, "custodyfutures", /*optional=*/true, "Verified exact custody/history child", {
-                {RPCResult::Type::NUM, "version", "Child state schema"},
-                {RPCResult::Type::ARR, "state_root", "32 consensus bytes", {{RPCResult::Type::NUM, "", "Byte"}}},
-                {RPCResult::Type::ARR, "configuration_digest", "32 consensus bytes", {{RPCResult::Type::NUM, "", "Byte"}}},
-                {RPCResult::Type::ARR, "policy_digest", "32 consensus bytes", {{RPCResult::Type::NUM, "", "Byte"}}},
-            }},
-            {RPCResult::Type::OBJ, "capital", /*optional=*/true, "Verified V2 public capital projection (present only for a frozen V2 deployment)", {
-                {RPCResult::Type::NUM, "version", "Capital projection version"},
-                {RPCResult::Type::STR_HEX, "exchangestateroot", "Root selecting this exact projection"},
-                {RPCResult::Type::STR_HEX, "configurationhash", "Frozen V2 configuration"},
-                {RPCResult::Type::STR_HEX, "bondassetid", "Verified fixed-supply bond asset"},
-                {RPCResult::Type::STR_HEX, "bonddeploymentcommitment", "Verified deployment envelope"},
-                {RPCResult::Type::STR_HEX, "transitionprogramid", "Frozen SP1 transition program"},
-                {RPCResult::Type::STR_HEX, "transitioncmr", "Frozen Simplicity transition CMR"},
-                {RPCResult::Type::NUM, "insurancereservequoteunits", "Public aggregate insurance reserve"},
-                {RPCResult::Type::NUM, "outstandingbondunits", "Public outstanding share atoms"},
-                {RPCResult::Type::NUM, "navquoteunitsperbond", "Execution-time NAV per whole share"},
-                {RPCResult::Type::NUM, "deficitquoteunits", "Worst full-range portfolio deficit"},
-                {RPCResult::Type::NUM, "targetreservequoteunits", "Ceiling of 125% deficit coverage"},
-                {RPCResult::Type::NUM, "coveragebps", "Public coverage ratio"},
-                {RPCResult::Type::STR, "mode", "Normal, ReduceOnly, or Recovery"},
-                {RPCResult::Type::NUM, "fundingepoch", "Last deterministic funding epoch"},
-                {RPCResult::Type::STR_HEX, "redemptionqueueroot", "FIFO redemption queue root"},
-                {RPCResult::Type::NUM, "redemptionhead", "FIFO head"},
-                {RPCResult::Type::NUM, "redemptiontail", "FIFO tail"},
-                {RPCResult::Type::NUM, "queuedredemptionbondunits", "Public queued share aggregate"},
-                {RPCResult::Type::NUM, "legacyfeepoolquoteunits", "Always zero in V2"},
-            }},
-        }},
-        RPCExamples{
-            HelpExampleCli("getecxconsensuscontext", "") +
-            HelpExampleRpc("getecxconsensuscontext", "")},
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    if (!drivechain::haskell::ExchangeAvailable(drivechain::haskell::Availability::RPC,
-            [](uint32_t) { return Params().GetConsensus().elements_mode; })) {
-        throw JSONRPCError(
-            RPC_MISC_ERROR,
-            "ECX consensus context is unavailable outside an Elements-mode chain");
-    }
-    ChainstateManager& chainman = EnsureAnyChainman(request.context);
-    LOCK(cs_main);
-    const CBlockIndex* tip{chainman.ActiveChain().Tip()};
-    std::string context_error;
-    ecx::ExchangeConsensusSnapshot exchange;
-    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::REQUIRED_PAIR_ERRORS,
-        [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
-        switch (step) {
-        case 1: return tip != nullptr;
-        case 2: throw JSONRPCError(RPC_MISC_ERROR, "active sidechain tip is unavailable");
-        case 3: return ecx::GetExchangeConsensusSnapshot(
-            chainman.ActiveChainstate().CoinsTip(), tip, exchange, context_error);
-        case 4: throw JSONRPCError(RPC_MISC_ERROR, context_error);
-        default: throw std::logic_error("invalid ECX context admission action");
-        }
-    });
-    drivechain::BmmParentContext bmm;
-    bool bmm_authenticated{true};
-    drivechain::BmmL1State bmm_state;
-    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::PARENT_REPORT,
-        [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
-        switch (step) {
-        case 1: return Params().GetConsensus().drivechain_slot.has_value();
-        // Report authenticated P, not its M7 inclusion Q or the mempool parent.
-        case 2: return GetPriorActiveBmmParentCheckpoint(tip, Params().GetConsensus()).has_value();
-        case 3: throw JSONRPCError(
-                RPC_MISC_ERROR,
-                "active native ECX tip has no authenticated parent checkpoint");
-        case 4: {
-        const DrivechainAnchor& anchor{*tip->m_drivechain_anchor};
-        bmm.block_hash = anchor.parent_block_hash;
-        bmm.height = anchor.parent_height;
-        bmm.median_time_past = anchor.parent_median_time_past;
-        return 1;
-        }
-        case 5: return drivechain::GetEffectiveBmmState(chainman.ActiveChainstate().CoinsTip(),tip,bmm_state,context_error);
-        case 6: return drivechain::GetBmmParentContext(bmm_state,bmm,context_error);
-        case 7: throw JSONRPCError(RPC_MISC_ERROR,context_error);
-        case 8: return Params().NetworkIDString() == "elementsregtest";
-        case 9: return tip->ecxParentHeight;
-        case 10: throw JSONRPCError(
-                RPC_MISC_ERROR,
-                "active ECX regtest tip has no synthetic parent height");
-        case 11:
-        bmm.block_hash.SetNull();
-        bmm.height = tip->ecxParentHeight;
-        bmm.median_time_past = tip->GetMedianTimePast();
-        bmm_authenticated = false;
-        return 1;
-        case 12: return tip->ecxParentHeight;
-        case 13: return tip->ecxParentHeight == bmm.height;
-        case 14: throw JSONRPCError(
-            RPC_MISC_ERROR,
-            "active ECX header approval height disagrees with BMM chainstate");
-        default: throw std::logic_error("invalid parent report action");
-        }
-    });
-
-    const auto inbox_json = [](const uint256& root, uint64_t count, uint64_t cursor) {
-        UniValue inbox(UniValue::VOBJ);
-        inbox.pushKV("headroot",root.GetHex());
-        inbox.pushKV("entrycount",count);
-        inbox.pushKV("nextindex",count);
-        inbox.pushKV("processedcursor",cursor);
-        return inbox;
-    };
-    UniValue parent(UniValue::VOBJ);
-    parent.pushKV("authenticated", bmm_authenticated);
-    parent.pushKV("parentheight", bmm.height);
-    parent.pushKV("parentmtp", bmm.median_time_past);
-    parent.pushKV("parentblockhash", bmm.block_hash.GetHex());
-
-    UniValue result(UniValue::VOBJ);
-    result.pushKV("sidechainheight", static_cast<uint64_t>(tip->nHeight));
-    result.pushKV("sidechainblockhash", tip->GetBlockHash().GetHex());
-    result.pushKV("exchangestateroot", exchange.exchange_state_root.GetHex());
-    result.pushKV("forcedinbox", inbox_json(exchange.forced_inbox_root,exchange.forced_entry_count,exchange.forced_processed_cursor));
-    result.pushKV("depositinbox", inbox_json(exchange.deposit_inbox_root,exchange.deposit_entry_count,exchange.deposit_processed_cursor));
-    result.pushKV("bmm", parent);
-    result.pushKV("sourceparentheight", static_cast<uint64_t>(tip->ecxParentHeight));
-    result.pushKV(
-        "sourcebacklogoldestparentheight",
-        exchange.source_backlog_oldest_parent_height);
-    const ecx::ExchangeConsensus& frozen{ecx::LayerTwoLabsExchangeConsensus()};
-    if (frozen.custody_successor.activation_enabled) {
-        if (!tip->ecxCustodyProjection || tip->ecxBondV2Capital ||
-            !ecx::CheckCustodyProjectionIdentity(*tip->ecxCustodyProjection,exchange.exchange_state_root,frozen))
-            throw JSONRPCError(RPC_MISC_ERROR,"exact custody tip has no verified profile3 projection");
-        const auto& custody=*tip->ecxCustodyProjection;
-        const auto bytes=[](const uint256& hash) {
-            UniValue array(UniValue::VARR);
-            for (const auto byte : hash) array.push_back(static_cast<unsigned int>(byte));
-            return array;
-        };
-        UniValue child(UniValue::VOBJ);
-        child.pushKV("version",2);
-        child.pushKV("state_root",bytes(custody.custody_history_root));
-        child.pushKV("configuration_digest",bytes(custody.ecx_configuration));
-        child.pushKV("policy_digest",bytes(custody.clearing_policy));
-        UniValue wide(UniValue::VOBJ);
-        wide.pushKV("canonicalstate",HexStr(tip->swapForcedState));
-        ecx::BigEndianUint128 count,cursor;
-        std::copy_n(tip->swapForcedState.begin()+65,16,count.bytes.begin());
-        std::copy_n(tip->swapForcedState.begin()+113,16,cursor.bytes.begin());
-        wide.pushKV("entrycount",drivechain::haskell::WideDecimal(count.bytes));wide.pushKV("processedcursor",drivechain::haskell::WideDecimal(cursor.bytes));
-        wide.pushKV("oldestpendingparentheight",tip->sourceBacklogOldestParentHeight);
-        result.pushKV("forcedinboxv3",std::move(wide));
-        result.pushKV("bridgeversion",3);
-        result.pushKV("bridgestateroot",HexStr(custody.custody_history_root));
-        result.pushKV("profitlockinsolvent",custody.profit_lock_insolvent!=0);
-        result.pushKV("custodyfutures",child);
-    }
-    static_assert(ecx::BOND_V2_CAPITAL_SNAPSHOT_VERSION == 4);
-    if (drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CAPITAL_REPORT,
-        [&](uint32_t step) -> uint32_t {
-        switch (step) {
-        case 1: return frozen.bond_v2.activation_enabled;
-        case 2: return tip->ecxBondV2Capital.has_value();
-        case 3: throw JSONRPCError(
-                RPC_MISC_ERROR,
-                "active ECX V2 tip has no fully verified capital projection");
-        default: break;
-        }
-        const ecx::BondV2CapitalSnapshot& capital{*tip->ecxBondV2Capital};
-        switch (step) {
-            case 4: return capital.version;
-            case 5: return ecx::CheckCapitalProjectionIdentity(capital,exchange.exchange_state_root,frozen);
-            case 6: return capital.bond_inventory_covenant_hash == frozen.bond_v2.inventory_covenant_script_sha256;
-            case 7: return capital.capital_mode;
-            case 8: return capital.oracle_mode;
-            case 9: return capital.operationally_safe;
-            case 10: return capital.legacy_fee_pool == std::array<unsigned char,16>{};
-            case 11: throw JSONRPCError(
-                RPC_MISC_ERROR,
-                "active ECX V2 capital projection is not root/frozen-identity bound");
-            default: throw std::logic_error("invalid capital report action");
-            }
-        })) {
-        const ecx::BondV2CapitalSnapshot& capital{*tip->ecxBondV2Capital};
-        if (capital.proof_profile == 2) {
-            result.pushKV("bridgeversion", 2);
-            result.pushKV("bridgestateroot", HexStr(capital.bridge_state_root));
-            result.pushKV("profitlockinsolvent", capital.profit_lock_insolvent != 0);
-        }
-        UniValue capital_json(UniValue::VOBJ);
-        capital_json.pushKV("version", capital.version);
-        capital_json.pushKV(
-            "proofprofile", capital.proof_profile == 0 ? "finite-v18" :
-                capital.proof_profile == 1 ? "incremental-successor" : "swap-successor-v24");
-        capital_json.pushKV("exchangestateroot", capital.exchange_state_root.GetHex());
-        capital_json.pushKV("configurationhash", capital.configuration_hash.GetHex());
-        capital_json.pushKV(
-            "bondactionconfigurationhash", frozen.bond_v2.configuration_hash.GetHex());
-        capital_json.pushKV("bondassetid", capital.bond_asset_id.GetHex());
-        capital_json.pushKV(
-            "bonddeploymentcommitment",
-            capital.bond_deployment_commitment.GetHex());
-        capital_json.pushKV("transitionprogramid", capital.transition_program_id.GetHex());
-        capital_json.pushKV("transitioncmr", capital.transition_cmr.GetHex());
-        capital_json.pushKV("covenantstatehash", capital.covenant_state_hash.GetHex());
-        capital_json.pushKV("bondstateroot", capital.bond_state_root.GetHex());
-        capital_json.pushKV("fundingstateroot", capital.funding_state_root.GetHex());
-        capital_json.pushKV(
-            "bondinventorycovenanthash", capital.bond_inventory_covenant_hash.GetHex());
-        capital_json.pushKV("insurancereservequoteunits", EcxWideNumberToJSON(capital.insurance_reserve));
-        capital_json.pushKV("issuedbondunits", capital.issued_share_atoms);
-        capital_json.pushKV("outstandingbondunits", capital.outstanding_share_atoms);
-        capital_json.pushKV("inventorybondunits", capital.inventory_share_atoms);
-        capital_json.pushKV("navquoteunitsperbond", EcxWideNumberToJSON(capital.nav_per_whole_share));
-        capital_json.pushKV("deficitquoteunits", EcxWideNumberToJSON(capital.full_bound_deficit));
-        capital_json.pushKV("targetreservequoteunits", EcxWideNumberToJSON(capital.target_reserve));
-        capital_json.pushKV("coveragebps", EcxWideNumberToJSON(capital.coverage_bps));
-        capital_json.pushKV("controlledquoteunits", EcxWideNumberToJSON(capital.controlled_usdd_atoms));
-        capital_json.pushKV("mode", drivechain::ECX_CAPITAL_MODES.at(capital.capital_mode));
-        capital_json.pushKV("minimumauthenticatedprice", capital.minimum_authenticated_price);
-        capital_json.pushKV("maximumauthenticatedprice", capital.maximum_authenticated_price);
-        capital_json.pushKV("fundingepoch", capital.funding_epoch);
-        capital_json.pushKV("fundingrateppm", capital.funding_rate_ppm);
-        capital_json.pushKV(
-            "globalfundingindexnumerator", EcxWideNumberToJSON(capital.global_funding_index_numerator,true));
-        capital_json.pushKV("redemptionqueueroot", capital.redemption_queue_root.GetHex());
-        capital_json.pushKV("redemptionhead", EcxWideNumberToJSON(capital.redemption_head.bytes));
-        capital_json.pushKV("redemptiontail", EcxWideNumberToJSON(capital.redemption_tail.bytes));
-        capital_json.pushKV(
-            "queuedredemptionbondunits",
-            capital.queued_redemption_share_atoms);
-        UniValue oracle_json(UniValue::VOBJ);
-        oracle_json.pushKV("certificatehash", capital.oracle_certificate_hash.GetHex());
-        oracle_json.pushKV(
-            "validthroughparentmtp", capital.oracle_valid_through_parent_mtp);
-        oracle_json.pushKV("mode", drivechain::ECX_ORACLE_MODES.at(capital.oracle_mode));
-        capital_json.pushKV("oracle", oracle_json);
-        capital_json.pushKV(
-            "encryptedavailabilityroot", capital.encrypted_availability_root.GetHex());
-        UniValue bond_inbox_json(UniValue::VOBJ);
-        bond_inbox_json.pushKV("headroot", capital.bond_inbox_head_root.GetHex());
-        bond_inbox_json.pushKV("entrycount", EcxWideNumberToJSON(capital.bond_inbox_entry_count.bytes));
-        bond_inbox_json.pushKV("processedroot", capital.bond_inbox_processed_root.GetHex());
-        bond_inbox_json.pushKV(
-            "processedcursor", EcxWideNumberToJSON(capital.bond_inbox_processed_cursor.bytes));
-        bond_inbox_json.pushKV("outcomeroot", capital.bond_inbox_outcome_root.GetHex());
-        bond_inbox_json.pushKV(
-            "outcomecount", EcxWideNumberToJSON(capital.bond_inbox_outcome_count.bytes));
-        bond_inbox_json.pushKV(
-            "nodeverifiedsourceheadroot", capital.node_bond_inbox_head_root.GetHex());
-        bond_inbox_json.pushKV(
-            "nodeverifiedsourceentrycount", EcxWideNumberToJSON(capital.node_bond_inbox_entry_count.bytes));
-        capital_json.pushKV("bondinbox", bond_inbox_json);
-        UniValue execution_json(UniValue::VOBJ);
-        execution_json.pushKV(
-            "receiptbatchroot", capital.matcher_execution_receipt_batch_root.GetHex());
-        execution_json.pushKV(
-            "previoussequence", EcxWideNumberToJSON(capital.previous_matcher_execution_sequence.bytes));
-        execution_json.pushKV("sequence", EcxWideNumberToJSON(capital.matcher_execution_sequence.bytes));
-        capital_json.pushKV("matcherexecution", execution_json);
-        capital_json.pushKV(
-            "lasttransitionsidechainheight", capital.last_transition_sidechain_height);
-        capital_json.pushKV("operationallysafe", capital.operationally_safe == 1);
-        capital_json.pushKV("legacyfeepoolquoteunits", EcxWideNumberToJSON(capital.legacy_fee_pool));
-        result.pushKV("capital", capital_json);
-    }
-    return result;
-},
-    };
-}
-
-
-static RPCHelpMan getecxbondinboxentries()
-{
-    return RPCHelpMan{"getecxbondinboxentries",
-        "Reconstruct a bounded range of exact node-verified bond-inbox source "
-        "entries from active-chain archival blocks. The returned finite "
-        "700-byte or incremental-successor 708-byte records and "
-        "witness-bearing source transactions are derived by the "
-        "same parser used by consensus; producer-supplied projections are "
-        "never accepted. The call fails if a block was pruned or the active "
-        "chain changes while it is being read.\n",
-        {
-            {"start_height", RPCArg::Type::NUM, RPCArg::Optional::NO,
-                "First active sidechain height to scan (at or after V2 activation)"},
-            {"block_count", RPCArg::Type::NUM, RPCArg::Default{drivechain::BOND_EXPORT_DEFAULT_BLOCKS},
-                "Number of active blocks to scan, 1..64; output stops before "
-                "a block that would exceed eight returned entries"},
-        },
-        RPCResult{RPCResult::Type::OBJ, "", "", {
-            {RPCResult::Type::NUM, "schema_version", "Exact export schema, currently 4"},
-            {RPCResult::Type::STR_HEX, "configurationhash", "Frozen V18 configuration"},
-            {RPCResult::Type::NUM, "activationheight", "First height accepted by this frozen source lane"},
-            {RPCResult::Type::STR_HEX, "capturedtiphash", "Active tip used for this reconstruction"},
-            {RPCResult::Type::NUM, "capturedtipheight", "Captured active-tip height"},
-            {RPCResult::Type::NUM, "startheight", "First reconstructed block"},
-            {RPCResult::Type::NUM, "endheight", "Last reconstructed block, inclusive"},
-            {RPCResult::Type::NUM, "nextheight", "Next block for a bounded continuation"},
-            {RPCResult::Type::BOOL, "truncated", "Whether another block remains in the requested range"},
-            {RPCResult::Type::STR_HEX, "endingheadroot", "Reconstructed node source head"},
-            {RPCResult::Type::NUM, "endingentrycount", "Reconstructed node source count"},
-            {RPCResult::Type::ARR, "entries", "Exact source entries", {
-                {RPCResult::Type::OBJ, "", "", {
-                    {RPCResult::Type::NUM, "entryindex", "Canonical append index"},
-                    {RPCResult::Type::NUM, "sidechainheight", "Containing active block height"},
-                    {RPCResult::Type::NUM, "observedparentheight", "Authenticated observed parent height"},
-                    {RPCResult::Type::NUM, "processdeadlineparentheight", "Exact ExpiredUnavailable boundary, observed parent height plus six"},
-                    {RPCResult::Type::NUM, "refundnotbeforeparentheight", "Signed enqueue refund boundary, or zero for non-enqueue markers"},
-                    {RPCResult::Type::NUM, "markerkind", "Canonical marker kind, 0..3"},
-                    {RPCResult::Type::STR_HEX, "actionid", "Authenticated marker action identifier"},
-                    {RPCResult::Type::NUM, "transactionindex", "Transaction index in the block"},
-                    {RPCResult::Type::NUM, "markervout", "Exact marker output index"},
-                    {RPCResult::Type::STR_HEX, "txid", "Source txid in display order"},
-                    {RPCResult::Type::STR_HEX, "wtxid", "Source wtxid in display order"},
-                    {RPCResult::Type::STR_HEX, "canonicalentryhex", "Exact canonical entry: 700 bytes for finite-v18 or 708 bytes for incremental-successor"},
-                    {RPCResult::Type::STR_HEX, "sourcetransactionhex", "Exact witness-bearing transaction serialization"},
-                }},
-            }},
-        }},
-        RPCExamples{
-            HelpExampleCli("getecxbondinboxentries", "100 1") +
-            HelpExampleRpc("getecxbondinboxentries", "100, 1")},
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    ChainstateManager& chainman = EnsureAnyChainman(request.context);
-    const ecx::ExchangeConsensus& frozen{ecx::LayerTwoLabsExchangeConsensus()};
-    if (!drivechain::haskell::ParentReplayAll<3>({
-        [&] { return Params().GetConsensus().elements_mode; },
-        [&] { return frozen.bond_v2.activation_enabled; },
-        [&] { return frozen.bond_v2.identities_frozen; },
-    })) {
-        throw JSONRPCError(
-            RPC_MISC_ERROR,
-            "frozen ECX bond V2 source export is unavailable");
-    }
-    const int start_height{request.params[0].getInt<int>()};
-    const int block_count{
-        request.params[1].isNull() ? drivechain::BOND_EXPORT_DEFAULT_BLOCKS : request.params[1].getInt<int>()};
-    int32_t requested_end{0};
-    if (drivechain::haskell::ExchangeExportRange(start_height, block_count,
-            frozen.activation_height, std::nullopt, requested_end)) {
-        throw JSONRPCError(
-            RPC_INVALID_PARAMETER,
-            "start_height must be at/after V2 activation and block_count must be 1..64");
-    }
-
-    uint256 captured_tip_hash;
-    int captured_tip_height{0};
-    ecx::BondV2CapitalSnapshot working;
-    std::vector<std::pair<const CBlockIndex*, ecx::BondV2CapitalSnapshot>> blocks;
-    const auto has_projection = [](const CBlockIndex* index) {
-        return drivechain::haskell::ParentReplayAll<2>({
-            [&] { return index != nullptr; },
-            [&] { return index->ecxBondV2Capital.has_value(); },
-        });
-    };
-    {
-        LOCK(cs_main);
-        const CBlockIndex* tip{chainman.ActiveChain().Tip()};
-        if (drivechain::haskell::ExchangeExportRange(start_height, block_count,
-                frozen.activation_height, tip ? tip->nHeight : -1, requested_end)) {
-            throw JSONRPCError(
-                RPC_INVALID_PARAMETER, "start_height is beyond the active tip");
-        }
-        captured_tip_hash = tip->GetBlockHash();
-        captured_tip_height = tip->nHeight;
-        const CBlockIndex* previous{nullptr};
-        drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EXPORT_INITIALIZE,
-            [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
-            switch (step) {
-            case 1: return start_height == frozen.activation_height;
-            case 2:
-                working.bond_inbox_head_root = ecx::BondInboxGenesisHead(frozen);
-                working.node_bond_inbox_head_root = working.bond_inbox_head_root;
-                return 1;
-            case 3:
-                previous = chainman.ActiveChain()[start_height - 1];
-                return has_projection(previous);
-            case 4: throw JSONRPCError(
-                    RPC_MISC_ERROR,
-                    "predecessor lacks a verified bond-inbox projection");
-            case 5: working = *previous->ecxBondV2Capital; return 1;
-            default: throw std::logic_error("invalid bond-inbox initialization action");
-            }
-        });
-        const std::function<bool(int64_t)> capture = [&](int64_t height) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
-            AssertLockHeld(cs_main);
-            const CBlockIndex* index{chainman.ActiveChain()[static_cast<int>(height)]};
-            if (!has_projection(index)) {
-                throw JSONRPCError(
-                    RPC_MISC_ERROR,
-                    strprintf("height %d lacks a verified bond-inbox projection", height));
-            }
-            blocks.emplace_back(index, *index->ecxBondV2Capital);
-            return true;
-        };
-        drivechain::haskell::ParentReplayEach(
-            std::views::iota(int64_t{start_height}, int64_t{requested_end} + 1), capture);
-    }
-
-    std::vector<ecx::BondInboxSourceExport> exported;
-    int end_height{start_height - 1};
-    const bool truncated{!drivechain::haskell::ParentReplayEach(blocks, [&](const auto& entry) {
-        const auto& [index, expected] = entry;
-        CBlock block;
-        if (!chainman.m_blockman.ReadBlock(block, *index)) {
-            throw JSONRPCError(
-                RPC_MISC_ERROR,
-                strprintf("archival block unavailable at height %d", index->nHeight));
-        }
-        ecx::BondV2CapitalSnapshot candidate{working};
-        std::vector<ecx::BondInboxSourceExport> block_entries;
-        std::string error;
-        drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EXPORT_RECONSTRUCT,
-            [&](uint32_t step) -> uint32_t {
-            switch (step) {
-            case 1: return expected.proof_profile != 0;
-            case 2: return working.proof_profile != 0;
-            case 3:
-                candidate.proof_profile = expected.proof_profile;
-                candidate.bond_inbox_head_root = ecx::IncrementalSuccessorBondInboxGenesisHead(frozen);
-                candidate.node_bond_inbox_head_root = candidate.bond_inbox_head_root;
-                candidate.bond_inbox_entry_count = 0;
-                candidate.node_bond_inbox_entry_count = 0;
-                return true;
-            case 4: case 5: {
-                const auto append_sources = step == 5
-                    ? ecx::AppendIncrementalSuccessorBondInboxSourcesForBlock : ecx::AppendBondInboxSourcesForBlock;
-                return append_sources(block, static_cast<uint64_t>(index->nHeight),
-                    static_cast<uint64_t>(index->ecxParentHeight), candidate, error, frozen, &block_entries);
-            }
-            case 6: return candidate.node_bond_inbox_head_root == expected.node_bond_inbox_head_root;
-            case 7: return candidate.node_bond_inbox_entry_count == expected.node_bond_inbox_entry_count;
-            case 8:
-                throw JSONRPCError(RPC_MISC_ERROR, "archival source reconstruction disagrees with the verified block index");
-            case 9: throw JSONRPCError(RPC_MISC_ERROR, error);
-            default: throw std::logic_error("invalid bond-inbox reconstruction action");
-            }
-        });
-        if (drivechain::haskell::ParentReplayAll<2>({
-            [&] { return !exported.empty(); },
-            [&] { return drivechain::haskell::ParentReplayRecord(
-                drivechain::haskell::ReplayRecordKind::LANE_EXCEEDED, drivechain::BOND_EXPORT_ENTRY_LIMIT, 0,
-                exported.size(), block_entries.size()); },
-        })) {
-            return false;
-        }
-        exported.insert(
-            exported.end(),
-            std::make_move_iterator(block_entries.begin()),
-            std::make_move_iterator(block_entries.end()));
-        working = expected;
-        end_height = index->nHeight;
-        return true;
-    })};
-
-    {
-        LOCK(cs_main);
-        const CBlockIndex* tip{chainman.ActiveChain().Tip()};
-        if (!drivechain::haskell::ParentReplayAll<3>({
-            [&] { return tip != nullptr; },
-            [&] { return tip->GetBlockHash() == captured_tip_hash; },
-            [&] { return tip->nHeight == captured_tip_height; },
-        })) {
-            throw JSONRPCError(
-                RPC_MISC_ERROR,
-                "active chain changed while reconstructing bond-inbox entries");
-        }
-        const std::function<bool(const std::pair<const CBlockIndex*, ecx::BondV2CapitalSnapshot>&)> check_range =
-            [&](const auto& entry) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
-            AssertLockHeld(cs_main);
-            const auto* index = entry.first;
-            return bool(drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EXPORT_RECHECK,
-                [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
-                switch (step) {
-                case 1: return index->nHeight <= end_height;
-                case 2: return chainman.ActiveChain()[index->nHeight] == index;
-                case 3: throw JSONRPCError(
-                    RPC_MISC_ERROR,
-                    "bond-inbox export range was reorganized during reconstruction");
-                default: throw std::logic_error("invalid bond-inbox recheck action");
-                }
-            }));
-        };
-        drivechain::haskell::ParentReplayEach(blocks, check_range);
-    }
-
-    UniValue entries(UniValue::VARR);
-    for (const auto& entry : exported) {
-        UniValue object(UniValue::VOBJ);
-        object.pushKV("proofprofile", static_cast<uint64_t>(entry.proof_profile));
-        object.pushKV("entryindex", EcxWideNumberToJSON(entry.entry_index_u128.bytes));
-        object.pushKV("sidechainheight", entry.sidechain_height);
-        object.pushKV("observedparentheight", entry.observed_parent_height);
-        object.pushKV(
-            "processdeadlineparentheight",
-            entry.process_deadline_parent_height);
-        object.pushKV(
-            "refundnotbeforeparentheight",
-            entry.refund_not_before_parent_height);
-        object.pushKV("markerkind", static_cast<uint64_t>(entry.marker_kind));
-        object.pushKV("actionid", entry.action_id.GetHex());
-        object.pushKV(
-            "transactionindex",
-            static_cast<uint64_t>(entry.source_transaction_index));
-        object.pushKV("markervout", static_cast<uint64_t>(entry.marker_vout));
-        object.pushKV("txid", entry.source_txid.GetHex());
-        object.pushKV("wtxid", entry.source_wtxid.GetHex());
-        object.pushKV("canonicalentryhex", HexStr(entry.canonical_entry));
-        object.pushKV("sourcetransactionhex", HexStr(entry.source_transaction));
-        entries.push_back(object);
-    }
-    UniValue result(UniValue::VOBJ);
-    result.pushKV("schema_version", 4);
-    result.pushKV("configurationhash", frozen.bond_v2.configuration_hash.GetHex());
-    result.pushKV("activationheight", frozen.activation_height);
-    result.pushKV("capturedtiphash", captured_tip_hash.GetHex());
-    result.pushKV("capturedtipheight", captured_tip_height);
-    result.pushKV("startheight", start_height);
-    result.pushKV("endheight", end_height);
-    result.pushKV("nextheight", int64_t{end_height} + 1);
-    result.pushKV("truncated", truncated);
-    result.pushKV("endingheadroot", working.node_bond_inbox_head_root.GetHex());
-    result.pushKV(
-        "endingentrycount", EcxWideNumberToJSON(working.node_bond_inbox_entry_count.bytes));
-    result.pushKV("entries", entries);
-    return result;
-},
-    };
-}
-
 static RPCHelpMan verifychain()
 {
     return RPCHelpMan{"verifychain",
@@ -2377,7 +1727,7 @@ static RPCHelpMan getalphacheckpointevidence()
         "or authenticate external configuration. Limited to 10,000 headers, 100,000 coins and 64 MiB raw evidence.\n",
         {{"expectedblock", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Required exact active-chain tip"}},
         RPCResult{RPCResult::Type::OBJ, "", "Versioned raw checkpoint evidence",
-            {{RPCResult::Type::ELISION, "", "Exact block, coin, claim, withdrawal and optional capital/anchor records"}}},
+            {{RPCResult::Type::ELISION, "", "Exact block, coin, claim and optional parent-anchor records"}}},
         RPCExamples{HelpExampleCli("getalphacheckpointevidence", "\"blockhash\"")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue {
     NodeContext& node = EnsureAnyNodeContext(request.context);
@@ -2397,10 +1747,6 @@ static RPCHelpMan getalphacheckpointevidence()
             throw JSONRPCError(RPC_MISC_ERROR, message);
     };
     check_limit(tip->nHeight, 1, drivechain::CHECKPOINT_HEADER_LIMIT, "Checkpoint header limit exceeded");
-    if (!ParentReplayAll<2>({[&] { return tip->m_usdd_withdrawal_accumulator.has_value(); },
-        [&] { return tip->m_usdd_withdrawal_accumulator->IsSane(); }})) {
-        throw JSONRPCError(RPC_MISC_ERROR, "Checkpoint withdrawal state unavailable or invalid");
-    }
     auto sources = node::PrepareChildCheckpointSources(chainman);
     auto& cursor = sources.coins;
     size_t raw_bytes{0};
@@ -2476,14 +1822,6 @@ static RPCHelpMan getalphacheckpointevidence()
     result.pushKV("coins", std::move(coins));
     result.pushKV("spent_claim_keys", std::move(spent));
     result.pushKV("coin_source_blocks", std::move(blocks));
-    const auto& accumulator = sources.withdrawals;
-    UniValue withdrawals(UniValue::VOBJ), frontier(UniValue::VARR);
-    withdrawals.pushKV("count", accumulator.count);
-    withdrawals.pushKV("root", HexStr(accumulator.root));
-    for (const auto& entry : accumulator.frontier) frontier.push_back(HexStr(entry));
-    withdrawals.pushKV("frontier", std::move(frontier));
-    result.pushKV("withdrawals", std::move(withdrawals));
-    result.pushKV("capital_snapshot", tip->ecxBondV2Capital ? UniValue(encode(*tip->ecxBondV2Capital)) : UniValue());
     result.pushKV("drivechain_anchor", tip->m_drivechain_anchor ? UniValue(encode(*tip->m_drivechain_anchor)) : UniValue());
     return result;
         }};
@@ -4621,8 +3959,7 @@ static RPCHelpMan getdrivechainpegevents()
     {
         LOCK(cs_main);
         const CBlockIndex* tip = chainman.ActiveChain().Tip();
-        if (!drivechain::haskell::ExchangeAvailable(drivechain::haskell::Availability::RPC,
-                [&](uint32_t) { return tip != nullptr; })) throw JSONRPCError(RPC_MISC_ERROR, "Sidechain tip is unavailable");
+        if (!tip) throw JSONRPCError(RPC_MISC_ERROR, "Sidechain tip is unavailable");
         tip_height = tip->nHeight;
         tip_hash = tip->GetBlockHash();
 
@@ -4831,14 +4168,6 @@ int CheckWithdrawalAdmission(WithdrawalAdmission stage, uint8_t flags, int depth
     WriteLE32(input.data()+6,required);
     CheckWithdrawalPolicy(drivechain::haskell::WithdrawalOp::RPC_ADMISSION,input);
     return depth;
-}
-
-void CheckWithdrawalProofBounds(uint8_t stage, uint64_t index, uint64_t count = 0)
-{
-    std::array<unsigned char,17> input{stage};
-    WriteLE64(input.data()+1,index);
-    WriteLE64(input.data()+9,count);
-    CheckWithdrawalPolicy(drivechain::haskell::WithdrawalOp::PROOF_BOUNDS,input);
 }
 
 int RecheckWithdrawalAnchor(ChainstateManager& chainman, const CBlockIndex& index,
@@ -5206,216 +4535,6 @@ static RPCHelpMan verifydrivechainwithdrawalbundle()
     };
 }
 
-static const CBlockIndex* ReadWithdrawalAccumulator(ChainstateManager& chainman, const UniValue& hash,
-    usdd::WithdrawalAccumulatorState& accumulator) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
-{
-    const CChain& active = chainman.ActiveChain();
-    const auto* index = hash.isNull() ? active.Tip() : chainman.m_blockman.LookupBlockIndex(ParseHashV(hash, "blockhash"));
-    AssertLockHeld(cs_main);
-    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::REQUIRED_PAIR_ERRORS,
-        [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
-        switch (step) {
-        case 1: return drivechain::haskell::ParentReplayAll<2>({
-            [&] { return index != nullptr; },
-            [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) { return active.Contains(index); }});
-        case 2: throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,"Block is not in the active chain");
-        case 3: return index->m_usdd_withdrawal_accumulator.has_value();
-        case 4: throw JSONRPCError(RPC_INTERNAL_ERROR,"Withdrawal accumulator unavailable; reindex required");
-        default: throw std::logic_error("invalid withdrawal accumulator admission action");
-        }
-    });
-    accumulator = *index->m_usdd_withdrawal_accumulator;
-    return index;
-}
-
-static RPCHelpMan getusddwithdrawalaccumulator()
-{
-    return RPCHelpMan{"getusddwithdrawalaccumulator",
-                "Returns the deterministic canonical Ethereum-withdrawal accumulator at an active-chain block.\n"
-                "This generic index binds each leaf's actual asset and vault but is not, by itself, an authorizing\n"
-                "USDD root. The immutable external deployment manifest and vault must enforce their exact IDs.\n",
-                {
-                    {"blockhash", RPCArg::Type::STR_HEX, RPCArg::DefaultHint{"chain tip"}, "Optional active-chain block hash"},
-                },
-                RPCResult{
-                    RPCResult::Type::OBJ, "", "",
-                    {
-                        {RPCResult::Type::STR_HEX, "blockhash", "Block whose derived state is returned"},
-                        {RPCResult::Type::NUM, "height", "Block height"},
-                        {RPCResult::Type::NUM, "count", "Cumulative canonical withdrawal-leaf count"},
-                        {RPCResult::Type::STR_HEX, "root", "Depth-64 SHA-256 sparse-Merkle root"},
-                        {RPCResult::Type::BOOL, "authorizing", "Always false: the node cannot authenticate an external USDD deployment"},
-                        {RPCResult::Type::STR, "scope", "Exact scope of the generic accumulator"},
-                    }},
-                RPCExamples{
-                    HelpExampleCli("getusddwithdrawalaccumulator", "")
-                    + HelpExampleRpc("getusddwithdrawalaccumulator", "")
-                },
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    ChainstateManager& chainman = EnsureAnyChainman(request.context);
-    const CBlockIndex* blockindex{nullptr};
-    usdd::WithdrawalAccumulatorState accumulator;
-    {
-        LOCK(cs_main);
-        blockindex = ReadWithdrawalAccumulator(chainman, request.params[0], accumulator);
-    }
-
-    UniValue result(UniValue::VOBJ);
-    result.pushKV("blockhash", blockindex->GetBlockHash().GetHex());
-    result.pushKV("height", blockindex->nHeight);
-    result.pushKV("count", accumulator.count);
-    result.pushKV("root", HexStr(accumulator.root));
-    result.pushKV("authorizing", false);
-    result.pushKV("scope", "generic exact USDD-v1-shaped burns; leaf binds actual asset and vault");
-    return result;
-},
-    };
-}
-
-static RPCHelpMan getusddwithdrawalproof()
-{
-    return RPCHelpMan{"getusddwithdrawalproof",
-                "Reconstructs a canonical withdrawal inclusion proof from retained active-chain blocks.\n"
-                "Proof reconstruction requires unpruned blocks containing withdrawals, is single-flight,\n"
-                "and is limited to 10,000 leaves and a ten-second work budget per call.\n",
-                {
-                    {"index", RPCArg::Type::NUM, RPCArg::Optional::NO, "Zero-based cumulative claim index"},
-                    {"blockhash", RPCArg::Type::STR_HEX, RPCArg::DefaultHint{"chain tip"}, "Optional active-chain block hash"},
-                },
-                RPCResult{
-                    RPCResult::Type::OBJ, "", "Withdrawal claim and bottom-up 64-sibling branch",
-                    {
-                        {RPCResult::Type::NUM, "index", "Claim index"},
-                        {RPCResult::Type::STR_HEX, "root", "Accumulator root"},
-                        {RPCResult::Type::NUM, "count", "Accumulator leaf count"},
-                        {RPCResult::Type::STR_HEX, "leaf", "Canonical Solidity-compatible leaf"},
-                        {RPCResult::Type::STR_HEX, "burn_id", "Canonical burn identity"},
-                        {RPCResult::Type::STR_HEX, "txid", "Elements burn transaction ID in display order"},
-                        {RPCResult::Type::NUM, "vout", "Burn output index"},
-                        {RPCResult::Type::STR_HEX, "asset", "Explicit burned asset ID"},
-                        {RPCResult::Type::STR_HEX, "vault_id", "Vault ID from the burn payload"},
-                        {RPCResult::Type::STR_HEX, "recipient", "Fixed Ethereum recipient"},
-                        {RPCResult::Type::NUM, "amount_usdt_micro", "Six-decimal USDT amount"},
-                        {RPCResult::Type::ARR, "siblings", "64 sibling hashes, bottom-up",
-                            {{RPCResult::Type::STR_HEX, "hash", "Sibling hash"}}},
-                        {RPCResult::Type::BOOL, "authorizing", "Always false: the node cannot authenticate an external USDD deployment"},
-                    }},
-                RPCExamples{
-                    HelpExampleCli("getusddwithdrawalproof", "0")
-                    + HelpExampleRpc("getusddwithdrawalproof", "0")
-                },
-        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
-{
-    const int64_t requested_index = request.params[0].getInt<int64_t>();
-    CheckWithdrawalProofBounds(0, static_cast<uint64_t>(requested_index));
-    const uint64_t index = static_cast<uint64_t>(requested_index);
-    std::unique_lock<std::mutex> proof_lock(
-        g_usdd_withdrawal_proof_mutex, std::defer_lock);
-    if (!proof_lock.try_lock()) {
-        throw JSONRPCError(
-            RPC_MISC_ERROR, "A withdrawal-proof reconstruction is already running");
-    }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{drivechain::WITHDRAWAL_PROOF_SECONDS};
-    const auto interruption_point = [&] {
-        RpcInterruptionPoint();
-        if (std::chrono::steady_clock::now() >= deadline) {
-            throw JSONRPCError(
-                RPC_MISC_ERROR, "Withdrawal-proof reconstruction work budget exhausted");
-        }
-    };
-
-    ChainstateManager& chainman = EnsureAnyChainman(request.context);
-    const CBlockIndex* target{nullptr};
-    usdd::WithdrawalAccumulatorState accumulator;
-    std::vector<const CBlockIndex*> blocks_with_withdrawals;
-    {
-        LOCK(cs_main);
-        const CChain& active = chainman.ActiveChain();
-        target = ReadWithdrawalAccumulator(chainman, request.params[1], accumulator);
-        CheckWithdrawalProofBounds(1,index,accumulator.count);
-        uint64_t prior_count{0};
-        int height{1};
-        const CBlockIndex* cursor{nullptr};
-        const auto status = drivechain::haskell::ParentReplayStore(
-            drivechain::haskell::ReplayStoreFlow::RPC_WITHDRAWAL_HISTORY,
-            [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
-                switch (step) {
-                case 1: return height <= target->nHeight;
-                case 2:
-                    if (height % drivechain::WITHDRAWAL_PROOF_INTERRUPT_INTERVAL == 0) interruption_point();
-                    cursor = active[height];
-                    return 1;
-                case 3: return cursor->m_usdd_withdrawal_accumulator.has_value();
-                case 4: return cursor->m_usdd_withdrawal_accumulator->count >= prior_count;
-                case 5: return cursor->m_usdd_withdrawal_accumulator->count != prior_count;
-                case 6: blocks_with_withdrawals.push_back(cursor); return 1;
-                case 7: prior_count = cursor->m_usdd_withdrawal_accumulator->count; ++height; return 1;
-                default: throw std::logic_error("invalid withdrawal history scan action");
-                }
-            });
-        if (status == 1) throw JSONRPCError(RPC_INTERNAL_ERROR, "Discontinuous withdrawal accumulator; reindex required");
-        if (status == 2) throw JSONRPCError(RPC_INTERNAL_ERROR, "Nonmonotonic withdrawal accumulator; reindex required");
-    }
-
-    std::vector<usdd::EthereumWithdrawalClaim> claims;
-    claims.reserve(static_cast<size_t>(accumulator.count));
-    drivechain::haskell::ParentReplayEach(blocks_with_withdrawals, [&](const CBlockIndex* blockindex) {
-        interruption_point();
-        CBlock block;
-        if (!chainman.m_blockman.ReadBlock(block, *blockindex)) {
-            throw JSONRPCError(RPC_MISC_ERROR,
-                "A withdrawal-containing block is pruned or unreadable; use an archival node or indexer");
-        }
-        std::vector<usdd::EthereumWithdrawalClaim> appended;
-        std::string extraction_error;
-        if (!usdd::ExtractEthereumWithdrawals(
-                block, Params().GetConsensus().hashGenesisBlock,
-                claims.size(), appended, &extraction_error)) {
-            throw JSONRPCError(RPC_INTERNAL_ERROR, extraction_error);
-        }
-        claims.insert(claims.end(), appended.begin(), appended.end());
-        return true;
-    });
-    interruption_point();
-    usdd::WithdrawalInclusionProof proof;
-    usdd::WithdrawalHash reconstructed_root;
-    std::string proof_error;
-    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::RPC_WITHDRAWAL_PROOF,
-        [&](uint32_t step) -> uint32_t {
-        switch (step) {
-        case 1: return claims.size() == accumulator.count;
-        case 2: throw JSONRPCError(RPC_INTERNAL_ERROR, "Reconstructed withdrawal count disagrees with the persisted accumulator");
-        case 3: return usdd::BuildWithdrawalInclusionProof(claims, index, proof, reconstructed_root, &proof_error);
-        case 4: return reconstructed_root == accumulator.root;
-        case 5: return !proof_error.empty();
-        case 6: throw JSONRPCError(RPC_INTERNAL_ERROR, proof_error);
-        case 7: throw JSONRPCError(RPC_INTERNAL_ERROR, "Reconstructed withdrawal root mismatch");
-        default: throw std::logic_error("invalid withdrawal proof action");
-        }
-    });
-
-    UniValue siblings(UniValue::VARR);
-    for (const auto& sibling : proof.siblings) siblings.push_back(HexStr(sibling));
-    UniValue result(UniValue::VOBJ);
-    result.pushKV("index", index);
-    result.pushKV("root", HexStr(accumulator.root));
-    result.pushKV("count", accumulator.count);
-    result.pushKV("leaf", HexStr(proof.claim.leaf));
-    result.pushKV("burn_id", HexStr(proof.claim.burn_id));
-    result.pushKV("txid", HexStr(proof.claim.burn_txid_display));
-    result.pushKV("vout", static_cast<uint64_t>(proof.claim.burn_vout));
-    result.pushKV("asset", HexStr(proof.claim.asset_id));
-    result.pushKV("vault_id", HexStr(proof.claim.vault_id));
-    result.pushKV("recipient", HexStr(proof.claim.recipient));
-    result.pushKV("amount_usdt_micro", proof.claim.amount_usdt_micro);
-    result.pushKV("siblings", siblings);
-    result.pushKV("authorizing", false);
-    return result;
-},
-    };
-}
-
 // END ELEMENTS
 //
 
@@ -5445,16 +4564,11 @@ void RegisterBlockchainRPCCommands(CRPCTable &t)
         {"blockchain", &scanblocks},
         {"blockchain", &getdescriptoractivity},
         {"blockchain", &getblockfilter},
-        {"blockchain", &getecxstateutxoroot},
-        {"blockchain", &getecxconsensuscontext},
-        {"blockchain", &getecxbondinboxentries},
         {"blockchain", &getdrivechainpegevents},
         {"blockchain", &getdrivechaindepositdestination},
         {"blockchain", &getdrivechainwithdrawalbundle},
         {"blockchain", &verifydrivechainwithdrawalbundle},
         {"blockchain", &submitdrivechainwithdrawal},
-        {"blockchain", &getusddwithdrawalaccumulator},
-        {"blockchain", &getusddwithdrawalproof},
         {"blockchain", &getsidechaininfo}, // ELEMENTS
         {"blockchain", &dumptxoutset},
         {"blockchain", &loadtxoutset},

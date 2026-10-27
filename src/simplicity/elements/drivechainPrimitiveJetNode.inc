@@ -47,11 +47,3 @@
 , .targetIx = ty_pw256pw64pw64w256
 , .cost = 216 /* milli weight units */
 }
-,[VERIFY_SP1_COMPRESSED_SHA256] =
-{ .tag = JET
-, .jet = simplicity_verify_sp1_compressed_sha256
-, .cmr = {{0x595cfa3au, 0xdbc83e61u, 0x6918a6a5u, 0x1441ba84u, 0x7f19faf7u, 0xe77f3cb9u, 0x7d21314eu, 0x28928399u}}
-, .sourceIx = ty_w512
-, .targetIx = ty_b
-, .cost = 900007720 /* milli weight units */
-}

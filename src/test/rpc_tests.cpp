@@ -27,7 +27,6 @@
 #include <univalue.h>
 #include <util/time.h>
 #include <util/strencodings.h>
-#include <usdd_withdrawal_accumulator.h>
 #include <validation.h>
 
 #include <any>
@@ -132,46 +131,6 @@ BOOST_AUTO_TEST_CASE(drivechain_deposit_destination_rpc)
     BOOST_CHECK_THROW(CallRPC("getdrivechaindepositdestination invalid 1000"), std::runtime_error);
 }
 
-BOOST_AUTO_TEST_CASE(withdrawal_proof_error_precedence)
-{
-    for (unsigned flags = 0; flags < 16; ++flags) for (unsigned fault = 0; fault <= 7; ++fault) {
-        std::vector<unsigned> expected, actual;
-        const auto run = [&](bool haskell, std::vector<unsigned>& trace) -> std::string {
-            const auto action = [&](uint32_t step) -> uint32_t {
-                trace.push_back(step);
-                if (step == fault) throw std::runtime_error("adapter failure");
-                switch (step) {
-                case 1: return flags & 1 ? 1 : 0;
-                case 2: throw JSONRPCError(RPC_INTERNAL_ERROR, "count mismatch");
-                case 3: return flags & 2 ? 1 : 0;
-                case 4: return flags & 4 ? 1 : 0;
-                case 5: return flags & 8 ? 1 : 0;
-                case 6: throw JSONRPCError(RPC_INTERNAL_ERROR, "proof diagnostic");
-                case 7: throw JSONRPCError(RPC_INTERNAL_ERROR, "root mismatch");
-                default: throw std::logic_error("unexpected proof action");
-                }
-            };
-            try {
-                if (haskell) {
-                    BOOST_CHECK_EQUAL(drivechain::haskell::ParentReplayStore(
-                        drivechain::haskell::ReplayStoreFlow::RPC_WITHDRAWAL_PROOF,action),1U);
-                } else {
-                    if (!action(1)) action(2);
-                    if (!(action(3) && action(4))) action(action(5) ? 6 : 7);
-                }
-                return "success";
-            } catch (const UniValue& error) {
-                BOOST_CHECK_EQUAL(error["code"].getInt<int>(),RPC_INTERNAL_ERROR);
-                return error["message"].get_str();
-            } catch (const std::runtime_error& error) {
-                return error.what();
-            }
-        };
-        const auto previous = run(false,expected);
-        BOOST_CHECK_EQUAL(run(true,actual),previous);
-        BOOST_CHECK(actual == expected);
-    }
-}
 
 BOOST_AUTO_TEST_CASE(withdrawal_rpc_paid_gate)
 {
@@ -222,19 +181,19 @@ BOOST_AUTO_TEST_CASE(checkpoint_evidence_tip_and_state_admission)
     if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
     auto* tip=WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Tip());
     const auto tip_hash=tip->GetBlockHash();
-    auto saved=WITH_LOCK(cs_main, return std::exchange(tip->m_usdd_withdrawal_accumulator,{}));
-    const auto restore=[&](CBlockIndex* index) { LOCK(cs_main); index->m_usdd_withdrawal_accumulator=std::move(saved); };
-    const std::unique_ptr<CBlockIndex,decltype(restore)> restore_guard(tip,restore);
-    for (const auto& hash : {uint256{},uint256::ONE,tip_hash}) {
+    for (const auto& hash : {uint256{},uint256::ONE}) {
         request.params=UniValue(UniValue::VARR);
         request.params.push_back(hash.GetHex());
         BOOST_CHECK_EXCEPTION(tableRPC.execute(request),UniValue,[&](const UniValue& error) {
-            const bool matched=hash==tip_hash;
-            return error["code"].getInt<int>()==(matched ? RPC_MISC_ERROR : RPC_INVALID_PARAMETER) &&
-                error["message"].get_str()==(matched ? "Checkpoint withdrawal state unavailable or invalid" :
-                    "Checkpoint tip changed or is unavailable");
+            return error["code"].getInt<int>()==RPC_INVALID_PARAMETER &&
+                error["message"].get_str()=="Checkpoint tip changed or is unavailable";
         });
     }
+    request.params=UniValue(UniValue::VARR);
+    request.params.push_back(tip_hash.GetHex());
+    BOOST_REQUIRE(!tip->IsValid(BLOCK_VALID_SCRIPTS));
+    BOOST_CHECK_EXCEPTION(tableRPC.execute(request), UniValue, HasJSON(
+        "{\"code\":-1,\"message\":\"Child checkpoint requires a validated active chain\"}"));
 }
 
 BOOST_AUTO_TEST_CASE(checkpoint_evidence_resource_limits)
@@ -296,22 +255,6 @@ BOOST_AUTO_TEST_CASE(checkpoint_coin_validation_short_circuits)
     }
 }
 
-BOOST_AUTO_TEST_CASE(bond_inbox_export_rejects_non_elements_before_range_checks)
-{
-    BOOST_REQUIRE(!Params().GetConsensus().elements_mode);
-    if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
-    for (const auto& [start, count] : {std::pair{0,1}, std::pair{-1,65}}) {
-        JSONRPCRequest request;
-        request.context = &m_node;
-        request.strMethod = "getecxbondinboxentries";
-        request.params = UniValue(UniValue::VARR);
-        request.params.push_back(start);
-        request.params.push_back(count);
-        BOOST_CHECK_EXCEPTION(tableRPC.execute(request), UniValue, [](const auto& error) {
-            return error.find_value("message").get_str() == "frozen ECX bond V2 source export is unavailable";
-        });
-    }
-}
 
 BOOST_AUTO_TEST_CASE(peg_events_rejects_network_before_range_or_l1)
 {
@@ -403,49 +346,7 @@ BOOST_AUTO_TEST_CASE(peg_event_range_boundaries)
     }
 }
 
-BOOST_AUTO_TEST_CASE(bond_export_catalogue_and_entry_budget)
-{
-    static_assert(drivechain::BOND_EXPORT_DEFAULT_BLOCKS == 1);
-    static_assert(drivechain::BOND_EXPORT_BLOCK_LIMIT == 64);
-    static_assert(drivechain::BOND_EXPORT_ENTRY_LIMIT == 8);
-    for (uint64_t used : std::array<uint64_t,6>{0,1,7,8,9,UINT64_MAX})
-    for (uint64_t added : std::array<uint64_t,4>{0,1,8,UINT64_MAX}) {
-        bool compared{false};
-        const bool rejected = drivechain::haskell::ParentReplayAll<2>({[&] { return used != 0; }, [&] {
-            compared = true;
-            return drivechain::haskell::ParentReplayRecord(drivechain::haskell::ReplayRecordKind::LANE_EXCEEDED,
-                drivechain::BOND_EXPORT_ENTRY_LIMIT,0,used,added);
-        }});
-        BOOST_CHECK_EQUAL(rejected,used != 0 && (used > 8 || added > 8-used));
-        BOOST_CHECK_EQUAL(compared,used != 0);
-    }
-}
 
-BOOST_AUTO_TEST_CASE(ecx_network_guard_before_context_or_parameters)
-{
-    for (bool available : {false,true}) {
-        unsigned reads{0};
-        BOOST_CHECK_EQUAL(drivechain::haskell::ExchangeAvailable(drivechain::haskell::Availability::RPC,
-            [&](uint32_t step) { BOOST_CHECK_EQUAL(step,0U); ++reads; return available; }),available);
-        BOOST_CHECK_EQUAL(reads,1U);
-    }
-    BOOST_CHECK_EXCEPTION(drivechain::haskell::ExchangeAvailable(drivechain::haskell::Availability::RPC,
-        [](uint32_t) -> bool { throw std::runtime_error("availability read failed"); }),
-        std::runtime_error,[](const auto& error) { return std::string_view{error.what()} == "availability read failed"; });
-    BOOST_REQUIRE(!Params().GetConsensus().elements_mode);
-    if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
-    for (bool root : {false,true}) {
-        JSONRPCRequest request;
-        request.strMethod = root ? "getecxstateutxoroot" : "getecxconsensuscontext";
-        request.params = UniValue(UniValue::VARR);
-        if (root) { request.params.push_back("not-a-hash"); request.params.push_back(-1); }
-        BOOST_CHECK_EXCEPTION(tableRPC.execute(request),UniValue,[&](const UniValue& error) {
-            return error["code"].getInt<int>() == RPC_MISC_ERROR && error["message"].get_str() ==
-                (root ? "ECX state is unavailable outside an Elements-mode chain" :
-                        "ECX consensus context is unavailable outside an Elements-mode chain");
-        });
-    }
-}
 
 BOOST_AUTO_TEST_CASE(peg_event_optional_l1_order)
 {
@@ -467,42 +368,6 @@ BOOST_AUTO_TEST_CASE(peg_event_optional_l1_order)
     }
 }
 
-BOOST_AUTO_TEST_CASE(bond_export_reconstruction_order)
-{
-    for (uint32_t expected_profile : {0U,1U,2U,255U,UINT32_MAX})
-    for (uint32_t working_profile : {0U,1U,2U,255U,UINT32_MAX})
-    for (uint32_t flags=0; flags<8; ++flags) {
-        const auto bit = [&](unsigned index) { return (flags>>index)&1; };
-        const std::array<uint32_t,10> replies{0,expected_profile,working_profile,1,bit(0),bit(0),bit(1),bit(2),1,1};
-        std::vector<uint32_t> expected{1}, trace;
-        if (expected_profile==1) {
-            expected.push_back(2);
-            if (working_profile==0) expected.push_back(3);
-        }
-        expected.push_back(expected_profile==1 ? 5 : 4);
-        uint32_t failure=0;
-        if (!bit(0)) failure=9;
-        else {
-            expected.push_back(6);
-            if (!bit(1)) failure=8;
-            else { expected.push_back(7); if (!bit(2)) failure=8; }
-        }
-        if (failure) expected.push_back(failure);
-        const auto run = [&] {
-            return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EXPORT_RECONSTRUCT,
-                [&](uint32_t step) -> uint32_t {
-                    trace.push_back(step);
-                    if (step==8 || step==9) throw JSONRPCError(RPC_MISC_ERROR,std::to_string(step));
-                    return replies.at(step);
-                });
-        };
-        if (!failure) BOOST_CHECK_EQUAL(run(),1);
-        else BOOST_CHECK_EXCEPTION(run(),UniValue,[&](const UniValue& error) {
-            return error["code"].getInt<int>()==RPC_MISC_ERROR && error["message"].get_str()==std::to_string(failure);
-        });
-        BOOST_CHECK(trace==expected);
-    }
-}
 
 BOOST_AUTO_TEST_CASE(parent_report_selection_order)
 {
@@ -551,160 +416,10 @@ BOOST_AUTO_TEST_CASE(parent_report_selection_order)
     }
 }
 
-BOOST_AUTO_TEST_CASE(capital_report_admission_order)
-{
-    const std::array<const char*,3> capital_names{"Normal","ReduceOnly","Recovery"};
-    const std::array<const char*,4> oracle_names{"Normal","ReduceOnly","Disputed","Halt"};
-    BOOST_REQUIRE_EQUAL(drivechain::ECX_CAPITAL_MODES.size(),capital_names.size());
-    BOOST_REQUIRE_EQUAL(drivechain::ECX_ORACLE_MODES.size(),oracle_names.size());
-    for (size_t i=0; i<capital_names.size(); ++i) BOOST_CHECK_EQUAL(std::string(drivechain::ECX_CAPITAL_MODES.at(i)),capital_names[i]);
-    for (size_t i=0; i<oracle_names.size(); ++i) BOOST_CHECK_EQUAL(std::string(drivechain::ECX_ORACLE_MODES.at(i)),oracle_names[i]);
-    for (uint32_t version : {0U,3U,4U,5U,6U,UINT32_MAX})
-    for (uint32_t capital : {0U,2U,3U,255U})
-    for (uint32_t oracle : {0U,3U,4U,255U})
-    for (uint32_t safe : {0U,1U,2U,255U})
-    for (uint32_t flags = 0; flags < 8; ++flags) {
-        const std::array<uint32_t,7> replies{version,flags&1,(flags>>1)&1,capital,oracle,safe,(flags>>2)&1};
-        const std::array<bool,7> valid{version==4 || version==5,bool(flags&1),bool(flags&2),capital<=2,oracle<=3,safe<=1,bool(flags&4)};
-        const auto passed = std::find(valid.begin(),valid.end(),false)-valid.begin();
-        std::vector<uint32_t> trace;
-        const auto run = [&] {
-            return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CAPITAL_REPORT,
-                [&](uint32_t step) -> uint32_t {
-                trace.push_back(step);
-                if (step <= 2) return 1;
-                if (step == 3) BOOST_FAIL("present projection rejected");
-                if (step == 11) throw JSONRPCError(RPC_MISC_ERROR,"invalid capital snapshot");
-                return replies.at(step-4);
-            });
-        };
-        if (passed == 7) BOOST_CHECK_EQUAL(run(),1);
-        else BOOST_CHECK_EXCEPTION(run(),UniValue,[](const UniValue& error) {
-            return error["code"].getInt<int>() == RPC_MISC_ERROR && error["message"].get_str() == "invalid capital snapshot";
-        });
-        std::vector<uint32_t> expected{1,2};
-        for (uint32_t step=4; step<=std::min<uint32_t>(passed+4,10); ++step) expected.push_back(step);
-        if (passed != 7) expected.push_back(11);
-        BOOST_CHECK(trace == expected);
-    }
-}
 
-BOOST_AUTO_TEST_CASE(capital_report_optional_projection)
-{
-    for (bool enabled : {false,true})
-    for (bool present : {false,true}) {
-        std::optional<uint32_t> projection;
-        if (present) projection = 4;
-        std::vector<uint32_t> trace;
-        const auto run = [&] {
-            return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::CAPITAL_REPORT,
-                [&](uint32_t step) -> uint32_t {
-                    trace.push_back(step);
-                    if (step == 1) return enabled;
-                    if (step == 2) return projection.has_value();
-                    if (step == 3) throw JSONRPCError(RPC_MISC_ERROR,
-                        "active ECX V2 tip has no fully verified capital projection");
-                    BOOST_REQUIRE(projection.has_value());
-                    return step == 4 ? projection.value() : 1;
-                });
-        };
-        if (enabled && !present) BOOST_CHECK_EXCEPTION(run(),UniValue,[](const UniValue& error) {
-            return error["code"].getInt<int>() == RPC_MISC_ERROR && error["message"].get_str() ==
-                "active ECX V2 tip has no fully verified capital projection";
-        });
-        else BOOST_CHECK_EQUAL(run(),enabled ? 1U : 0U);
-        const std::vector<uint32_t> expected = !enabled ? std::vector<uint32_t>{1} :
-            !present ? std::vector<uint32_t>{1,2,3} : std::vector<uint32_t>{1,2,4,5,6,7,8,9,10};
-        BOOST_CHECK(trace == expected);
-    }
-}
 
-BOOST_AUTO_TEST_CASE(bond_export_range_bounds)
-{
-    int32_t end = 123;
-    BOOST_CHECK_EQUAL(drivechain::haskell::ExchangeExportRange(100, 64, 100, std::nullopt, end), 0U);
-    BOOST_CHECK_EQUAL(end, 100);
-    BOOST_CHECK_EQUAL(drivechain::haskell::ExchangeExportRange(100, 64, 100, 110, end), 0U);
-    BOOST_CHECK_EQUAL(end, 110);
-    BOOST_CHECK_EQUAL(drivechain::haskell::ExchangeExportRange(100, 64, 100, 200, end), 0U);
-    BOOST_CHECK_EQUAL(end, 163);
-    BOOST_CHECK_EQUAL(drivechain::haskell::ExchangeExportRange(INT32_MAX, 64, 100, INT32_MAX, end), 0U);
-    BOOST_CHECK_EQUAL(end, INT32_MAX);
-    for (int count : {0, 65, -1}) {
-        BOOST_CHECK_EQUAL(drivechain::haskell::ExchangeExportRange(100, count, 100, -1, end), 1U);
-        BOOST_CHECK_EQUAL(end, INT32_MAX);
-    }
-    BOOST_CHECK_EQUAL(drivechain::haskell::ExchangeExportRange(99, 1, 100, -1, end), 1U);
-    BOOST_CHECK_EQUAL(drivechain::haskell::ExchangeExportRange(100, 1, 100, -1, end), 2U);
-    BOOST_CHECK_EQUAL(drivechain::haskell::ExchangeExportRange(100, 1, 100, 99, end), 2U);
-    BOOST_CHECK_EQUAL(end, INT32_MAX);
-}
 
-BOOST_AUTO_TEST_CASE(bond_inbox_export_snapshot_seed)
-{
-    for (bool genesis : {false,true})
-    for (bool present : {false,true}) {
-        std::optional<uint64_t> previous;
-        if (present) previous = 42;
-        uint64_t working{0};
-        std::vector<uint32_t> trace;
-        const auto run = [&] {
-            return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EXPORT_INITIALIZE,
-                [&](uint32_t step) -> uint32_t {
-                trace.push_back(step);
-                switch (step) {
-                case 1: return genesis;
-                case 2: working = 1; return 1;
-                case 3: return previous.has_value();
-                case 4: throw JSONRPCError(RPC_MISC_ERROR, "predecessor lacks a verified bond-inbox projection");
-                case 5: working = previous.value(); return 1;
-                default: throw std::logic_error("unexpected seed action");
-                }
-            });
-        };
-        if (genesis || present) BOOST_CHECK_EQUAL(run(),1U);
-        else BOOST_CHECK_EXCEPTION(run(),UniValue,HasJSON(
-            "{\"code\":-1,\"message\":\"predecessor lacks a verified bond-inbox projection\"}"));
-        BOOST_CHECK_EQUAL(working,genesis ? 1U : present ? 42U : 0U);
-        const std::vector<uint32_t> expected = genesis ? std::vector<uint32_t>{1,2} :
-            std::vector<uint32_t>{1,3,present ? 5U : 4U};
-        BOOST_CHECK(trace == expected);
-    }
-}
 
-BOOST_AUTO_TEST_CASE(bond_inbox_export_recheck_prefix)
-{
-    const std::array heights{0,1,2};
-    for (int end = -1; end <= 3; ++end)
-    for (int changed = -1; changed <= 2; ++changed) {
-        std::vector<int> looked_up;
-        const auto run = [&] {
-            return drivechain::haskell::ParentReplayEach(heights, [&](int height) {
-                return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EXPORT_RECHECK,
-                    [&](uint32_t step) -> uint32_t {
-                    switch (step) {
-                    case 1: return height <= end;
-                    case 2: looked_up.push_back(height); return height != changed;
-                    case 3: throw JSONRPCError(RPC_MISC_ERROR,
-                        "bond-inbox export range was reorganized during reconstruction");
-                    default: throw std::logic_error("unexpected recheck action");
-                    }
-                });
-            });
-        };
-        const bool fails{changed >= 0 && changed <= end};
-        if (fails) BOOST_CHECK_EXCEPTION(run(),UniValue,HasJSON(
-            "{\"code\":-1,\"message\":\"bond-inbox export range was reorganized during reconstruction\"}"));
-        else BOOST_CHECK_EQUAL(run(),end >= 2);
-        std::vector<int> expected;
-        for (int height : heights) {
-            if (height > end) break;
-            expected.push_back(height);
-            if (height == changed) break;
-        }
-        BOOST_CHECK(looked_up == expected);
-    }
-}
 
 BOOST_AUTO_TEST_CASE(bond_inbox_export_capture_range)
 {
@@ -855,31 +570,6 @@ BOOST_AUTO_TEST_CASE(bond_inbox_export_reorg_fence)
     }
 }
 
-BOOST_AUTO_TEST_CASE(wide_decimal_json_numbers)
-{
-    struct Case { const char* hex; const char* positive; const char* signed_value; };
-    for (const auto& example : {
-        Case{"00000000000000000000000000000000", "0", "0"},
-        Case{"00000000000000000000000000000001", "1", "1"},
-        Case{"00000000000000010000000000000000", "18446744073709551616", "18446744073709551616"},
-        Case{"7fffffffffffffffffffffffffffffff", "170141183460469231731687303715884105727", "170141183460469231731687303715884105727"},
-        Case{"80000000000000000000000000000000", "170141183460469231731687303715884105728", "-170141183460469231731687303715884105728"},
-        Case{"ffffffffffffffffffffffffffffffff", "340282366920938463463374607431768211455", "-1"}}) {
-        const auto parsed = ParseHex(example.hex);
-        std::array<unsigned char,16> bytes;
-        std::copy(parsed.begin(),parsed.end(),bytes.begin());
-        for (bool signed_value : {false,true}) {
-            const auto text = drivechain::haskell::WideDecimal(bytes,signed_value);
-            BOOST_CHECK_EQUAL(text,signed_value ? example.signed_value : example.positive);
-            const UniValue number = EcxWideNumberToJSON(bytes,signed_value);
-            BOOST_REQUIRE(number.isNum());
-            BOOST_CHECK_EQUAL(number.write(),text);
-            UniValue decoded;
-            BOOST_REQUIRE(decoded.read(number.write()));
-            BOOST_CHECK_EQUAL(decoded.getValStr(),text);
-        }
-    }
-}
 
 BOOST_AUTO_TEST_CASE(private_bmm_sequence_order)
 {
@@ -967,72 +657,11 @@ BOOST_AUTO_TEST_CASE(bmm_context_snapshot_order)
     }
 }
 
-BOOST_AUTO_TEST_CASE(simplicity_source_selection_order)
-{
-    namespace hs = drivechain::haskell;
-    for (bool frozen : {false,true}) for (bool private_catalogue : {false,true}) {
-        std::vector<uint32_t> expected{1};
-        if (private_catalogue) {
-            expected.push_back(2);
-            if (!frozen) expected.push_back(3);
-        }
-        for (size_t fault=0; fault<=expected.size(); ++fault) {
-            std::vector<uint32_t> seen;
-            const auto run = [&] {
-                return hs::ParentReplayStore(hs::ReplayStoreFlow::EVALUATOR_SOURCE,
-                    [&](uint32_t step) -> uint32_t {
-                        seen.push_back(step);
-                        if (fault && seen.size()==fault) throw std::runtime_error("source read failed");
-                        if (step==1) return private_catalogue;
-                        if (step==2) return frozen;
-                        BOOST_CHECK(private_catalogue && !frozen);
-                        return 1;
-                    });
-            };
-            if (fault) BOOST_CHECK_EXCEPTION(run(),std::runtime_error,[](const auto& error) {
-                return std::string{error.what()}=="source read failed";
-            });
-            else BOOST_CHECK_EQUAL(run(),1U);
-            BOOST_CHECK_EQUAL_COLLECTIONS(seen.begin(),seen.end(),expected.begin(),
-                expected.begin()+(fault ? fault : expected.size()));
-        }
-    }
-}
 
-BOOST_AUTO_TEST_CASE(simplicity_identity_reporting)
+BOOST_AUTO_TEST_CASE(retired_proof_catalogue_rpc_is_absent)
 {
-    const auto initial{CallRPC("getsimplicityinfo")};
-    const bool frozen{initial["catalogueFrozen"].get_bool()};
-    const bool private_catalogue{initial["privateCatalogue"].get_bool()};
-    const std::vector<std::string> identities{
-        "", std::string(63, 'a'), std::string(65, 'a'), std::string(64, 'g'),
-        std::string(63, 'a') + '\0', std::string(64, '0'), std::string(64, 'a'),
-        std::string(64, 'F'), std::string(32, 'a') + std::string(32, 'B')};
-    for (const auto& catalogue : identities) {
-        for (const auto& program : identities) {
-            // The fixture restores settings, including forced values, on exit.
-            m_node.args->ForceSetArg("-ecxprivatesimplicitycataloguesha256", catalogue);
-            m_node.args->ForceSetArg("-ecxprivatesimplicityprogramcmr", program);
-            const auto result{CallRPC("getsimplicityinfo")};
-            BOOST_CHECK_EQUAL(result.size(), 5U);
-            BOOST_CHECK_EQUAL(result["catalogueFrozen"].get_bool(), frozen);
-            BOOST_CHECK_EQUAL(result["privateCatalogue"].get_bool(), private_catalogue);
-            if (private_catalogue && !frozen) {
-                const auto valid_hash = [](const std::string& value) {
-                    return value.size() == 64 && value.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
-                };
-                const bool valid{valid_hash(catalogue) && valid_hash(program)};
-                BOOST_CHECK_EQUAL(result["active"].get_bool(), valid);
-                BOOST_CHECK_EQUAL(result["catalogueSha256"].get_str(), valid ? catalogue : "");
-                BOOST_CHECK_EQUAL(result["programCmr"].get_str(), valid ? program : "");
-            } else {
-                BOOST_CHECK_EQUAL(result.write(), initial.write());
-            }
-        }
-    }
-    const bool available{!initial["catalogueSha256"].get_str().empty()};
-    BOOST_CHECK_EQUAL(initial["programCmr"].get_str().empty(), !available);
-    BOOST_CHECK_EQUAL(initial["active"].get_bool(), available && (frozen || private_catalogue));
+    BOOST_CHECK_EXCEPTION(CallRPC("getsimplicityinfo"), std::runtime_error,
+        [](const std::runtime_error& error) { return std::string(error.what()) == "Method not found"; });
 }
 
 BOOST_AUTO_TEST_CASE(bmm_work_bid_admission)
@@ -1576,25 +1205,6 @@ BOOST_FIXTURE_TEST_CASE(bmm_context_missing_tip, EmptyElementsRPCSetup)
         HasJSON("{\"code\":-1,\"message\":\"active sidechain tip is unavailable\"}"));
 }
 
-BOOST_FIXTURE_TEST_CASE(usdd_snapshot_missing_tip, EmptyElementsRPCSetup)
-{
-    {
-        LOCK(cs_main);
-        BOOST_REQUIRE(m_node.chainman->ActiveChain().Tip() == nullptr);
-    }
-    CRPCTable table;
-    RegisterBlockchainRPCCommands(table);
-    if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
-    for (const std::string method : {"getusddwithdrawalaccumulator", "getusddwithdrawalproof"}) {
-        JSONRPCRequest request;
-        request.context = &m_node;
-        request.strMethod = method;
-        request.params = UniValue(UniValue::VARR);
-        if (method == "getusddwithdrawalproof") request.params.push_back(0);
-        BOOST_CHECK_EXCEPTION(table.execute(request), UniValue,
-            HasJSON("{\"code\":-5,\"message\":\"Block is not in the active chain\"}"));
-    }
-}
 
 BOOST_FIXTURE_TEST_CASE(bmm_context_native_preflight, EnabledWithdrawalRPCSetup)
 {
@@ -1615,45 +1225,7 @@ BOOST_FIXTURE_TEST_CASE(bmm_context_native_preflight, EnabledWithdrawalRPCSetup)
     rejected("active sidechain tip has no authenticated native BMM anchor");
 }
 
-BOOST_FIXTURE_TEST_CASE(ecx_state_utxo_eligibility, EnabledWithdrawalRPCSetup)
-{
-    const auto txid = Txid::FromUint256(uint256S("7131"));
-    BOOST_CHECK_EXCEPTION(ExecuteWithdrawalRPC(m_node, "getecxstateutxoroot", {txid.GetHex(), "-1"}),
-        UniValue, HasJSON("{\"code\":-8,\"message\":\"vout must be nonnegative\"}"));
-    BOOST_CHECK_EXCEPTION(ExecuteWithdrawalRPC(m_node, "getecxstateutxoroot", {txid.GetHex(), "0"}),
-        UniValue, HasJSON("{\"code\":-5,\"message\":\"ECX singleton UTXO not found\"}"));
-    for (unsigned variant = 0; variant < 5; ++variant) {
-        CTxOut output{Params().GetConsensus().pegged_asset, 1,
-            CScript() << OP_1 << std::vector<unsigned char>(32, 1)};
-        if (variant == 1) output.nAsset.vchCommitment.assign(33, 10);
-        if (variant == 2) output.nValue.vchCommitment.assign(33, 8);
-        if (variant == 3) output.nNonce.vchCommitment.assign(33, 2);
-        if (variant == 4) output.scriptPubKey = CScript() << OP_TRUE;
-        {
-            LOCK(cs_main);
-            m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
-                COutPoint{txid, variant}, Coin{output, 0, false}, false);
-        }
-        const auto result = ExecuteWithdrawalRPC(m_node, "getecxstateutxoroot",
-            {txid.GetHex(), std::to_string(variant)});
-        BOOST_CHECK_EQUAL(result["eligible"].get_bool(), variant == 0);
-        BOOST_CHECK_EQUAL(result["height"].getInt<int>(), 0);
-        BOOST_CHECK_EQUAL(result["root"].get_str().size(), 64);
-    }
-    {
-        LOCK(cs_main);
-        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(COutPoint{txid, 5},
-            Coin{CTxOut{Params().GetConsensus().pegged_asset, 1, CScript{}}, 0, false}, false);
-    }
-    BOOST_CHECK_EXCEPTION(ExecuteWithdrawalRPC(m_node, "getecxstateutxoroot", {txid.GetHex(), "5"}),
-        UniValue, HasJSON("{\"code\":-5,\"message\":\"ECX singleton UTXO not found\"}"));
-}
 
-BOOST_FIXTURE_TEST_CASE(ecx_context_missing_tip, EmptyElementsRPCSetup)
-{
-    BOOST_CHECK_EXCEPTION(ExecuteWithdrawalRPC(m_node, "getecxconsensuscontext", {}),
-        UniValue, HasJSON("{\"code\":-1,\"message\":\"active sidechain tip is unavailable\"}"));
-}
 
 BOOST_FIXTURE_TEST_CASE(peg_event_default_request, EnabledWithdrawalRPCSetup)
 {
@@ -1672,11 +1244,6 @@ BOOST_FIXTURE_TEST_CASE(peg_event_missing_tip_before_range_or_l1, EmptyElementsR
     }
 }
 
-BOOST_FIXTURE_TEST_CASE(ecx_context_missing_snapshot, EnabledWithdrawalRPCSetup)
-{
-    BOOST_CHECK_EXCEPTION(ExecuteWithdrawalRPC(m_node, "getecxconsensuscontext", {}),
-        UniValue, HasJSON("{\"code\":-1,\"message\":\"active tip has no complete ECX consensus context\"}"));
-}
 
 BOOST_AUTO_TEST_CASE(bmm_context_missing_state)
 {
@@ -1712,88 +1279,7 @@ BOOST_AUTO_TEST_CASE(withdrawal_required_facts_preserve_effect_order)
     }
 }
 
-BOOST_FIXTURE_TEST_CASE(usdd_proof_admission, EnabledWithdrawalRPCSetup)
-{
-    const auto reject = [&](const std::vector<std::string>& args, int code, const char* message) {
-        BOOST_CHECK_EXCEPTION(ExecuteWithdrawalRPC(m_node, "getusddwithdrawalproof", args), UniValue,
-            [&](const UniValue& error) {
-                const bool matches = error["code"].getInt<int>() == code && error["message"].get_str() == message;
-                BOOST_CHECK_MESSAGE(matches, "expected " << message << "; received " << error.write());
-                return matches;
-            });
-    };
-    reject({"-1", "not-a-hash"}, RPC_INVALID_PARAMETER, "Withdrawal index must not be negative");
-    reject({"0", std::string(64, '0')}, RPC_INVALID_ADDRESS_OR_KEY, "Block is not in the active chain");
-    BOOST_CHECK_EXCEPTION(ExecuteWithdrawalRPC(m_node, "getusddwithdrawalaccumulator", {std::string(64, '0')}),
-        UniValue, HasJSON("{\"code\":-5,\"message\":\"Block is not in the active chain\"}"));
 
-    LOCK(cs_main);
-    auto* tip = m_node.chainman->ActiveChain().Tip();
-    BOOST_REQUIRE(tip);
-    // This fixture owns the chain. Always restore the index, including failures.
-    struct Restore {
-        CBlockIndex& tip;
-        decltype(tip.m_usdd_withdrawal_accumulator) saved;
-        ~Restore() { tip.m_usdd_withdrawal_accumulator = saved; }
-    } restore{*tip, tip->m_usdd_withdrawal_accumulator};
-    tip->m_usdd_withdrawal_accumulator.reset();
-    reject({"0"}, RPC_INTERNAL_ERROR, "Withdrawal accumulator unavailable; reindex required");
-    BOOST_CHECK_EXCEPTION(ExecuteWithdrawalRPC(m_node, "getusddwithdrawalaccumulator", {}),
-        UniValue, HasJSON("{\"code\":-32603,\"message\":\"Withdrawal accumulator unavailable; reindex required\"}"));
-    tip->m_usdd_withdrawal_accumulator.emplace();
-    const auto snapshot = ExecuteWithdrawalRPC(m_node,"getusddwithdrawalaccumulator",{});
-    BOOST_CHECK_EQUAL(snapshot["blockhash"].get_str(),tip->GetBlockHash().GetHex());
-    BOOST_CHECK_EQUAL(snapshot["height"].getInt<int>(),tip->nHeight);
-    BOOST_CHECK_EQUAL(snapshot["count"].getInt<uint64_t>(),0U);
-    BOOST_CHECK_EQUAL(snapshot["root"].get_str(),HexStr(tip->m_usdd_withdrawal_accumulator->root));
-    BOOST_CHECK(!snapshot["authorizing"].get_bool());
-    reject({"0"}, RPC_INVALID_PARAMETER, "Withdrawal index is outside this accumulator");
-    tip->m_usdd_withdrawal_accumulator->count = 10'001;
-    reject({"10001"}, RPC_INVALID_PARAMETER, "Withdrawal index is outside this accumulator");
-    for (int repeat = 0; repeat < 2; ++repeat) {
-        reject({"10000"}, RPC_MISC_ERROR,
-            "Proof reconstruction exceeds the safe RPC limit; use a dedicated permissionless indexer");
-    }
-    tip->m_usdd_withdrawal_accumulator->count = 10'000;
-    // The fixture has no running RPC service. Reaching its interruption point
-    // proves the inclusive limit passed admission without starting global RPC.
-    BOOST_REQUIRE(!IsRPCRunning());
-    reject({"9999"}, RPC_CLIENT_NOT_CONNECTED, "Shutting down");
-}
-
-BOOST_FIXTURE_TEST_CASE(usdd_history_rpc, TestChain100Setup)
-{
-    LOCK(cs_main);
-    CChain& chain = m_node.chainman->ActiveChain();
-    using State = decltype(chain.Tip()->m_usdd_withdrawal_accumulator);
-    struct Restore {
-        std::vector<std::pair<CBlockIndex*, State>> records;
-        ~Restore() { for (auto& [index, state] : records) index->m_usdd_withdrawal_accumulator = state; }
-    } restore;
-    BOOST_REQUIRE_EQUAL(chain.Height(), 100);
-    for (int height = 0; height <= chain.Height(); ++height) {
-        auto* index = chain[height];
-        restore.records.emplace_back(index, index->m_usdd_withdrawal_accumulator);
-        index->m_usdd_withdrawal_accumulator.emplace();
-    }
-    chain.Tip()->m_usdd_withdrawal_accumulator->count = 1;
-    const auto reject = [&](int code, const char* message) {
-        BOOST_CHECK_EXCEPTION(ExecuteWithdrawalRPC(m_node, "getusddwithdrawalproof", {"0"}), UniValue,
-            [&](const UniValue& error) {
-                return error["code"].getInt<int>() == code && error["message"].get_str() == message;
-            });
-    };
-    chain[50]->m_usdd_withdrawal_accumulator.reset();
-    reject(RPC_INTERNAL_ERROR, "Discontinuous withdrawal accumulator; reindex required");
-    chain[50]->m_usdd_withdrawal_accumulator.emplace();
-    chain[50]->m_usdd_withdrawal_accumulator->count = 1;
-    reject(RPC_INTERNAL_ERROR, "Nonmonotonic withdrawal accumulator; reindex required");
-    for (int height = 51; height < chain.Height(); ++height) {
-        chain[height]->m_usdd_withdrawal_accumulator->count = 1;
-    }
-    BOOST_REQUIRE(!IsRPCRunning());
-    reject(RPC_CLIENT_NOT_CONNECTED, "Shutting down");
-}
 
 BOOST_FIXTURE_TEST_CASE(withdrawal_rpc_enabled_preflight, EnabledWithdrawalRPCSetup)
 {
@@ -1903,23 +1389,6 @@ BOOST_FIXTURE_TEST_CASE(withdrawal_rpc_external_bundle_domains, EnabledWithdrawa
         HasJSON("{\"code\":-22,\"message\":\"blinded M6 does not have the bounded legacy zero-input/three-output frame\"}"));
 }
 
-BOOST_AUTO_TEST_CASE(rpc_convert_values_usdd_withdrawal_proof)
-{
-    static constexpr const char* BLOCK_HASH =
-        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-
-    UniValue positional;
-    BOOST_CHECK_NO_THROW(positional = RPCConvertValues(
-        "getusddwithdrawalproof", {"7", BLOCK_HASH}));
-    BOOST_CHECK_EQUAL(positional[0].getInt<int>(), 7);
-    BOOST_CHECK_EQUAL(positional[1].get_str(), BLOCK_HASH);
-
-    UniValue named;
-    BOOST_CHECK_NO_THROW(named = RPCConvertNamedValues(
-        "getusddwithdrawalproof", {"index=7", std::string{"blockhash="} + BLOCK_HASH}));
-    BOOST_CHECK_EQUAL(named["index"].getInt<int>(), 7);
-    BOOST_CHECK_EQUAL(named["blockhash"].get_str(), BLOCK_HASH);
-}
 
 BOOST_AUTO_TEST_CASE(rpc_getblockstats_calculate_percentiles_by_weight)
 {

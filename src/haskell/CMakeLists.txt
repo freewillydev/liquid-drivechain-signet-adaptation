@@ -18,21 +18,16 @@ function(check_haskell_header path generator)
   endif()
 endfunction()
 check_haskell_header(resource_constants.h resourceHeader)
-check_haskell_header(../simplicity/elements/primitiveJetCost.inc jetCostHeader)
-check_haskell_header(../simplicity/elements/ecxPrivateE2ePrimitiveJetNode.inc privateJetHeader)
 check_haskell_header(../simplicity/elements/drivechainPrimitiveJetNode.inc publicJetHeader)
-check_haskell_header(../simplicity/include/simplicity/elements/policy_constants.h simplicityHeader)
 set(bmm_constants_generator header)
 set(bootstrap_constants_generator bootstrapHeader)
 set(parent_rules_generator parentRulesHeader)
-set(exchange_constants_generator exchangeHeader)
-set(activation_constants_generator activationHeader)
 set(rpc_security_constants_generator rpcSecurityHeader)
 set(network_defaults_generator networkDefaultsHeader)
 set(journal_constants_generator journalHeader)
 set(pegin_identity_generator peginIdentityHeader)
 set(wallet_rpc_generator walletRpcHeader)
-foreach(name IN ITEMS bmm_constants bootstrap_constants parent_rules exchange_constants activation_constants rpc_security_constants network_defaults journal_constants pegin_identity wallet_rpc)
+foreach(name IN ITEMS bmm_constants bootstrap_constants parent_rules rpc_security_constants network_defaults journal_constants pegin_identity wallet_rpc)
   execute_process(COMMAND "${ELEMENTS_GHC}" -Wall -Werror -no-user-package-db -package-env -
     -hide-all-packages -package base "${CMAKE_CURRENT_SOURCE_DIR}/BmmConstants.hs"
     -e "putStr BmmConstants.${${name}_generator}"
@@ -97,7 +92,7 @@ add_custom_command(OUTPUT "${hs_library}" "${CMAKE_CURRENT_BINARY_DIR}/DomainABI
     -odir "${CMAKE_CURRENT_BINARY_DIR}" -hidir "${CMAKE_CURRENT_BINARY_DIR}"
     -stubdir "${CMAKE_CURRENT_BINARY_DIR}" ${hs_link_flags}
     "${CMAKE_CURRENT_SOURCE_DIR}/DomainABI.hs" "${CMAKE_CURRENT_SOURCE_DIR}/GrpcClient.hs" "${CMAKE_CURRENT_SOURCE_DIR}/Utreexo.hs" "${CMAKE_CURRENT_BINARY_DIR}/runtime.c" -o "${hs_library}"
-  DEPENDS ${grpc_ready} Utreexo.hs GrpcClient.hs EnforcerCodec.hs Abi.hs DomainABI.hs domain_abi.h abi.def generate_abi.py Drivechain.hs Withdrawal.hs Deposit.hs NativeDeposit.hs Bmm.hs BmmConstants.hs ParentBlock.hs ParentHeader.hs ParentReplay.hs ParentCache.hs ReplayStore.hs Exchange.hs ExchangeCustody.hs ExchangeForcedV3.hs ExchangeForcedV3Block.hs Usdd.hs ScriptPolicy.hs CapabilityContext.hs Workflow.hs ${operation_sources} runtime.c VERBATIM)
+  DEPENDS ${grpc_ready} Utreexo.hs GrpcClient.hs EnforcerCodec.hs Abi.hs DomainABI.hs domain_abi.h abi.def generate_abi.py Drivechain.hs Withdrawal.hs Deposit.hs NativeDeposit.hs Bmm.hs BmmConstants.hs ParentBlock.hs ParentHeader.hs ParentReplay.hs ParentCache.hs ReplayStore.hs NodeRules.hs ScriptPolicy.hs CapabilityContext.hs Workflow.hs ${operation_sources} runtime.c VERBATIM)
 add_custom_target(elements_haskell_build DEPENDS "${hs_library}" "${CMAKE_CURRENT_BINARY_DIR}/DomainABI_stub.h")
 add_library(elements_haskell_runtime SHARED IMPORTED GLOBAL)
 set_target_properties(elements_haskell_runtime PROPERTIES IMPORTED_LOCATION "${hs_library}")

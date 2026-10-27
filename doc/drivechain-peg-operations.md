@@ -1,7 +1,7 @@
 # Native slot-24 deposits and withdrawals
 
 This guide applies to the current `-chain=elements` node, not the historical
-Liquid-signet/ECX bridge. Use a fresh `elements-betanet-slot24-v1` chain data directory. Do not
+Liquid-signet/ECX bridge. Use a fresh `elements-native-v1` chain data directory. Do not
 point the current binary at a preserved historical chain.
 
 ## Identity and transport
@@ -15,6 +15,7 @@ This is not a runtime-selectable signet. Sharing Bitcoin's genesis and address
 prefixes does not prove a connected node follows the intended parent fork.
 Verify the checkpoint, enforcer compatibility revision, proposal identity, and
 activation on the intended parent deployment before funding anything.
+The former Betanet proposal is not reused; the new matching proposal must be activated.
 
 Follow [RPC security](drivechain-rpc-security.md). Parent access requires
 authentication on numeric loopback, preferably a private rotating cookie;

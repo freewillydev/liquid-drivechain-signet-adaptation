@@ -3,7 +3,6 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <node/blockstorage.h>
-#include <node/ecx_deployment_identity.h>
 
 #include <arith_uint256.h>
 #include <block_proof.h>
@@ -50,9 +49,7 @@ namespace kernel {
 static constexpr uint8_t DB_BLOCK_FILES{'f'};
 static constexpr uint8_t DB_BLOCK_INDEX{'b'};
 // Separate from CDiskBlockIndex to preserve every legacy block-index byte.
-static constexpr uint8_t DB_ECX_BOND_V2_CAPITAL{'E'};
 static constexpr uint8_t DB_DRIVECHAIN_ANCHOR{'D'};
-static constexpr uint8_t DB_USDD_WITHDRAWAL_ACCUMULATOR{'U'};
 
 static constexpr uint8_t DB_FLAG{'F'};
 static constexpr uint8_t DB_REINDEX_FLAG{'R'};
@@ -103,13 +100,8 @@ bool BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFi
             if (value) batch.Write(key, *value);
             else batch.Erase(key);
         };
-        assert(!bi->ecxCustodyProjection || !bi->ecxBondV2Capital);
-        if (bi->ecxCustodyProjection) write_optional(DB_ECX_BOND_V2_CAPITAL, bi->ecxCustodyProjection);
-        else write_optional(DB_ECX_BOND_V2_CAPITAL, bi->ecxBondV2Capital);
         assert(!bi->m_drivechain_anchor || bi->m_drivechain_anchor->IsSane());
         write_optional(DB_DRIVECHAIN_ANCHOR, bi->m_drivechain_anchor);
-        assert(!bi->m_usdd_withdrawal_accumulator || bi->m_usdd_withdrawal_accumulator->IsSane());
-        write_optional(DB_USDD_WITHDRAWAL_ACCUMULATOR, bi->m_usdd_withdrawal_accumulator);
     }
     return WriteBatch(batch, true);
 }
@@ -137,7 +129,6 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
 
     int n_untrimmed = 0;
     int n_total = 0;
-    std::vector<CBlockIndex*> accumulator_indices;
 
     // Load m_block_index
     while (pcursor->Valid()) {
@@ -158,15 +149,6 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->hashWithdrawalBundle = diskindex.hashWithdrawalBundle;
                 pindexNew->hashBmmProof   = diskindex.hashBmmProof;
                 pindexNew->utreexo       = diskindex.utreexo;
-                pindexNew->hashExchangeStateRoot = diskindex.hashExchangeStateRoot;
-                pindexNew->hashForcedInboxRoot = diskindex.hashForcedInboxRoot;
-                pindexNew->hashDepositInboxRoot = diskindex.hashDepositInboxRoot;
-                pindexNew->ecxParentHeight = diskindex.ecxParentHeight;
-                pindexNew->forcedProcessedCursor = diskindex.forcedProcessedCursor;
-                pindexNew->depositProcessedCursor = diskindex.depositProcessedCursor;
-                pindexNew->sourceBacklogOldestParentHeight =
-                    diskindex.sourceBacklogOldestParentHeight;
-                pindexNew->swapForcedState = diskindex.swapForcedState;
                 pindexNew->nTime          = diskindex.nTime;
                 pindexNew->nBits          = diskindex.nBits;
                 pindexNew->nNonce         = diskindex.nNonce;
@@ -174,44 +156,14 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->nTx            = diskindex.nTx;
 
                 DrivechainAnchor drivechain_anchor;
-                std::pair<uint8_t,uint256> accumulator_key;
-                usdd::WithdrawalAccumulatorState accumulator;
-                const char* function = __func__;
-                if (drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::INDEX_DERIVED,
-                    [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
-                    switch (step) {
-                    case 1: return Read(std::make_pair(DB_DRIVECHAIN_ANCHOR,pindexNew->GetBlockHash()),drivechain_anchor);
-                    case 2: return drivechain_anchor.IsSane();
-                    case 3:
-                        LogError("%s: malformed persisted drivechain anchor for %s", function, pindexNew->GetBlockHash().GetHex());
-                        return 1;
-                    case 4: pindexNew->m_drivechain_anchor=drivechain_anchor; return 1;
-                    case 5:
-                        accumulator_key=std::make_pair(DB_USDD_WITHDRAWAL_ACCUMULATOR,pindexNew->GetBlockHash());
-                        return Exists(accumulator_key);
-                    case 6: return Read(accumulator_key,accumulator);
-                    case 7: return accumulator.IsSane();
-                    case 8:
-                        LogError("%s: malformed persisted USDD withdrawal accumulator for %s",
-                            function,pindexNew->GetBlockHash().GetHex());
-                        return 1;
-                    case 9:
-                        pindexNew->m_usdd_withdrawal_accumulator=accumulator;
-                        accumulator_indices.push_back(pindexNew);
-                        return 1;
-                    case 10: return pindexNew->GetBlockHash()==consensusParams.hashGenesisBlock;
-                    case 11:
-                        pindexNew->m_usdd_withdrawal_accumulator=usdd::WithdrawalAccumulatorState::Empty();
-                        accumulator_indices.push_back(pindexNew);
-                        return 1;
-                    case 12: return pindexNew->IsValid(BLOCK_VALID_SCRIPTS);
-                    case 13:
-                        LogError("%s: missing derived USDD withdrawal accumulator for validated block %s; reindex required",
-                            function,pindexNew->GetBlockHash().GetHex());
-                        return 1;
-                    default: throw std::logic_error("invalid derived index action");
+                const auto anchor_key = std::make_pair(DB_DRIVECHAIN_ANCHOR, pindexNew->GetBlockHash());
+                if (Exists(anchor_key)) {
+                    if (!Read(anchor_key, drivechain_anchor) || !drivechain_anchor.IsSane()) {
+                        LogError("%s: malformed persisted drivechain anchor for %s", __func__, pindexNew->GetBlockHash().GetHex());
+                        return false;
                     }
-                }) != 0) return false;
+                    pindexNew->m_drivechain_anchor = drivechain_anchor;
+                }
 
                 pindexNew->proof               = diskindex.proof;
                 pindexNew->m_dynafed_params    = diskindex.m_dynafed_params;
@@ -244,85 +196,9 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
         }
     }
 
-    const auto empty_accumulator = usdd::WithdrawalAccumulatorState::Empty();
-    auto current=accumulator_indices.begin();
-    const CBlockIndex* pindex{nullptr};
-    const usdd::WithdrawalAccumulatorState* accumulator{nullptr};
-    const char* function=__func__;
-    if (drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::INDEX_CONTINUITY,
-        [&](uint32_t step) -> uint32_t {
-        switch (step) {
-        case 1:
-            if (current==accumulator_indices.end()) return 0;
-            pindex=*current;
-            accumulator=&*pindex->m_usdd_withdrawal_accumulator;
-            return 1;
-        case 2: return pindex->pprev!=nullptr;
-        case 3: return pindex->GetBlockHash()==consensusParams.hashGenesisBlock;
-        case 4: return *accumulator==empty_accumulator;
-        case 5:
-            LogError("%s: nonempty or misplaced genesis USDD withdrawal accumulator",function);
-            return 1;
-        case 6: return pindex->pprev->m_usdd_withdrawal_accumulator.has_value();
-        case 7: return accumulator->count>=pindex->pprev->m_usdd_withdrawal_accumulator->count;
-        case 8: return accumulator->count==pindex->pprev->m_usdd_withdrawal_accumulator->count;
-        case 9:
-            LogError("%s: discontinuous USDD withdrawal accumulator at %s",function,pindex->GetBlockHash().GetHex());
-            return 1;
-        case 10: return *accumulator==*pindex->pprev->m_usdd_withdrawal_accumulator;
-        case 11:
-            LogError("%s: USDD withdrawal accumulator changed without an appended leaf at %s",function,pindex->GetBlockHash().GetHex());
-            return 1;
-        case 12: ++current; return 1;
-        default: throw std::logic_error("invalid index continuity action");
-        }
-    }) != 0) return false;
-
     LogPrintf("LoadBlockIndexGuts: loaded %d total / %d untrimmed (fully in-memory) headers\n", n_total, n_untrimmed);
 
-    // V2 projections are intentionally a disjoint database namespace.  This
-    // permits an old V1 index to load without reinterpretation while making a
-    // missing V2 projection fail closed at its RPC/activation boundary.
-    size_t capital_entries{0};
-    std::pair<uint8_t,uint256> key;
-    std::optional<ecx::BondV2CapitalSnapshot> snapshot;
-    std::optional<ecx::CustodyProjection> custody;
-    uint16_t projection_version{0};
-    CBlockIndex* index{nullptr};
-    return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::INDEX_CAPITAL,
-        [&](uint32_t step) -> uint32_t {
-        switch (step) {
-        case 1: pcursor->Seek(std::make_pair(DB_ECX_BOND_V2_CAPITAL,uint256())); return 1;
-        case 2: return pcursor->Valid();
-        case 3: key={}; return pcursor->GetKey(key);
-        case 4: return key.first==DB_ECX_BOND_V2_CAPITAL;
-        case 5:
-            snapshot.reset(); custody.reset();
-            if (!pcursor->GetValue(projection_version)) return 0;
-            return projection_version==ecx::CustodyProjection::VERSION ?
-                pcursor->GetValue(custody.emplace()) : pcursor->GetValue(snapshot.emplace());
-        case 6:
-            LogError("%s: failed to read ECX bond V2 capital projection",function);
-            return 1;
-        case 7: index=insertBlockIndex(key.second); return index!=nullptr;
-        case 8: return index->GetBlockHash()==key.second;
-        case 9: return (custody ? custody->exchange_state_root : snapshot->exchange_state_root)==index->hashExchangeStateRoot;
-        case 10:
-            LogError("%s: ECX bond V2 projection is orphaned or root-mismatched for %s",function,key.second.GetHex());
-            return 1;
-        case 11:
-            if (custody) { index->ecxCustodyProjection=std::move(*custody); index->ecxBondV2Capital.reset(); }
-            else { index->ecxBondV2Capital=std::move(*snapshot); index->ecxCustodyProjection.reset(); }
-            ++capital_entries;
-            pcursor->Next();
-            snapshot.reset();
-            return 1;
-        case 12:
-            LogPrintf("LoadBlockIndexGuts: loaded %u ECX bond V2 capital projections\n",static_cast<unsigned int>(capital_entries));
-            return 1;
-        default: throw std::logic_error("invalid capital index action");
-        }
-    })==0;
+    return true;
 }
 
 // ELEMENTS
@@ -367,25 +243,12 @@ const CBlockIndex *BlockTreeDB::RegenerateFullIndex(const CBlockIndex *pindexTri
     pindexNew->hashWithdrawalBundle = pindexTrimmed->hashWithdrawalBundle;
     pindexNew->hashBmmProof   = pindexTrimmed->hashBmmProof;
     pindexNew->utreexo       = pindexTrimmed->utreexo;
-    pindexNew->hashExchangeStateRoot = pindexTrimmed->hashExchangeStateRoot;
-    pindexNew->hashForcedInboxRoot = pindexTrimmed->hashForcedInboxRoot;
-    pindexNew->hashDepositInboxRoot = pindexTrimmed->hashDepositInboxRoot;
-    pindexNew->ecxParentHeight = pindexTrimmed->ecxParentHeight;
-    pindexNew->forcedProcessedCursor = pindexTrimmed->forcedProcessedCursor;
-    pindexNew->depositProcessedCursor = pindexTrimmed->depositProcessedCursor;
-    pindexNew->sourceBacklogOldestParentHeight =
-        pindexTrimmed->sourceBacklogOldestParentHeight;
-    pindexNew->swapForcedState = pindexTrimmed->swapForcedState;
-    pindexNew->ecxBondV2Capital = pindexTrimmed->ecxBondV2Capital;
-    pindexNew->ecxCustodyProjection = pindexTrimmed->ecxCustodyProjection;
     pindexNew->nTime          = pindexTrimmed->nTime;
     pindexNew->nBits          = pindexTrimmed->nBits;
     pindexNew->nNonce         = pindexTrimmed->nNonce;
     pindexNew->nStatus        = pindexTrimmed->nStatus;
     pindexNew->nTx            = pindexTrimmed->nTx;
     pindexNew->m_drivechain_anchor = pindexTrimmed->m_drivechain_anchor;
-    pindexNew->m_usdd_withdrawal_accumulator =
-        pindexTrimmed->m_usdd_withdrawal_accumulator;
 
     pindexNew->proof               = tmp.proof;
     pindexNew->m_dynafed_params    = tmp.m_dynafed_params;
@@ -1436,13 +1299,6 @@ BlockManager::BlockManager(const util::SignalInterrupt& interrupt, Options opts)
       m_undo_file_seq{FlatFileSeq{m_opts.blocks_dir, "rev", UNDOFILE_CHUNK_SIZE}},
       m_interrupt{interrupt}
 {
-    std::string reset_error;
-    if (!CheckEcxDeploymentResetAllowed(
-            m_opts.block_tree_db_params.wipe_data,
-            m_opts.block_tree_db_params.memory_only,
-            reset_error)) {
-        throw std::runtime_error("ECX consensus identity: " + reset_error);
-    }
     m_block_tree_db = std::make_unique<BlockTreeDB>(m_opts.block_tree_db_params);
 
     if (m_opts.block_tree_db_params.wipe_data) {

@@ -12,47 +12,6 @@
 #include "../simplicity_assert.h"
 #include "../typeInference.h"
 
-static bool nonzero_root(const unsigned char root[32]) {
-  static const unsigned char zero[32] = {0};
-  return 0 != memcmp(root, zero, sizeof(zero));
-}
-
-static bool valid_optional_ecx_root(uint8_t present, const uint8_t root[32]) {
-  return elements_haskell_optional_environment(0, present, nonzero_root(root));
-}
-
-static bool valid_optional_bmm_parent(const ecx_prior_active_root_env* env) {
-  return elements_haskell_optional_environment(1, env->current_bmm_parent_present,
-    nonzero_root(env->current_bmm_parent_block_hash_wire) |
-    ((env->current_bmm_parent_height != 0) << 1) | ((env->current_bmm_parent_mtp != 0) << 2));
-}
-
-static bool valid_optional_bond_v2_identity(const ecx_prior_active_root_env* env) {
-  const unsigned char* roots[] = {
-    env->bond_v2_configuration_hash_wire, env->bond_v2_asset_id_wire,
-    env->bond_v2_deployment_commitment_wire, env->bond_v2_transition_cmr_wire,
-    env->bond_v2_insurance_reserve_script_sha256_wire, env->bond_v2_insurance_reserve_cmr_wire,
-    env->bond_v2_collateral_vault_script_sha256_wire, env->bond_v2_collateral_vault_cmr_wire};
-  uint32_t fields = 0;
-  for (size_t i = 0; i < sizeof(roots)/sizeof(*roots); ++i) fields |= (uint32_t)nonzero_root(roots[i]) << i;
-  return elements_haskell_optional_environment(2, env->bond_v2_identity_present, fields);
-}
-
-static bool valid_optional_bond_v2_projection(const ecx_prior_active_root_env* env) {
-  return elements_haskell_optional_environment(3, env->bond_v2_projection_present,
-    nonzero_root(env->prior_active_bond_inbox_root_wire) |
-    ((env->prior_active_bond_inbox_count != 0) << 1) | ((env->current_sidechain_height != 0) << 2));
-}
-
-static bool valid_optional_bond_v2_incremental_activation_identity(
-  const ecx_prior_active_root_env* env
-) {
-  return elements_haskell_optional_environment(4, env->bond_v2_incremental_activation_identity_present,
-    nonzero_root(env->bond_v2_incremental_activation_cmr_wire) |
-    (nonzero_root(env->incremental_successor_transition_cmr_wire) << 1) |
-    ((env->bond_v2_identity_present != 0) << 2));
-}
-
 /* Deserialize a Simplicity 'program' with its 'witness' data and execute it in the environment of the 'ix'th input of 'tx' with `taproot`.
  *
  * If at any time malloc fails then '*error' is set to 'SIMPLICITY_ERR_MALLOC' and 'false' is returned,
@@ -87,7 +46,6 @@ static bool valid_optional_bond_v2_incremental_activation_identity(
 extern bool simplicity_elements_execSimplicityWithBlockEnv( simplicity_err* error, unsigned char* ihr
                                               , const elementsTransaction* tx, uint_fast32_t ix, const elementsTapEnv* taproot
                                               , const unsigned char* genesisBlockHash
-                                              , const ecx_prior_active_root_env* ecxRoot
                                               , const rawElementsBlockEnv* blockEnv
                                               , int64_t minCost, int64_t budget
                                               , const unsigned char* amr
@@ -97,22 +55,10 @@ extern bool simplicity_elements_execSimplicityWithBlockEnv( simplicity_err* erro
   simplicity_assert(NULL != tx);
   simplicity_assert(NULL != taproot);
   simplicity_assert(NULL != genesisBlockHash);
-  simplicity_assert(NULL != ecxRoot);
   simplicity_assert(0 <= minCost);
   simplicity_assert(minCost <= budget);
   simplicity_assert(NULL != program || 0 == program_len);
   simplicity_assert(NULL != witness || 0 == witness_len);
-
-  if (!valid_optional_ecx_root(ecxRoot->present, ecxRoot->root_wire) ||
-      !valid_optional_ecx_root(ecxRoot->forced_inbox_present, ecxRoot->forced_inbox_root_wire) ||
-      !valid_optional_ecx_root(ecxRoot->deposit_inbox_present, ecxRoot->deposit_inbox_root_wire) ||
-      !valid_optional_bmm_parent(ecxRoot) ||
-      !valid_optional_bond_v2_identity(ecxRoot) ||
-      !valid_optional_bond_v2_incremental_activation_identity(ecxRoot) ||
-      !valid_optional_bond_v2_projection(ecxRoot)) {
-    *error = SIMPLICITY_ERR_DATA_OUT_OF_RANGE;
-    return true;
-  }
 
   combinator_counters census;
   dag_node* dag = NULL;
@@ -181,7 +127,7 @@ extern bool simplicity_elements_execSimplicityWithBlockEnv( simplicity_err* erro
       simplicity_free(analysis);
     }
     if (IS_OK(*error)) {
-      txEnv env = simplicity_elements_build_txEnv(tx, taproot, &genesis_hash, ecxRoot, ix,
+      txEnv env = simplicity_elements_build_txEnv(tx, taproot, &genesis_hash, ix,
                                                   blockEnv && blockEnv->bmmParentMtpPresent,
                                                   blockEnv ? blockEnv->bmmParentMtp : 0,
                                                   blockEnv && blockEnv->priorActiveBmmParentCheckpointPresent,
@@ -206,8 +152,7 @@ extern bool simplicity_elements_execSimplicity( simplicity_err* error, unsigned 
                                               , const unsigned char* amr
                                               , const unsigned char* program, size_t program_len
                                               , const unsigned char* witness, size_t witness_len) {
-  const ecx_prior_active_root_env absent = {0};
   return simplicity_elements_execSimplicityWithBlockEnv(
-      error, ihr, tx, ix, taproot, genesisBlockHash, &absent, NULL,
+      error, ihr, tx, ix, taproot, genesisBlockHash, NULL,
       minCost, budget, amr, program, program_len, witness, witness_len);
 }

@@ -10,9 +10,7 @@ To Build
 This fork additionally requires the [Haskell toolchain](#haskell-toolchain)
 below. Set it up before running `cabal update` or CMake; Ubuntu's distro Cabal
 may be too old. These requirements supplement the upstream dependencies below.
-External verifier archives also require independently trusted SHA-256 pins;
-see [verifier build integrity](verifier-build-integrity.md). An archive path
-alone is no longer sufficient, including when reconfiguring an existing build.
+This branch does not link external SP1 or USDD verifier archives.
 
 ```bash
 cmake -B build

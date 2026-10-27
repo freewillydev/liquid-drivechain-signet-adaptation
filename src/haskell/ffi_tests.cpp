@@ -503,211 +503,10 @@ static void CheckOptionalEnvironment()
     }
 }
 
-static void CheckWideArithmetic()
-{
-    // hi, lo, multiplier, divisor hi/lo, expected hi/lo, accepted.
-    const uint64_t cases[][8] = {
-        {0,0,0,0,1,0,0,1},
-        {0,7,3,0,2,0,10,1},
-        {1,0,1,0,2,0,UINT64_C(1) << 63,1},
-        {UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX,0,UINT64_MAX,1},
-        {UINT64_MAX,UINT64_MAX,1,0,1,UINT64_MAX,UINT64_MAX,1},
-        {UINT64_MAX,UINT64_MAX,2,0,1,0,0,0},
-        {0,0,0,0,0,0,0,0},
-    };
-    for (const auto& row : cases) {
-        uint64_t output[]{91,92,93,94};
-        Require(elements_haskell_muldiv128(row[0],row[1],row[2],row[3],row[4],output+1,output+2) == bool(row[7]));
-        Require(output[0] == 91 && output[3] == 94);
-        Require(output[1] == (row[7] ? row[5] : 92));
-        Require(output[2] == (row[7] ? row[6] : 93));
-        Require(!elements_haskell_muldiv128(row[0],row[1],row[2],row[3],row[4],nullptr,output));
-        Require(!elements_haskell_muldiv128(row[0],row[1],row[2],row[3],row[4],output,nullptr));
-        Require(output[0] == 91);
-    }
-}
-
-static void CheckCanonicalActivation()
-{
-    std::array<unsigned char,364> input{};
-    input[3]=1;
-    for (size_t i=0; i<10; ++i) input[4+32*i]=static_cast<unsigned char>(i+1);
-    for (size_t offset=324; offset<364; offset+=8) input[offset+7]=1;
-    Require(elements_haskell_canonical_activation(input.data(),input.size()));
-    for (const auto& pair : {std::pair{4,36},std::pair{4,100},std::pair{36,100}}) {
-        auto aliased=input;
-        std::copy_n(input.data()+pair.first,32,aliased.data()+pair.second);
-        Require(!elements_haskell_canonical_activation(aliased.data(),aliased.size()));
-    }
-    for (size_t offset=324; offset<364; offset+=8) {
-        auto zero=input;
-        zero[offset+7]=0;
-        Require(!elements_haskell_canonical_activation(zero.data(),zero.size()));
-    }
-    Require(!elements_haskell_canonical_activation(nullptr,364));
-    Require(!elements_haskell_canonical_activation(input.data(),363));
-    Require(!elements_haskell_canonical_activation(input.data(),365));
-}
-
-static uint32_t verifier_version{1}, verifier_status{0};
-static std::vector<int> verifier_calls;
-extern "C" uint32_t TestRustVersion() { verifier_calls.push_back(1); return verifier_version; }
-extern "C" uint32_t TestRustVerify(uint32_t abi, const unsigned char* annex, size_t size,
-    const unsigned char* program, size_t program_size, const unsigned char* digest, size_t digest_size)
-{
-    verifier_calls.push_back(2);
-    if (abi != 1 || size != 3 || annex[0] != 0x50 || program_size != 32 || digest_size != 32 ||
-        program[0] != 17 || digest[0] != 29) return 2;
-    return verifier_status;
-}
-
-extern "C" uint32_t TestRustIdentity(unsigned char* output, size_t size)
-{
-    verifier_calls.push_back(3);
-    if (size != 32) return 2;
-    std::fill_n(output, size, 7);
-    return verifier_status;
-}
-
-static void CheckRustStartup()
-{
-    std::array<unsigned char,32> expected;
-    expected.fill(7);
-    for (bool active : {false,true}) {
-        for (uint32_t version : {0U,1U,UINT32_MAX}) {
-            for (uint32_t status : {0U,1U,4U,UINT32_MAX}) {
-                verifier_version=version; verifier_status=status; verifier_calls.clear();
-                std::string error="stale";
-                Require(hs::VerifierIdentity(active,1,1,expected,TestRustVersion,TestRustVersion,
-                    TestRustIdentity,&error)==(!active || (version==1 && status==0)));
-                Require(verifier_calls==(active ? (version==1 ? std::vector<int>{1,1,3} :
-                    std::vector<int>{1}) : std::vector<int>{}));
-                Require(error.empty()==(!active || (version==1 && status==0)));
-            }
-        }
-    }
-    verifier_calls.clear();
-    Require(!hs::VerifierIdentity(true,1,1,expected,nullptr,TestRustVersion,TestRustIdentity,nullptr));
-    Require(!hs::VerifierIdentity(true,1,1,expected,TestRustVersion,nullptr,TestRustIdentity,nullptr));
-    Require(!hs::VerifierIdentity(true,1,1,expected,TestRustVersion,TestRustVersion,nullptr,nullptr));
-    expected.fill(0);
-    Require(!hs::VerifierIdentity(true,1,1,expected,TestRustVersion,TestRustVersion,TestRustIdentity,nullptr));
-    Require(verifier_calls.empty());
-}
-
-static void CheckRustVerifier()
-{
-    const std::array<unsigned char,3> annex{0x50,1,2};
-    const std::array<unsigned char,32> program{17}, digest{29};
-    for (uint32_t version : {0U,1U,2U}) {
-        for (uint32_t status : {0U,1U,2U,3U,4U,UINT32_MAX}) {
-            verifier_version = version; verifier_status = status; verifier_calls.clear();
-            Require(hs::VerifyJournal(TestRustVersion,TestRustVerify,annex,program,digest) ==
-                (version != 1 ? 2 : status == 0 ? 0 : 1));
-            Require(verifier_calls == (version == 1 ? std::vector<int>{1,2} : std::vector<int>{1}));
-        }
-    }
-    verifier_calls.clear();
-    Require(hs::VerifyJournal(TestRustVersion,TestRustVerify,annex,{},digest) == 1);
-    Require(hs::VerifyJournal(TestRustVersion,TestRustVerify,annex,program,{}) == 1);
-    Require(hs::VerifyJournal(nullptr,TestRustVerify,annex,program,digest) == 2);
-    Require(hs::VerifyJournal(TestRustVersion,nullptr,annex,program,digest) == 2);
-    Require(verifier_calls.empty());
-}
-
-extern "C" bool TestRustGroth16(void* context, const unsigned char* proof, size_t size,
-    const uint32_t* program, const unsigned char* digest)
-{
-    verifier_calls.push_back(3);
-    return context == nullptr && size == 2 && proof[0] == 7 && program[7] == 43 && digest[31] == 99;
-}
-
-static void CheckRustGroth16()
-{
-    const std::array<unsigned char,2> proof{7,8};
-    std::array<uint32_t,8> program{};
-    std::array<unsigned char,32> digest{};
-    program[7] = 43; digest[31] = 99;
-    verifier_calls.clear();
-    Require(hs::VerifyGroth16(TestRustGroth16,nullptr,proof.data(),proof.size(),program.data(),digest.data()));
-    digest[31] = 0;
-    Require(!hs::VerifyGroth16(TestRustGroth16,nullptr,proof.data(),proof.size(),program.data(),digest.data()));
-    Require(verifier_calls == std::vector<int>({3,3}));
-    verifier_calls.clear();
-    Require(!hs::VerifyGroth16(TestRustGroth16,&digest,proof.data(),proof.size(),program.data(),digest.data()));
-    Require(!hs::VerifyGroth16(nullptr,nullptr,proof.data(),proof.size(),program.data(),digest.data()));
-    Require(!hs::VerifyGroth16(TestRustGroth16,nullptr,nullptr,proof.size(),program.data(),digest.data()));
-    Require(!hs::VerifyGroth16(TestRustGroth16,nullptr,proof.data(),proof.size(),nullptr,digest.data()));
-    Require(!hs::VerifyGroth16(TestRustGroth16,nullptr,proof.data(),proof.size(),program.data(),nullptr));
-    Require(verifier_calls.empty());
-}
-
-extern "C" bool TestRustCustody(const unsigned char* bundle, size_t bundle_size,
-    const unsigned char* registry, size_t registry_size, const unsigned char* receipts, size_t count)
-{
-    verifier_calls.push_back(4);
-    return bundle_size == 2 && bundle[1] == 29 && registry_size == 3 && registry[2] == 53 &&
-        count == 3 && receipts[413] == 99;
-}
-
-static void CheckRustCustody()
-{
-    const std::array<unsigned char,2> bundle{17,29};
-    const std::array<unsigned char,3> registry{31,41,53};
-    std::array<unsigned char,414> receipts{};
-    receipts.back() = 99;
-    verifier_calls.clear();
-    Require(hs::VerifyCustody(TestRustCustody,bundle,registry,receipts,3));
-    receipts.back() = 0;
-    Require(!hs::VerifyCustody(TestRustCustody,bundle,registry,receipts,3));
-    Require(verifier_calls == std::vector<int>({4,4}));
-    verifier_calls.clear();
-    Require(!hs::VerifyCustody(TestRustCustody,bundle,registry,receipts,UINT64_MAX));
-    Require(!hs::VerifyCustody(TestRustCustody,bundle,registry,receipts,2));
-    Require(!hs::VerifyCustody(TestRustCustody,bundle,registry,std::span{receipts}.first(413),3));
-    Require(!hs::VerifyCustody(nullptr,bundle,registry,receipts,3));
-    Require(verifier_calls.empty());
-}
-
-extern "C" bool TestReadJetAnnex(const void* context, const unsigned char** bytes, size_t* size)
-{
-    verifier_calls.push_back(5);
-    const int mode = *static_cast<const int*>(context);
-    static const unsigned char good[]{0x50,1,2}, bad[]{0x51,1,2};
-    if (mode == 0) return false;
-    if (mode == 5) return true; // A reader that publishes nothing must fail closed.
-    *bytes = mode == 1 ? nullptr : mode == 3 ? bad : good;
-    *size = mode == 2 ? 0 : 3;
-    return true;
-}
-
-static void CheckRustJet()
-{
-    const std::array<unsigned char,32> program{17}, digest{29};
-    for (uint32_t version : {0U,1U,2U}) for (int mode = 0; mode <= 5; ++mode) {
-        for (uint32_t status : {0U,1U,4U,UINT32_MAX}) {
-            verifier_calls.clear(); verifier_version = version; verifier_status = status;
-            Require(elements_haskell_verify_jet(TestRustVersion,TestRustVerify,TestReadJetAnnex,&mode,
-                program.data(),digest.data()) == (version == 1 && mode == 4 && status == 0));
-            Require(verifier_calls == (version != 1 ? std::vector<int>{1} :
-                mode != 4 ? std::vector<int>{1,5} : std::vector<int>{1,5,2}));
-        }
-    }
-    verifier_calls.clear();
-    Require(!elements_haskell_verify_jet(TestRustVersion,TestRustVerify,nullptr,nullptr,program.data(),digest.data()));
-    Require(!elements_haskell_verify_jet(TestRustVersion,TestRustVerify,TestReadJetAnnex,nullptr,nullptr,digest.data()));
-    Require(!elements_haskell_verify_jet(nullptr,TestRustVerify,TestReadJetAnnex,nullptr,program.data(),digest.data()));
-    Require(!elements_haskell_verify_jet(TestRustVersion,nullptr,TestReadJetAnnex,nullptr,program.data(),digest.data()));
-    Require(verifier_calls.empty());
-}
-
 static void CheckStatusAdapters()
 {
     const std::vector<std::pair<std::function<void()>,const char*>> invalid{
-        {[] { hs::AdmitStandardness(static_cast<hs::StandardnessGate>(3),0); }, "Haskell standardness gate failed"},
-        {[] { hs::ContextPresence(1,0); }, "Haskell context presence evaluation failed"},
         {[] { hs::CtvAdmission(32,0); }, "Haskell CTV admission failed"},
-        {[] { hs::TaprootWitnessPolicy(false,false,0,257,0,0); }, "Haskell Taproot witness policy failed"},
         {[] { hs::BmmMessageMatches(static_cast<hs::BmmMessageKind>(2),""); }, "Haskell BMM duplicate request classification failed"},
     };
     for (const auto& [call,message] : invalid) {
@@ -716,12 +515,6 @@ static void CheckStatusAdapters()
         catch (const std::runtime_error& error) { failed=true; Require(std::string(error.what())==message); }
         Require(failed);
     }
-    Require(!hs::AdmitStandardness(hs::StandardnessGate::ANNEX_NETWORK,0));
-    Require(hs::AdmitStandardness(hs::StandardnessGate::ANNEX_NETWORK,7));
-    Require(hs::ContextPresence(0,2)==0 && hs::ContextPresence(2,2)==1 && hs::ContextPresence(1,2)==2);
-    Require(hs::TaprootWitnessPolicy(false,false,2,0xc4,0,0)==1);
-    Require(!hs::TransactionWeight(false,1,2,400000,1500000));
-    Require(!hs::BondMarkerPolicy(false,{}));
 }
 
 static void IdentityProfiles()
@@ -739,65 +532,6 @@ static void IdentityProfiles()
             std::string(size, 'x'), "proposal syntax", "proposal value"); }
         catch (const std::runtime_error& e) { rejected = std::string(e.what()) == "proposal syntax"; }
         Require(rejected);
-    }
-    for (bool availability : {false,true}) {
-        std::vector<unsigned char> expected(availability ? 32 : 16,3);
-        std::vector<unsigned char> valid(availability ? 71 : 178,2);
-        if (availability) { valid[0]=1; std::copy(expected.begin(),expected.end(),valid.begin()+1); valid[65]=3; valid[66]=5; WriteBE32(valid.data()+67,16777216); }
-        else { valid[0]=5; valid[1]=3; std::copy(expected.begin(),expected.end(),valid.begin()+34); }
-        const auto check=[&](const std::vector<unsigned char>& bytes) {
-            const auto nonzero=[&](size_t offset) { return std::any_of(bytes.begin()+offset,bytes.begin()+offset+32,[](auto b) { return b!=0; }); };
-            const bool accepted=availability ? bytes[0]==1 && nonzero(1) && nonzero(33) &&
-                std::equal(expected.begin(),expected.end(),bytes.begin()+1) && bytes[65]==3 && bytes[66]==5 && ReadBE32(bytes.data()+67)==16777216 :
-                (bytes[0]==5 || bytes[0]==6) && bytes[1]==3 && std::equal(expected.begin(),expected.end(),bytes.begin()+34) &&
-                nonzero(2) && nonzero(50) && nonzero(82) && nonzero(114) && nonzero(146);
-            std::vector<unsigned char> output(availability ? 64 : 161,0xa5);
-            const int actual=elements_hs_exchange_frozen_profile_v1(availability ? 5 : 4,0,bytes.size(),
-                const_cast<unsigned char*>(bytes.data()),expected.data(),output.data());
-            Require(actual==(accepted ? 0 : 1));
-            std::vector<unsigned char> wanted(output.size(),0xa5);
-            if (accepted && availability) std::copy_n(bytes.begin()+1,64,wanted.begin());
-            if (accepted && !availability) { wanted[0]=bytes[0]; std::copy_n(bytes.begin()+2,32,wanted.begin()+1); std::copy_n(bytes.begin()+50,128,wanted.begin()+33); }
-            Require(output==wanted);
-        };
-        check(valid);
-        for (size_t offset=0;offset<valid.size();++offset) for (unsigned byte : {0U,1U,3U,5U,6U,255U}) { auto bytes=valid; bytes[offset]=byte; check(bytes); }
-        const std::vector<size_t> offsets=availability ? std::vector<size_t>{1,33} : std::vector<size_t>{2,50,82,114,146};
-        for (size_t offset : offsets) { auto bytes=valid; std::fill_n(bytes.begin()+offset,32,0); check(bytes); }
-        expected[0]^=1; check(valid);
-    }
-}
-
-static void MatcherAccumulatorProfiles()
-{
-    for (bool matcher : {false,true}) {
-        std::vector<unsigned char> valid(matcher ? 85 : 100,1);
-        if (matcher) { WriteBE64(valid.data()+41,0); WriteBE32(valid.data()+81,6); }
-        else { std::fill_n(valid.begin()+32,32,2); WriteBE32(valid.data()+96,64); }
-        const auto check=[&](const std::vector<unsigned char>& bytes) {
-            for (bool signer : {false,true}) {
-                const auto nonzero=[&](size_t offset) { return std::any_of(bytes.begin()+offset,bytes.begin()+offset+32,[](auto b) { return b!=0; }); };
-                const bool accepted=matcher ? bytes[0]==1 && signer && ReadBE64(bytes.data()+41)!=UINT64_MAX && nonzero(49) && ReadBE32(bytes.data()+81)==6 :
-                    nonzero(0) && nonzero(32) && nonzero(64) && !std::equal(bytes.begin(),bytes.begin()+32,bytes.begin()+32) &&
-                    ReadBE32(bytes.data()+96)>0 && ReadBE32(bytes.data()+96)<=64;
-                std::vector<unsigned char> output(matcher ? 32 : 96,0xa5);
-                const int actual=elements_hs_exchange_frozen_profile_v1(matcher ? 6 : 7,matcher && signer,bytes.size(),
-                    const_cast<unsigned char*>(bytes.data()),nullptr,output.data());
-                Require(actual==(accepted ? 0 : 1));
-                std::vector<unsigned char> wanted(output.size(),0xa5);
-                if (accepted) std::copy_n(bytes.begin()+(matcher ? 49 : 0),output.size(),wanted.begin());
-                Require(output==wanted);
-            }
-        };
-        check(valid);
-        for (size_t offset=0;offset<valid.size();++offset) for (unsigned byte : {0U,1U,6U,64U,65U,255U}) { auto bytes=valid; bytes[offset]=byte; check(bytes); }
-        for (size_t offset : matcher ? std::vector<size_t>{49} : std::vector<size_t>{0,32,64}) {
-            auto bytes=valid; std::fill_n(bytes.begin()+offset,32,0); check(bytes);
-        }
-        auto bytes=valid;
-        if (matcher) std::fill_n(bytes.begin()+41,8,255);
-        else std::copy_n(bytes.begin(),32,bytes.begin()+32);
-        check(bytes);
     }
 }
 
@@ -1775,28 +1509,6 @@ static void CheckBmmHeaderPolicy()
     }
 }
 
-void CheckAnchorReentry()
-{
-    std::array<std::byte,145> anchor{};
-    for (size_t offset : {0,1,33,65,133}) anchor[offset] = std::byte{1};
-    anchor[97] = std::byte{2};
-    const auto owner = std::this_thread::get_id();
-    std::vector<uint32_t> seen;
-    std::string error;
-    Require(hs::ExchangeGenesisInitialization(0,[&](uint32_t step) {
-        Require(std::this_thread::get_id()==owner);
-        seen.push_back(step);
-        return hs::AnchorRule(anchor);
-    },error));
-    Require(seen==std::vector<uint32_t>({0,1,2,3,4,19}));
-    anchor[0] = std::byte{0};
-    seen.clear();
-    Require(!hs::ExchangeGenesisInitialization(0,[&](uint32_t step) {
-        seen.push_back(step);
-        return hs::AnchorRule(anchor);
-    },error));
-    Require(seen==std::vector<uint32_t>({0}));
-}
 
 int main()
 {
@@ -1858,20 +1570,12 @@ int main()
         Require(sigaction(SIGINT, nullptr, &after) == 0);
         Require(before.sa_handler == after.sa_handler);
         CheckStatusAdapters();
-        CheckWideArithmetic();
         CheckOptionalEnvironment();
-        CheckCanonicalActivation();
-        CheckRustVerifier();
-        CheckRustStartup();
-        CheckRustGroth16();
-        CheckRustCustody();
-        CheckRustJet();
         CheckStoreRunner();
         CheckPredicateRunner();
         CheckBmmStateRunner();
         CheckBmmProofRunner();
         CheckPegReadRunner();
-        CheckAnchorReentry();
         CheckParentPrelude();
         CheckParentBlock();
         CheckDepositConstruction();
@@ -2016,7 +1720,6 @@ int main()
         catch (const std::runtime_error&) { fault = true; }
         Require(fault);
         IdentityProfiles();
-        MatcherAccumulatorProfiles();
         for (bool deferred : {false,true}) for (bool per_asset : {false,true}) for (bool explicit_asset : {false,true}) {
             const auto expected = deferred ? hs::OutputTotalMode::DEFERRED : !per_asset ? hs::OutputTotalMode::AGGREGATE :
                 explicit_asset ? hs::OutputTotalMode::PER_ASSET : hs::OutputTotalMode::REJECT;

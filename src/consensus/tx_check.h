@@ -15,12 +15,6 @@
 class CTransaction;
 class TxValidationState;
 
-// Per-asset totals are opt-in; callers without authenticated activation context
-// retain historical aggregate validation.
 bool CheckTransaction(const CTransaction& tx, TxValidationState& state);
-bool CheckTransaction(const CTransaction& tx, TxValidationState& state, bool explicit_asset_totals);
-// Only for height-independent block screening. Full totals must be checked
-// again with authenticated height in ContextualCheckBlock and ConnectBlock.
-bool CheckTransactionWithoutAggregateTotals(const CTransaction& tx, TxValidationState& state);
 
 #endif // BITCOIN_CONSENSUS_TX_CHECK_H

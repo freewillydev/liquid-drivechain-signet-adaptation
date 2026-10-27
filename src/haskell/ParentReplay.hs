@@ -1055,11 +1055,17 @@ instance Validation RequiredPairFlow where
 -- Ordered by the ReplayStoreFlow ABI; invalid kinds never authorize actions.
 storeMaximum :: Word32 -> Int32
 storeMaximum kind
-  | kind == 129 = -1 -- Retired inherited genesis connection workflow.
+  | retiredStoreKind kind = -1
   | kind == 183 = -1 -- Superseded by the typed BMM submission workflow.
   | kind >= 198 && kind <= 200 = -1 -- Retired LWK dialog.
   | kind >= fromIntegral (length storeBounds) = -1
   | otherwise = storeBounds !! fromIntegral kind
+
+-- Keep native workflow numbers stable, but never dispatch removed feature slots.
+retiredStoreKind :: Word32 -> Bool
+retiredStoreKind kind = kind `elem`
+  ([129..131] ++ [149..176] ++ [188,189,209,212,217,246,247] ++ [249..255] ++
+   [259,261,262,263,266,269,271,272,274,276,289,290,292,293,295,323,326])
 
 storeBounds :: [Int32]
 storeBounds =
@@ -1107,7 +1113,7 @@ instance Validation StartupBundleFlow where
     [(1,(6,2)),(2,(4,3)),(3,(-1,4)),(4,(-1,5)),(5,(-1,-10)),(6,(-1,-10))]
 
 data BlockValidationStage = ContextualHeader | ContextualOutputs | CandidateSelfCheck
-  | BranchChoice | StartupReconcile | ExchangeParent | FinalBmm | BmmFailure deriving (Eq, Show)
+  | BranchChoice | StartupReconcile | FinalBmm | BmmFailure deriving (Eq, Show)
 data BlockValidationFlow = BlockValidationFlow BlockValidationStage Word32 Word32
 instance Validation BlockValidationFlow where
   type ValidationResult BlockValidationFlow = Int32
@@ -1118,7 +1124,6 @@ instance Validation BlockValidationFlow where
       (5,(6,9)),(6,(9,7)),(7,(-10,8)),(8,(-1,9)),(9,(-10,-11))]
     BranchChoice -> [(1,(3,2)),(2,(-10,-11)),(3,(-10,-11))]
     StartupReconcile -> [(1,(2,3)),(2,(-10,-1)),(3,(-1,4)),(4,(-10,5)),(5,(-11,6)),(6,(-10,-1))]
-    ExchangeParent -> [(1,(-10,2)),(2,(3,4)),(3,(-10,4)),(4,(-10,5)),(5,(-10,6)),(6,(-1,-10))]
     FinalBmm -> [(1,(-11,2)),(2,(-11,3)),(3,(4,5)),(4,(-10,-1)),
       (5,(7,6)),(6,(-10,-1)),(7,(8,-11)),(8,(-1,-12))]
     BmmFailure -> [(1,(3,2)),(2,(-10,-1)),(3,(5,4)),(4,(-10,-1)),(5,(-10,-1))]
@@ -1207,13 +1212,6 @@ instance Validation IndexContinuityFlow where
      (6,(9,7)),(7,(9,8)),(8,(12,10)),(9,(-1,-11)),(10,(11,12)),
      (11,(-1,-11)),(12,(-1,1))]
 
-data IndexCapitalFlow = IndexCapitalFlow Word32 Word32
-instance Validation IndexCapitalFlow where
-  type ValidationResult IndexCapitalFlow = Int32
-  validate (IndexCapitalFlow phase result) = transition phase result
-    [(1,(-1,2)),(2,(12,3)),(3,(12,4)),(4,(12,5)),(5,(6,7)),(6,(-1,-11)),
-     (7,(10,8)),(8,(10,9)),(9,(10,11)),(10,(-1,-11)),(11,(-1,2)),(12,(-1,-10))]
-
 commitmentBytes :: Word32 -> [Word8] -> [Word8]
 commitmentBytes 0 bytes | length bytes == 37 = reverse (drop 5 bytes)
 commitmentBytes 1 bytes | length bytes == 32 = bytes
@@ -1261,6 +1259,7 @@ data Record = Record Word32 Word32 Int64 Word64 Word64 | TipFlow Word32 Word32
 instance Validation Record where
   type ValidationResult Record = Int32
   validate (StoreFlow kind phase result) = case (kind,phase) of
+    _ | retiredStoreKind kind -> -1
     (328,_) -> transition phase result
       [(1,(-10,4)),(4,(-10,5)),(5,(-10,7)),(7,(-10,8)),(8,(-10,-11))]
     (327,_) -> transition phase result
@@ -1286,7 +1285,7 @@ instance Validation Record where
       [(1,(4,2)),(2,(-11,3)),(3,(-11,4)),(4,(-12,5)),
        (5,(-12,6)),(6,(-12,7)),(7,(-12,8)),(8,(-12,-10))]
     (219,_) -> transition phase result
-      [(1,(16,2)),(2,(16,3)),(3,(5,4)),(4,(16,5)),(5,(17,6)),(6,(17,7)),
+      [(1,(16,2)),(2,(16,3)),(3,(7,4)),(4,(16,7)),
        (7,(-1,8)),(8,(18,9)),(9,(-1,10)),(10,(-1,11)),(11,(19,12)),
        (12,(19,13)),(13,(19,14)),(14,(19,15)),(15,(19,-10))]
     (k,0) | k<=128 -> if k==61 then 2 else 1

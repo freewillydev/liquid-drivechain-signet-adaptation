@@ -1,5 +1,4 @@
 #include <simplicity/elements/env.h>
-#include <haskell/simplicity_ffi.h>
 
 #include <stdalign.h>
 #include <stddef.h>
@@ -102,34 +101,6 @@ static void copyInput(sigInput* result, const rawElementsInput* input) {
     result->issuance.assetId = simplicity_calculateAsset(&result->issuance.entropy);
     result->issuance.tokenId = simplicity_calculateToken(&result->issuance.entropy, result->issuance.assetAmt.prefix);
   }
-}
-
-/* Return true when `fullAnnex` is a bounded, exact serialization of `annex`.
- *
- * The released Simplicity environment historically receives the annex body
- * without its 0x50 Taproot tag.  Retaining exact bytes is deliberately an
- * additive operation: malformed optional full-annex data never changes the
- * legacy hash or transaction-environment construction.
- */
-static bool canCopyFullAnnex(const rawElementsInput* input) {
-  if (!input->annex || !input->fullAnnex) return false;
-  return elements_haskell_annex_retention(input->fullAnnex->len, input->annex->len,
-    input->fullAnnex->buf, input->annex->buf);
-}
-
-/* Sum the bytes that will be retained, rejecting only allocation arithmetic
- * overflow.  Whether a particular optional full annex is retained is decided
- * by canCopyFullAnnex and never affects legacy annex processing.
- */
-static bool countFullAnnexBytes(size_t* result, const rawElementsTransaction* rawTx) {
-  *result = 0;
-  for (uint_fast32_t i = 0; i < rawTx->numInputs; ++i) {
-    if (canCopyFullAnnex(&rawTx->input[i])) {
-      if (SIZE_MAX - *result < rawTx->input[i].fullAnnex->len) return false;
-      *result += rawTx->input[i].fullAnnex->len;
-    }
-  }
-  return true;
 }
 
 /* As specified in https://github.com/ElementsProject/elements/blob/de942511a67c3a3fcbdf002a8ee7e9ba49679b78/src/primitives/transaction.h#L304-L307. */
@@ -383,21 +354,6 @@ extern elementsTransaction* simplicity_elements_mallocTransaction(const rawEleme
   if (SIZE_MAX - allocationSize < totalNullDataCodes * sizeof(opcode)) return NULL;
   allocationSize += (size_t)totalNullDataCodes * sizeof(opcode);
 
-  size_t totalAnnexBytes = 0;
-  for (uint_fast32_t i = 0; i < rawTx->numInputs; ++i) {
-    if (rawTx->input[i].annex) {
-      if (SIZE_MAX - totalAnnexBytes < rawTx->input[i].annex->len) return NULL;
-      totalAnnexBytes += rawTx->input[i].annex->len;
-    }
-  }
-  if (SIZE_MAX - allocationSize < totalAnnexBytes) return NULL;
-  allocationSize += totalAnnexBytes;
-
-  size_t totalFullAnnexBytes;
-  if (!countFullAnnexBytes(&totalFullAnnexBytes, rawTx)) return NULL;
-  if (SIZE_MAX - allocationSize < totalFullAnnexBytes) return NULL;
-  allocationSize += totalFullAnnexBytes;
-
   char *allocation = simplicity_malloc(allocationSize);
   if (!allocation) return NULL;
 
@@ -418,12 +374,6 @@ extern elementsTransaction* simplicity_elements_mallocTransaction(const rawEleme
 
   opcode* ops = (opcode*)(void*)allocation;
   size_t opsLen = (size_t)totalNullDataCodes;
-  allocation += (size_t)totalNullDataCodes * sizeof(opcode);
-  unsigned char* annexBytes = (unsigned char*)(void*)allocation;
-  allocation += totalAnnexBytes;
-
-  unsigned char* fullAnnexAllocation = (unsigned char*)allocation;
-  size_t fullAnnexAllocationLen = totalFullAnnexBytes;
 
   /* In C++ an assignment from (sigOutput**) to (const sigOutput * const *) is allowed,
      but C forgoes the complicated specification of C++.  Therefore we must make an explicit cast of feeOutputs in C.
@@ -456,22 +406,6 @@ extern elementsTransaction* simplicity_elements_mallocTransaction(const rawEleme
     sha256_context ctx_issuancesHash = sha256_init(tx->issuancesHash.s);
     for (uint_fast32_t i = 0; i < tx->numInputs; ++i) {
       copyInput(&input[i], &rawTx->input[i]);
-      if (rawTx->input[i].annex) {
-        input[i].annex = annexBytes;
-        input[i].annexLen = rawTx->input[i].annex->len;
-        memcpy(annexBytes, rawTx->input[i].annex->buf, input[i].annexLen);
-        annexBytes += input[i].annexLen;
-      }
-      if (canCopyFullAnnex(&rawTx->input[i])) {
-        const uint_fast32_t fullAnnexLen = rawTx->input[i].fullAnnex->len;
-        simplicity_assert(fullAnnexLen <= fullAnnexAllocationLen);
-        memcpy(fullAnnexAllocation, rawTx->input[i].fullAnnex->buf, fullAnnexLen);
-        input[i].fullAnnex = fullAnnexAllocation;
-        input[i].fullAnnexLen = fullAnnexLen;
-        input[i].hasFullAnnex = true;
-        fullAnnexAllocation += fullAnnexLen;
-        fullAnnexAllocationLen -= fullAnnexLen;
-      }
       if (input[i].sequence < 0xffffffff) { tx->isFinal = false; }
       if (input[i].sequence < 0x80000000) {
         const uint_fast16_t maskedSequence = input[i].sequence & 0xffff;
@@ -525,7 +459,6 @@ extern elementsTransaction* simplicity_elements_mallocTransaction(const rawEleme
       sha256_hash(&ctx_issuanceRangeProofsHash, &input[i].issuance.assetRangeProofHash);
       sha256_hash(&ctx_issuanceRangeProofsHash, &input[i].issuance.tokenRangeProofHash);
     }
-    simplicity_assert(0 == fullAnnexAllocationLen);
     sha256_finalize(&ctx_inputOutpointsHash);
     sha256_finalize(&ctx_inputAssetAmountsHash);
     sha256_finalize(&ctx_inputScriptsHash);
@@ -640,19 +573,6 @@ extern elementsTransaction* simplicity_elements_mallocTransaction(const rawEleme
  */
 extern void simplicity_elements_freeTransaction(elementsTransaction* tx) {
   simplicity_free(tx);
-}
-
-extern bool simplicity_elements_getInputFullAnnex(const elementsTransaction* tx, uint32_t inputIndex,
-                                                  rawElementsBuffer* annex) {
-  if (!annex) return false;
-  *annex = (rawElementsBuffer){0};
-  if (!tx || tx->numInputs <= inputIndex || !tx->input[inputIndex].hasFullAnnex) return false;
-
-  simplicity_assert(tx->input[inputIndex].fullAnnex);
-  simplicity_assert(tx->input[inputIndex].fullAnnexLen <= SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE);
-  annex->buf = tx->input[inputIndex].fullAnnex;
-  annex->len = (uint32_t)tx->input[inputIndex].fullAnnexLen;
-  return true;
 }
 
 /* Allocate and initialize a 'elementsTapEnv' from a 'rawElementsTapEnv', copying or hashing the data as needed.

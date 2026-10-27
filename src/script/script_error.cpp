@@ -136,24 +136,6 @@ std::string ScriptErrorString(const ScriptError serror)
             return "EC scalar mult verify fail";
         case SCRIPT_ERR_SIMPLICITY_WRONG_LENGTH:
             return "Simplicity witness has incorrect length";
-        case SCRIPT_ERR_USDD_SP1_ANNEX:
-            return "Malformed or unsupported USDD SP1 proof annex";
-        case SCRIPT_ERR_USDD_SP1_WRONG_CONTROLLER_CMR:
-            return "USDD SP1 proof annex used by an unrecognized controller";
-        case SCRIPT_ERR_USDD_SP1_WRONG_GUEST_PROGRAM_ID:
-            return "USDD SP1 proof annex names an unrecognized guest program";
-        case SCRIPT_ERR_USDD_SP1_MALFORMED_PUBLIC_VALUES:
-            return "USDD SP1 proof annex lacks a canonical inbound strict-journal identity";
-        case SCRIPT_ERR_USDD_SP1_DEPLOYMENT_UNCONFIGURED:
-            return "USDD SP1 canonical deployment domain is not configured";
-        case SCRIPT_ERR_USDD_SP1_WRONG_INBOUND_MINT_DOMAIN:
-            return "USDD SP1 proof annex authenticates a noncanonical deployment domain";
-        case SCRIPT_ERR_USDD_BMM_CONTEXT_MISSING:
-            return "USDD proof evaluation requires authenticated BIP301 parent context";
-        case SCRIPT_ERR_USDD_SP1_VERIFIER_UNAVAILABLE:
-            return "USDD SP1 verifier is unavailable or incompatible; proof rejected fail-closed";
-        case SCRIPT_ERR_USDD_SP1_BUDGET:
-            return "USDD SP1 proof witness exceeds the reserved proof-transaction budget lane";
         case SCRIPT_ERR_SIMPLICITY_DATA_OUT_OF_RANGE:
             return SIMPLICITY_ERR_MSG(SIMPLICITY_ERR_DATA_OUT_OF_RANGE);
         case SCRIPT_ERR_SIMPLICITY_DATA_OUT_OF_ORDER:

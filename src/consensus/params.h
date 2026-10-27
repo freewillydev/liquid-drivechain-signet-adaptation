@@ -174,9 +174,6 @@ struct Params {
     uint256 parentChainPowLimit;
     uint32_t pegin_min_depth;
     /** Negative disables explicit-only creation; activation must be release-pinned. */
-    int explicit_only_height{-1};
-    bool ExplicitOnlyConfigured() const;
-    bool ExplicitOnlyActive(int height) const;
     CScript parent_chain_signblockscript;
     /** BIP325 challenge when the parent is Signet, empty for non-Signet parents. */
     std::vector<uint8_t> parent_signet_challenge;
@@ -242,8 +239,6 @@ struct Params {
      */
     bool drivechain_m6_withdrawal_validation{false};
     bool DrivechainWithdrawalValidationEnabled() const;
-    /** Apply the fail-closed USDD SP1 annex envelope rules to Simplicity spends. */
-    bool enable_usdd_sp1_annex = false;
 };
 
 } // namespace Consensus

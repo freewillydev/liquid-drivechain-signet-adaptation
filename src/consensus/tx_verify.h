@@ -22,10 +22,6 @@ class COutPoint;
 /** Transaction validation functions */
 
 namespace Consensus {
-/** Explicit-only creation policy. Historical input commitments remain valid
- * inputs and must still undergo normal balance, proof and script validation.
- * Caller is responsible for the consensus activation-height gate. */
-bool HasOnlyExplicitCreations(const CTransaction& tx);
 /**
  * Check whether all inputs of this transaction are valid (no double spends and amounts)
  * This does not modify the UTXO set. This does not check scripts and sigs.

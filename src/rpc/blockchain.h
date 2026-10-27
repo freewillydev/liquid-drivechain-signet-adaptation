@@ -29,7 +29,6 @@ struct NodeContext;
 static constexpr int NUM_GETBLOCKSTATS_PERCENTILES = 5;
 
 //! Encode a big-endian 128-bit ECX integer as an exact JSON number.
-UniValue EcxWideNumberToJSON(std::span<const unsigned char,16> bytes, bool signed_value = false);
 
 /**
  * Get the difficulty of the net wrt to the given block index.

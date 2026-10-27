@@ -13,7 +13,6 @@
 bool g_con_blockheightinheader = false;
 bool g_signed_blocks = false;
 bool g_con_utreexo = false;
-bool g_con_ecx_swap_v3 = false;
 
 std::string CProof::ToString() const
 {
@@ -24,18 +23,16 @@ std::string CProof::ToString() const
 CBlockHeader::HeaderLayout CBlockHeader::GetLayout(int32_t version, bool withdrawal, bool dynamic, bool reading, bool critical)
 {
     static_assert(DYNAFED_HF_MASK == 0x80000000U && WITHDRAWAL_BUNDLE_HF_MASK == 0x40000000U &&
-        BMM_PROOF_HF_MASK == (1U << 20) && EXCHANGE_STATE_HF_MASK == (1U << 19) &&
-        FORCED_INBOX_HF_MASK == (1U << 18) && DEPOSIT_INBOX_HF_MASK == (1U << 17) && INBOX_CURSOR_HF_MASK == (1U << 16));
+        BMM_PROOF_HF_MASK == (1U << 20));
     const auto layout = drivechain::haskell::BmmHeaderLayout(static_cast<uint32_t>(version),
-        uint32_t(g_con_elementsmode) | (reading << 1) | (withdrawal << 2) | (dynamic << 3) | (critical << 5) | (g_con_ecx_swap_v3 << 6));
+        uint32_t(g_con_elementsmode) | (reading << 1) | (withdrawal << 2) | (dynamic << 3) | (critical << 5));
     const auto fields = layout[1];
-    return {static_cast<int32_t>(layout[0]), bool(fields & 1), bool(fields & 2), bool(fields & 4),
-        bool(fields & 8), bool(fields & 16), bool(fields & 32), bool(fields & 64), bool(fields & 128), bool(fields & 256), bool(fields & 512)};
+    return {static_cast<int32_t>(layout[0]), bool(fields & 1), bool(fields & 2), bool(fields & 64), bool(fields & 256)};
 }
 
 uint32_t CBlockHeader::GetRawExtensionFlags() const
 {
-    return drivechain::haskell::BmmHeaderLayout(static_cast<uint32_t>(nVersion),16 | (g_con_ecx_swap_v3 << 6))[1];
+    return drivechain::haskell::BmmHeaderLayout(static_cast<uint32_t>(nVersion),16)[1];
 }
 
 // ELEMENTS: GetHash manually implemented for CBlockHeader.
@@ -44,8 +41,7 @@ uint32_t CBlockHeader::GetRawExtensionFlags() const
 uint256 CBlockHeader::ComputeHash(bool critical) const
 {
     HashWriter s{};
-    const auto [nVersion, has_withdrawal_bundle_hash, has_bmm_proof, has_exchange_state,
-        has_forced_inbox, has_deposit_inbox, has_inbox_cursors, is_dyna, has_parent_height, zero_bmm, has_swap_forced] =
+    const auto [nVersion, has_withdrawal_bundle_hash, has_bmm_proof, is_dyna, zero_bmm] =
         GetLayout(this->nVersion, !hashWithdrawalBundle.IsNull(), !m_dynafed_params.IsNull(), false, critical);
     s << (nVersion);
     s << hashPrevBlock;
@@ -68,16 +64,6 @@ uint256 CBlockHeader::ComputeHash(bool critical) const
             s << nNonce;
         }
     }
-    if (has_exchange_state) s << hashExchangeStateRoot;
-    if (has_forced_inbox) s << hashForcedInboxRoot;
-    if (has_deposit_inbox) s << hashDepositInboxRoot;
-    if (has_parent_height) s << ecxParentHeight;
-    if (has_inbox_cursors) {
-        s << forcedProcessedCursor;
-        s << depositProcessedCursor;
-        s << sourceBacklogOldestParentHeight;
-    }
-    if (has_swap_forced) s << swapForcedState;
     if (HasUtreexo()) s << utreexo;
     return s.GetHash();
 }
@@ -88,7 +74,7 @@ uint256 CBlockHeader::GetBmmCriticalHash() const { return ComputeHash(true); }
 std::string CBlock::ToString() const
 {
     std::stringstream s;
-    s << strprintf("CBlock(hash=%s, critical=%s, ver=0x%08x, hashPrevBlock=%s, hashMerkleRoot=%s, hashWithdrawalBundle=%s, hashBmmProof=%s, hashExchangeStateRoot=%s, hashForcedInboxRoot=%s, hashDepositInboxRoot=%s, ecxParentHeight=%u, forcedProcessedCursor=%llu, depositProcessedCursor=%llu, sourceBacklogOldestParentHeight=%llu, nTime=%u, nBits=%08x, nNonce=%u, proof=%u, vtx=%u)\n",
+    s << strprintf("CBlock(hash=%s, critical=%s, ver=0x%08x, hashPrevBlock=%s, hashMerkleRoot=%s, hashWithdrawalBundle=%s, hashBmmProof=%s, nTime=%u, nBits=%08x, nNonce=%u, proof=%u, vtx=%u)\n",
         GetHash().ToString(),
         GetBmmCriticalHash().ToString(),
         nVersion,
@@ -96,13 +82,6 @@ std::string CBlock::ToString() const
         hashMerkleRoot.ToString(),
         hashWithdrawalBundle.ToString(),
         hashBmmProof.ToString(),
-        hashExchangeStateRoot.ToString(),
-        hashForcedInboxRoot.ToString(),
-        hashDepositInboxRoot.ToString(),
-        ecxParentHeight,
-        static_cast<unsigned long long>(forcedProcessedCursor),
-        static_cast<unsigned long long>(depositProcessedCursor),
-        static_cast<unsigned long long>(sourceBacklogOldestParentHeight),
         nTime, nBits, nNonce, proof.ToString(),
         vtx.size());
     for (const auto& tx : vtx) {

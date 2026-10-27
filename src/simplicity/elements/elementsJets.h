@@ -5,9 +5,6 @@
 
 #include "../jets.h"
 
-#ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
-#include "ecxElementsJets.h.inc"
-#endif
 
 /* Jets for the Elements application of Simplicity. */
 bool simplicity_version(frameItem* dst, frameItem src, const txEnv* env);
@@ -39,46 +36,6 @@ bool simplicity_output_surjection_proof(frameItem* dst, frameItem src, const txE
 bool simplicity_output_range_proof(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_total_fee(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_genesis_block_hash(frameItem* dst, frameItem src, const txEnv* env);
-#ifndef ECX_SIMPLICITY_CATALOGUE_FROZEN
-bool simplicity_prior_active_exchange_state_root_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_prior_active_forced_inbox_root_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_prior_active_deposit_inbox_root_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_prior_active_forced_processed_cursor_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_prior_active_deposit_processed_cursor_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_current_bmm_parent_block_hash_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_current_bmm_parent_height_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_current_bmm_parent_mtp_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_bond_v2_configuration_hash_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_bond_v2_asset_id_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_bond_v2_deployment_commitment_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_bond_v2_transition_cmr_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_bond_v2_incremental_activation_cmr_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_incremental_successor_transition_cmr_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_prior_active_bond_inbox_root_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_prior_active_bond_inbox_count_required(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_current_sidechain_height_required(frameItem* dst, frameItem src, const txEnv* env);
-/** TWO^32 |- ONE. Fail unless the supplied index is the current input, index
- * >= 2, non-pegin/nonissuance, and uses the frozen insurance-reserve script.
- * N-to-M confidential reserve conservation remains in the txid-bound proof
- * and Elements CT kernel. Catalogue decoding is independently opt-in. */
-bool simplicity_bond_v2_insurance_reserve_input_required(
-  frameItem* dst,
-  frameItem src,
-  const txEnv* env);
-/** TWO^32 |- ONE. Same authenticated per-current-input role check for the
- * frozen confidential trader-collateral vault. */
-bool simplicity_bond_v2_collateral_vault_input_required(
-  frameItem* dst,
-  frameItem src,
-  const txEnv* env);
-bool simplicity_verify_sp1_groth16_sha256(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_verify_sp1_groth16_v3_public_values_v4_sha256(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_verify_sp1_groth16_v4_public_values_v5_sha256(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_verify_sp1_groth16_v5_incremental_activation_sha256(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_verify_sp1_groth16_v6_incremental_successor_sha256(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_verify_sp1_groth16_v7_swap_successor_sha256(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_verify_sp1_groth16_v8_custody_successor_sha256(frameItem* dst, frameItem src, const txEnv* env);
-#endif
 bool simplicity_script_cmr(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_transaction_id(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_current_index(frameItem* dst, frameItem src, const txEnv* env);
@@ -86,7 +43,6 @@ bool simplicity_current_bmm_parent_mtp(frameItem* dst, frameItem src, const txEn
 bool simplicity_native_current_bmm_parent_mtp_required(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_prior_active_bmm_parent_checkpoint_required(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_issuance_is_none(frameItem* dst, frameItem src, const txEnv* env);
-bool simplicity_verify_sp1_compressed_sha256(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_current_pegin(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_current_prev_outpoint(frameItem* dst, frameItem src, const txEnv* env);
 bool simplicity_current_asset(frameItem* dst, frameItem src, const txEnv* env);

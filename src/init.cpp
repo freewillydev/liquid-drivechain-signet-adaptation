@@ -63,7 +63,6 @@
 #include <node/context.h>
 #include <node/drivechain_deposits.h>
 #include <node/drivechain_withdrawal_bundle.h>
-#include <node/ecx_deployment_identity.h>
 #include <node/interface_ui.h>
 #include <node/kernel_notifications.h>
 #include <node/mempool_args.h>
@@ -107,8 +106,6 @@
 #include <util/threadnames.h>
 #include <util/time.h>
 #include <util/translation.h>
-#include <usdd_sp1_verifier_identity.h>
-#include <usdd_withdrawal_accumulator.h>
 #include <validation.h>
 #include <validationinterface.h>
 #include <walletinitinterface.h>
@@ -876,8 +873,6 @@ static bool MineNativeBlockForParentBlock(NodeContext& node, const int64_t paren
     CAmount sidechain_fees{0};
     std::unique_ptr<CBlockTemplate> block_template;
     uint256 sidechain_block_hash,critical_hash;
-    std::optional<usdd::WithdrawalAccumulatorState> previous_withdrawal_accumulator;
-    std::string checkpoint_error;
     return drivechain::haskell::BmmProduction(/*ecx=*/false,[&](uint32_t stage) {
     switch (stage) {
     case 1: return configured_slot.has_value();
@@ -904,35 +899,21 @@ static bool MineNativeBlockForParentBlock(NodeContext& node, const int64_t paren
     LOCK(cs_main);
     const CBlockIndex* predecessor = node.chainman->m_blockman.LookupBlockIndex(block_template->block.hashPrevBlock);
     const bool current = predecessor && node.chainman->ActiveChain().Tip() == predecessor;
-    if (current) previous_withdrawal_accumulator = predecessor->m_usdd_withdrawal_accumulator;
+    if (current) critical_hash = sidechain_block_hash;
     return current;
-    }
-    case 11: return previous_withdrawal_accumulator.has_value();
-    case 12: {
-    usdd::WithdrawalAccumulatorState next_withdrawal_accumulator;
-    return usdd::DeriveWithdrawalBip301CriticalHash(
-            block_template->block, Params().GetConsensus().hashGenesisBlock,
-            static_cast<uint8_t>(*configured_slot),
-            *previous_withdrawal_accumulator, next_withdrawal_accumulator,
-            critical_hash, &checkpoint_error);
     }
     case 7: return SubmitNativeDrivechainBmm(node, *configured_slot, parent_height, parent_hash, critical_hash, sidechain_fees);
     case 8: return WaitForDrivechainBmmCommitment(node,critical_hash,parent_hash,*configured_slot);
     case 9: return AcceptPreparedDrivechainBlock(*node.chainman,block_template->block);
     case 10:
-    LogPrintf("drivechain L1 block sync: mined sidechain block %s at height %d with BIP301 USDD checkpoint %s for L1 block %s at height %d, fees %s\n",
+    LogPrintf("drivechain L1 block sync: mined sidechain block %s at height %d with BIP301 commitment %s for L1 block %s at height %d, fees %s\n",
         sidechain_block_hash.ToString(), side_height, critical_hash.GetHex(),
         parent_hash.GetHex(), parent_height, FormatMoney(sidechain_fees));
     break;
     case 101: LogPrintf("drivechain L1 block sync: refusing to mine on a network without an assigned drivechain slot\n"); break;
     case 102: LogPrintf("drivechain L1 block sync: node chainman or mempool unavailable\n"); break;
     case 103: LogPrintf("drivechain L1 block sync: sidechain tip unavailable\n"); break;
-    case 106: LogPrintf("drivechain L1 block sync: sidechain tip changed while deriving BIP301 USDD checkpoint; rebuilding candidate\n"); break;
-    case 111: LogPrintf("drivechain L1 block sync: predecessor USDD withdrawal accumulator unavailable; reindex required\n"); break;
-    case 112:
-        LogPrintf("drivechain L1 block sync: cannot derive BIP301 USDD checkpoint for sidechain block %s: %s\n",
-                  sidechain_block_hash.GetHex(), checkpoint_error);
-        break;
+    case 106: LogPrintf("drivechain L1 block sync: sidechain tip changed while deriving BIP301 commitment; rebuilding candidate\n"); break;
     case 107:
         LogPrintf("drivechain L1 block sync: BIP301 BMM request failed for sidechain block %d / parent height %d\n",
             side_height, parent_height);
@@ -1047,7 +1028,7 @@ static bool MineEcxBlockForParentBlock(NodeContext& node, const int64_t parent_h
 static bool MineOneBlockForParentBlock(NodeContext& node, const int64_t parent_height, const uint256& parent_hash)
 {
     namespace hs = drivechain::haskell;
-    // Configured slots use the native withdrawal-checkpoint critical hash,
+    // Configured slots use the native block-hash commitment,
     // never the private ECX header-proof encoding.
     return hs::ParentReplayStore(hs::ReplayStoreFlow::PRODUCTION_ROUTING,[&](uint32_t step) -> uint32_t {
         switch (step) {
@@ -1538,67 +1519,6 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
             "(default: 0 = disable pruning blocks, 1 = allow manual pruning via RPC, >=%u = automatically prune block files to stay under the specified target size in MiB)", MIN_DISK_SPACE_FOR_BLOCK_FILES / 1024 / 1024), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-reindex", "If enabled, wipe chain state and block index, and rebuild them from blk*.dat files on disk. Also wipe and rebuild other optional indexes that are active. If an assumeutxo snapshot was loaded, its chainstate will be wiped as well. The snapshot can then be reloaded via RPC.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-reindex-chainstate", "If enabled, wipe chain state, and rebuild it from blk*.dat files on disk. If an assumeutxo snapshot was loaded, its chainstate will be wiped as well. The snapshot can then be reloaded via RPC.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
-    argsman.AddArg("-ecxactivationheight=<n>", "Activate the complete ECX state and source-inbox header rules at height n (regtest only; requires every ECX deployment argument)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxgenesisstateoutpoint=<txid:vout>", "Frozen pre-activation ECX singleton outpoint (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxgenesisstateroot=<hex>", "Frozen ECX singleton root matching the configured outpoint (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxchainid=<hex>", "Frozen ECX 32-byte protocol chain id, encoded as raw hex bytes (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxforcedactiondomain=<hex>", "Frozen nonzero forced-action inbox domain, encoded as raw hex bytes (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxdepositinboxdomain=<hex>", "Frozen distinct nonzero deposit inbox domain, encoded as raw hex bytes (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxcollateralvaultscript=<hex>", "Frozen raw collateral-vault script bytes (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxcollateralvaultscripthash=<hex>", "SHA256 of the frozen raw collateral-vault script bytes (regtest only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
-    argsman.AddArg("-ecxprivatebmmcheckpoint", "Use the compile-time private replay BMM checkpoint (private E2E build only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxprivatebmmactivationheight=<n>", "Require private replay BMM proofs beginning at sidechain height n (required with -ecxprivatebmmcheckpoint; private E2E build only)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxprivatesimplicitycataloguesha256=<hex>", "Test-only hash of the private Simplicity catalogue exposed by getsimplicityinfo", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxprivatesimplicityprogramcmr=<hex>", "Test-only prediction-market program CMR exposed by getsimplicityinfo", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-#endif
-#ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
-    argsman.AddArg("-ecxbondv2", "Enable exact two-transaction bond V2 activation on elementsregtest using the compiled reviewed catalogue", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxbondv2deploymenttx=<hex>", "Exact preauthorized fixed-supply bond issuance/inventory/token-burn transaction", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxbondv2deploymentversion=<n>", "Frozen deployment relation: 2 confidential, 3 explicit public; must match the configuration commitment", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxbondv2genesistx=<hex>", "Exact preauthorized V2 genesis-singleton transaction spending the deployment authority output", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxbondv2issuanceinput=<n>", "Issuance input index in the exact bond deployment transaction", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxbondv2inventoryoutput=<n>", "Full confidential bond inventory output index", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxbondv2burnoutput=<n>", "Explicit unspendable reissuance-token output index", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxbondv2stateauthoritysourceoutput=<n>", "Exact deployment output spent by V2 genesis input zero", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    for (const char* name : {
-             "-ecxbondv2inventoryassetblinder=<hex>",
-             "-ecxbondv2inventoryvalueblinder=<hex>",
-             "-ecxbondv2issuancevalueblinder=<hex>",
-             "-ecxbondv2transitionprogramid=<hex>",
-             "-ecxbondv2configurationhash=<hex>",
-             "-ecxbondv2publicstatedomain=<hex>",
-             "-ecxbondv2statenodedomain=<hex>",
-             "-ecxbondv2journaldomain=<hex>",
-             "-ecxbondv2transitioncmr=<hex>",
-             "-ecxbondv2incrementalactivationprogramid=<hex>",
-             "-ecxbondv2incrementalactivationconfigurationhash=<hex>",
-             "-ecxbondv2incrementalactivationcmr=<hex>",
-             "-ecxbondv2incrementalsuccessorprogramid=<hex>",
-             "-ecxbondv2incrementalsuccessorconfigurationhash=<hex>",
-             "-ecxbondv2incrementalsuccessortransitioncmr=<hex>",
-             "-ecxbondv2incrementalsuccessorstatenodedomain=<hex>",
-             "-ecxbondv2inventorycmr=<hex>",
-             "-ecxbondv2queuecmr=<hex>",
-             "-ecxbondv2ecxbtcprogramid=<hex>",
-             "-ecxbondv2ecxbtcredemptioncovenant=<hex>",
-             "-ecxbondv2ecxbtcsourcecheckpoint=<hex>",
-             "-ecxbondv2usddusdprogramid=<hex>",
-             "-ecxbondv2usddusdredemptioncovenant=<hex>",
-             "-ecxbondv2usddusdsourcecheckpoint=<hex>",
-             "-ecxbondv2matcherreceipt=<hex>",
-             "-ecxbondv2orderreceiptsroot=<hex>",
-             "-ecxbondv2availabilityroot=<hex>",
-             "-ecxbondv2usddasset=<hex>",
-             "-ecxbondv2keylessinternalkey=<hex>"}) {
-        argsman.AddArg(name, "Exact bond V2 activation identity (32 raw hex bytes)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    }
-    argsman.AddArg("-ecxbondv2configurationbytes=<hex>", "Exact canonical FrozenConfigurationV2 bytes whose tagged hash is authorized", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxbondv2genesismarkprice=<n>", "Exact positive genesis ECX/USDD mark price", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxbondv2initializationheight=<n>", "Reviewed ancestor height used to initialize empty genesis (V2)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxbondv2initializationblock=<hex>", "Reviewed initialization ancestor hash in raw internal byte order (V2)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-    argsman.AddArg("-ecxbondv2initializationmtp=<n>", "Exact authenticated parent MTP of the initialization ancestor (V2)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
-#endif
     argsman.AddArg("-settings=<file>", strprintf("Specify path to dynamic settings data file. Can be disabled with -nosettings. File is written at runtime and not meant to be edited by users (use %s instead for custom settings). Relative paths will be prefixed by datadir location. (default: %s)", BITCOIN_CONF_FILENAME, BITCOIN_SETTINGS_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #if HAVE_SYSTEM
     argsman.AddArg("-startupnotify=<cmd>", "Execute command on startup.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -2048,7 +1968,7 @@ bool AppInitBasicSetup(const ArgsManager& args, std::atomic<int>& exit_status)
 #ifndef ELEMENTS_FUNCTIONAL_TEST_ONLY
     std::string identity_error;
     const char* reason = "This binary only supports the built-in -chain=elements Betanet test network";
-    if (!drivechain::haskell::ParentReplayAll<4>({
+    if (!drivechain::haskell::ParentReplayAll<3>({
         [&] { return drivechain::haskell::NetworkSelectionStatus(
             drivechain::haskell::NetworkSelection::PRODUCTION, args.GetChainName()) == 0; },
         [&] {
@@ -2058,10 +1978,6 @@ bool AppInitBasicSetup(const ArgsManager& args, std::atomic<int>& exit_status)
         [&] {
             reason = "Refusing implicit use of the existing-proposal test profile: ";
             return CheckDrivechainTestProfileOptIn(args, &identity_error);
-        },
-        [&] {
-            reason = "Refusing to start with an incompatible USDD SP1 verifier: ";
-            return CheckCanonicalUsddSp1VerifierStartupIdentity(&identity_error);
         },
     })) {
         return InitError(Untranslated(strprintf("%s%s", reason, identity_error)));
@@ -2910,16 +2826,6 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             policyAsset,
             &fee_asset_error)) {
         return InitError(Untranslated(fee_asset_error));
-    }
-
-    // Reject a changed deployment identity before Step 7 can open, replay,
-    // wipe or reinterpret chainstate. This intentionally follows policyAsset
-    // initialization because the ECX source-marker rules consume that asset.
-    std::string ecx_identity_error;
-    if (!node::CheckEcxDeploymentIdentity(ecx_identity_error)) {
-        return InitError(Untranslated(strprintf(
-            "ECX consensus configuration error: %s",
-            ecx_identity_error)));
     }
 
     // Check port numbers

@@ -339,7 +339,6 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "verifydrivechainwithdrawalbundle", 2, "minconfirmations"},
     { "submitdrivechainwithdrawal", 1, "vout"},
     { "submitdrivechainwithdrawal", 3, "minconfirmations"},
-    { "getusddwithdrawalproof", 0, "index"},
     { "dumpissuanceblindingkey", 1, "vin" },
     { "importissuanceblindingkey", 1, "vin" },
     { "rawissueasset", 1, "issuances" },

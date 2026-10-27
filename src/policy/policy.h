@@ -8,7 +8,6 @@
 
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
-#include <haskell/resource_constants.h>
 #include <policy/discount.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -20,7 +19,6 @@
 class CCoinsViewCache;
 class CFeeRate;
 class CScript;
-namespace ecx { struct ExchangeConsensus; }
 
 // ELEMENTS:
 extern CAsset policyAsset;
@@ -131,10 +129,7 @@ static constexpr unsigned int STANDARD_SCRIPT_VERIFY_FLAGS{MANDATORY_SCRIPT_VERI
                                                              SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION |
                                                              SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS |
                                                              SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE |
-                                                             SCRIPT_VERIFY_SIMPLICITY |
-                                                             ElementsDrivechainIdentity::STANDARD_SCRIPT_VERIFY_FLAGS};
-static_assert(ElementsDrivechainIdentity::STANDARD_SCRIPT_VERIFY_FLAGS == SCRIPT_VERIFY_USDD_SP1_ANNEX);
-static_assert((MANDATORY_SCRIPT_VERIFY_FLAGS & ElementsDrivechainIdentity::STANDARD_SCRIPT_VERIFY_FLAGS) == 0);
+                                                             SCRIPT_VERIFY_SIMPLICITY};
 
 /** For convenience, standard but not mandatory verify flags. */
 static constexpr unsigned int STANDARD_NOT_MANDATORY_VERIFY_FLAGS{STANDARD_SCRIPT_VERIFY_FLAGS & ~MANDATORY_SCRIPT_VERIFY_FLAGS};
@@ -166,13 +161,7 @@ static constexpr decltype(CTransaction::version) TX_MAX_STANDARD_VERSION{3};
 * Check for standard transaction types
 * @return True if all outputs (scriptPubKeys) use only standard transaction forms
 */
-bool IsStandardTx(
-    const CTransaction& tx,
-    const std::optional<unsigned>& max_datacarrier_bytes,
-    bool permit_bare_multisig,
-    const CFeeRate& dust_relay_fee,
-    std::string& reason,
-    const ecx::ExchangeConsensus* ecx_consensus = nullptr);
+bool IsStandardTx(const CTransaction& tx, const std::optional<unsigned>& max_datacarrier_bytes, bool permit_bare_multisig, const CFeeRate& dust_relay_fee, std::string& reason);
 /**
 * Check for standard transaction types
 * @param[in] mapInputs       Map of previous transactions that have outputs we're spending
@@ -184,15 +173,9 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
 * 3600bytes witnessScript size, 80bytes per witness stack element, 100 witness stack elements
 * These limits are adequate for multisignatures up to n-of-100 using OP_CHECKSIG, OP_ADD, and OP_EQUAL.
 *
-* Also enforce a maximum stack item size limit. On the sole Elements
-* Drivechain, one canonical USDD SP1 proof annex is permitted; every other
-* annex remains nonstandard.
-* ECX annex policy is separately gated by its activation profile.
+* Also enforce a maximum stack item size limit and no annexes for tapscript spends.
 */
-bool IsWitnessStandard(
-    const CTransaction& tx,
-    const CCoinsViewCache& mapInputs,
-    const ecx::ExchangeConsensus* ecx_consensus = nullptr);
+bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs);
 
 /* ELEMENTS
 * Check if unblinded issuance/reissuance is in MoneyRange

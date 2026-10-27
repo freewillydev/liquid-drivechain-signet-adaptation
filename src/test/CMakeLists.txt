@@ -49,10 +49,6 @@ add_executable(test_elements
   drivechain_peg_tests.cpp
   drivechain_treasury_tests.cpp
   drivechain_withdrawal_tests.cpp
-  ecx_exchange_state_tests.cpp
-  ecx_custody_projection_tests.cpp
-  ecx_swap_header_tests.cpp
-  ecx_simplicity_test_shim.c
   feefrac_tests.cpp
   flatfile_tests.cpp
   fs_tests.cpp
@@ -132,7 +128,6 @@ add_executable(test_elements
   util_tests.cpp
   util_threadnames_tests.cpp
   util_trace_tests.cpp
-  usdd_sp1_verifier_identity_tests.cpp
   validation_block_tests.cpp
   validation_chainstate_tests.cpp
   validation_chainstatemanager_tests.cpp
@@ -156,8 +151,6 @@ target_json_data_sources(test_elements
 )
 target_raw_data_sources(test_elements NAMESPACE test::data
   data/asmap.raw
-  data/usdd_mainnet_segment.raw
-  data/usdd_mainnet_journal.raw
 )
 
 target_link_libraries(test_elements
@@ -172,6 +165,27 @@ target_link_libraries(test_elements
   Boost::headers
   libevent::extra
 )
+
+# Exercise the vendored Simplicity suite against the same native bridge.
+add_executable(test_simplicity
+  ../simplicity/test.c
+  ../simplicity/ctx8Pruned.c
+  ../simplicity/ctx8Unpruned.c
+  ../simplicity/hashBlock.c
+  ../simplicity/regression4.c
+  ../simplicity/schnorr0.c
+  ../simplicity/schnorr6.c
+  ../simplicity/typeSkipTest.c
+  ../simplicity/elements/checkSigHashAllTx1.c
+)
+set_target_properties(test_simplicity PROPERTIES LINKER_LANGUAGE CXX)
+target_compile_definitions(test_simplicity PRIVATE PRODUCTION)
+target_compile_options(test_simplicity PRIVATE
+  $<$<C_COMPILER_ID:MSVC>:/std:c11;/UNDEBUG>
+  $<$<NOT:$<C_COMPILER_ID:MSVC>>:-UNDEBUG>
+)
+target_link_libraries(test_simplicity PRIVATE core_interface bitcoin_node elementssimplicity secp256k1)
+add_test(NAME simplicity_native COMMAND test_simplicity --no-timing)
 
 if(ENABLE_WALLET)
   add_subdirectory(${PROJECT_SOURCE_DIR}/src/wallet/test wallet)
@@ -229,6 +243,8 @@ endfunction()
 
 add_all_test_targets()
 
-# Test shims include Simplicity internal assertions even in Release builds.
-set_source_files_properties(ecx_simplicity_test_shim.c PROPERTIES COMPILE_OPTIONS
-  "$<$<C_COMPILER_ID:MSVC>:/UNDEBUG>;$<$<NOT:$<C_COMPILER_ID:MSVC>>:-UNDEBUG>")
+option(ENABLE_LOW_MEMORY_TEST_BUILD "Reduce optimization of the large validation test fixture" OFF)
+if(ENABLE_LOW_MEMORY_TEST_BUILD AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+  # Test scaffolding only; production consensus objects retain their build flags.
+  set_property(SOURCE validation_block_tests.cpp APPEND PROPERTY COMPILE_OPTIONS -O1)
+endif()

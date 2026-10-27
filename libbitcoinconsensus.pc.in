@@ -7,5 +7,5 @@ Name: @PACKAGE_NAME@ consensus library
 Description: Library for the Elements consensus protocol.
 Version: @PACKAGE_VERSION@
 Libs: -L${libdir} -lelementsconsensus
-Libs.private: @USDD_SP1_VERIFIER_PKGCONFIG_LIBS@ @ECX_SP1_VERIFIER_PKGCONFIG_LIBS@
+Libs.private: @ELEMENTS_CONSENSUS_PRIVATE_LIBS@
 Cflags: -I${includedir}

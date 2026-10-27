@@ -65,17 +65,6 @@ target_link_libraries(bench_bitcoin
   Boost::headers
 )
 
-if(ECX_SP1_VERIFIER_ARCHIVE)
-  target_sources(bench_bitcoin PRIVATE
-    ecx_simplicity_bench_shim.c
-    ecx_simplicity_bench_shim.h
-    ecx_simplicity_jets.cpp
-  )
-  set_source_files_properties(ecx_simplicity_bench_shim.c PROPERTIES COMPILE_OPTIONS
-    "$<$<C_COMPILER_ID:MSVC>:/std:c11;/UNDEBUG>;$<$<NOT:$<C_COMPILER_ID:MSVC>>:-UNDEBUG>")
-else()
-  message(STATUS "ECX jet benchmarks require ECX_SP1_VERIFIER_ARCHIVE; not built")
-endif()
 
 if(ENABLE_WALLET)
   target_sources(bench_bitcoin

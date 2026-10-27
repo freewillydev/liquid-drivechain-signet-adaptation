@@ -13,7 +13,6 @@
 #include <sync.h>
 #include <uint256.h>
 #include <txdb.h>
-#include <usdd_withdrawal_accumulator.h>
 #include <util/chaintype.h>
 #include <util/check.h>
 #include <util/fs.h>
@@ -38,7 +37,6 @@ struct ChildCheckpointSources {
     uint256 genesis;
     uint256 block_hash;
     int height;
-    usdd::WithdrawalAccumulatorState withdrawals;
     std::unique_ptr<CCoinsViewCursor> coins;
     std::unique_ptr<CSpentPeginCursor> spent_claims;
 };

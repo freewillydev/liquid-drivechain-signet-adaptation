@@ -7,27 +7,8 @@
 #include <consensus/amount.h>
 #include <primitives/transaction.h>
 #include <consensus/validation.h>
-#include <haskell/bridge.h>
-#include <map>
-
-static bool CheckTransactionImpl(const CTransaction&, TxValidationState&, bool, bool);
 
 bool CheckTransaction(const CTransaction& tx, TxValidationState& state)
-{
-    return CheckTransaction(tx, state, false);
-}
-
-bool CheckTransaction(const CTransaction& tx, TxValidationState& state, bool explicit_asset_totals)
-{
-    return CheckTransactionImpl(tx, state, explicit_asset_totals, false);
-}
-
-bool CheckTransactionWithoutAggregateTotals(const CTransaction& tx, TxValidationState& state)
-{
-    return CheckTransactionImpl(tx, state, false, true);
-}
-
-static bool CheckTransactionImpl(const CTransaction& tx, TxValidationState& state, bool explicit_asset_totals, bool defer_totals)
 {
     // Basic checks that don't depend on any context
     if (tx.vin.empty())
@@ -41,7 +22,6 @@ static bool CheckTransactionImpl(const CTransaction& tx, TxValidationState& stat
 
     // Check for negative or overflow output values (see CVE-2010-5139)
     CAmount nValueOutExplicit = 0;
-    std::map<CAsset, CAmount> asset_totals;
     for (const auto& txout : tx.vout)
     {
         if (!txout.nValue.IsValid())
@@ -52,19 +32,9 @@ static bool CheckTransactionImpl(const CTransaction& tx, TxValidationState& stat
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-vout-negative");
         if (txout.nValue.GetAmount() > MAX_MONEY)
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-vout-toolarge");
-        using TotalMode = drivechain::haskell::OutputTotalMode;
-        const auto mode = drivechain::haskell::SelectOutputTotalMode(
-            defer_totals, explicit_asset_totals, txout.nAsset.IsExplicit());
-        if (mode == TotalMode::DEFERRED) continue;
-        // The activated explicit-only rule supplies public asset identities.
-        // Never treat an unknown/confidential asset as a distinct public asset.
-        if (mode == TotalMode::REJECT)
-            return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-asset-not-explicit");
-        CAmount& total = mode == TotalMode::PER_ASSET ? asset_totals[txout.nAsset.GetAsset()] : nValueOutExplicit;
-        if (!drivechain::haskell::ParentReplayRecord(drivechain::haskell::ReplayRecordKind::AMOUNT_SUM,
-                0, txout.nValue.GetAmount(), total, MAX_MONEY))
+        nValueOutExplicit += txout.nValue.GetAmount();
+        if (!MoneyRange(nValueOutExplicit))
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-txouttotal-toolarge");
-        total += txout.nValue.GetAmount();
     }
 
     // Check for duplicate inputs (see CVE-2018-17144)
@@ -353,16 +323,6 @@ bool ParameterGate(uint32_t mode, int64_t first, int64_t second)
 }
 }
 
-bool Consensus::Params::ExplicitOnlyActive(int height) const
-{
-    return ParameterGate(0, explicit_only_height, height);
-}
-
-bool Consensus::Params::ExplicitOnlyConfigured() const
-{
-    return ParameterGate(2, explicit_only_height, 0);
-}
-
 bool Consensus::Params::DrivechainWithdrawalValidationEnabled() const
 {
     return ParameterGate(1, drivechain_slot.has_value(), drivechain_m6_withdrawal_validation);
@@ -385,42 +345,6 @@ int CheckedStatus(int code, int maximum, const char* failure)
 }
 }
 
-bool AdmitStandardness(StandardnessGate kind, uint32_t facts, uint64_t count, uint64_t limit)
-{
-    elements_hs_runtime_init();
-    const auto result = elements_hs_standardness_gate_v1(static_cast<uint32_t>(kind), facts, count, limit);
-    return CheckedStatus(result,1,"Haskell standardness gate failed") == 1;
-}
-
-int VerifyJournal(RustVerifierVersion version, RustVerifyAnnex verify, std::span<const unsigned char> annex,
-    std::span<const unsigned char> program, std::span<const unsigned char> digest)
-{
-    elements_hs_runtime_init();
-    return CheckedStatus(elements_hs_verify_journal_v1(reinterpret_cast<HsFunPtr>(version),
-        reinterpret_cast<HsFunPtr>(verify), const_cast<unsigned char*>(annex.data()), annex.size(),
-        const_cast<unsigned char*>(program.data()), program.size(), const_cast<unsigned char*>(digest.data()),
-        digest.size()),2,"Haskell journal verification failed");
-}
-
-bool VerifyGroth16(RustGroth16 verify, void* context, const unsigned char* proof, size_t size,
-    const uint32_t* program, const unsigned char* digest)
-{
-    elements_hs_runtime_init();
-    return CheckedStatus(elements_hs_verify_groth16_v1(reinterpret_cast<HsFunPtr>(verify),
-        context, const_cast<unsigned char*>(proof), size, const_cast<uint32_t*>(program),
-        const_cast<unsigned char*>(digest)),1,"Haskell Groth16 verification failed") == 1;
-}
-
-bool VerifyCustody(RustCustody verify, std::span<const unsigned char> bundle,
-    std::span<const unsigned char> registry, std::span<const unsigned char> receipts, size_t count)
-{
-    elements_hs_runtime_init();
-    return CheckedStatus(elements_hs_verify_custody_v1(reinterpret_cast<HsFunPtr>(verify),
-        const_cast<unsigned char*>(bundle.data()), bundle.size(), const_cast<unsigned char*>(registry.data()),
-        registry.size(), const_cast<unsigned char*>(receipts.data()), receipts.size(), count),
-        1,"Haskell custody verification failed") == 1;
-}
-
 static int ReadExportRange(uint32_t mode, int32_t start, int32_t count, int32_t activation,
     int32_t tip, int32_t& end)
 {
@@ -438,22 +362,6 @@ int32_t PegEventStart(int32_t tip)
     int32_t start{};
     CheckedStatus(ReadExportRange(3,0,0,0,tip,start),0,"Haskell peg-event start selection failed");
     return start;
-}
-
-std::pair<bool, int32_t> ExchangeRuntimeActivation(int32_t activation, std::optional<int32_t> private_height)
-{
-    elements_hs_runtime_init();
-    int32_t first{};
-    const int code = elements_hs_runtime_activation_v1(private_height.has_value(), activation,
-        private_height.value_or(0), &first);
-    return {CheckedStatus(code, 1, "Haskell runtime activation selection failed") != 0, first};
-}
-
-uint32_t ExchangeExportRange(int32_t start, int32_t count, int32_t activation,
-    std::optional<int32_t> tip, int32_t& end)
-{
-    return CheckedStatus(ReadExportRange(tip.has_value(),start,count,activation,tip.value_or(0),end),
-        2,"Haskell export range validation failed");
 }
 
 bool ApprovingParentHeight(int64_t parent, uint64_t& successor)
@@ -487,16 +395,6 @@ bool FitsU32(std::span<const uint64_t> fields)
     elements_hs_runtime_init();
     return CheckedStatus(elements_hs_unsigned32_fields_v1(fields.size(), const_cast<uint64_t*>(fields.data())),
         1, "Haskell unsigned field bounds failed") != 0;
-}
-
-std::string WideDecimal(std::span<const unsigned char,16> bytes, bool signed_value)
-{
-    elements_hs_runtime_init();
-    std::array<unsigned char,40> text{};
-    const auto size = elements_hs_wide_decimal_v1(signed_value, const_cast<unsigned char*>(bytes.data()),
-        bytes.size(), text.data(), text.size());
-    if (size < 1 || size > static_cast<int32_t>(text.size())) throw std::runtime_error("Haskell wide integer formatting failed");
-    return std::string(text.begin(), text.begin()+size);
 }
 
 bool AnchorRule(std::span<const std::byte> encoded)
@@ -542,14 +440,6 @@ uint64_t NextBondContextHeight(int32_t height)
     return static_cast<uint64_t>(result);
 }
 
-int32_t ExchangeTrackerHeight(bool previous, int32_t height)
-{
-    elements_hs_runtime_init();
-    const auto result = elements_hs_tracker_height_v1(previous, height);
-    if (result < INT32_MIN || result > INT32_MAX) throw std::runtime_error("Haskell tracker height evaluation failed");
-    return result;
-}
-
 int64_t BmmSelectedBid(int64_t configured, int64_t fees)
 {
     elements_hs_runtime_init();
@@ -578,7 +468,6 @@ bool BmmMessageMatches(BmmMessageKind kind, const std::string& message)
     return CheckedStatus(result,1,kind == BmmMessageKind::DEFINITIVE_WAIT ?
         "Haskell BMM wait error classification failed" : "Haskell BMM duplicate request classification failed") == 1;
 }
-
 
 bool FeeAsset(const std::optional<std::string>& configured, bool canonical,
     std::span<const unsigned char,32> pegged, std::span<unsigned char,32> output, std::string* error)
@@ -677,43 +566,6 @@ bool MainchainCookieAtRoot(const std::string& chain)
     return CheckedStatus(result,1,"Haskell mainchain cookie selection failed") == 1;
 }
 
-uint8_t ContextPresence(uint32_t count, uint32_t required)
-{
-    elements_hs_runtime_init();
-    const auto result = elements_hs_context_presence_v1(count, required);
-    return static_cast<uint8_t>(CheckedStatus(result,2,"Haskell context presence evaluation failed"));
-}
-
-bool TransactionWeight(bool bond, uint64_t total, uint64_t annex, uint64_t ordinary, uint64_t proof)
-{
-    elements_hs_runtime_init();
-    const auto result = elements_hs_transaction_weight_v1(bond, total, annex, ordinary, proof);
-    return CheckedStatus(result,1,"Haskell transaction weight policy failed") == 1;
-}
-
-bool ReturnMarker(std::span<const unsigned char,4> magic, std::span<const unsigned char> script)
-{
-    elements_hs_runtime_init();
-    return CheckedStatus(elements_hs_return_marker_v1(script.size(),
-        const_cast<unsigned char*>(script.data()), const_cast<unsigned char*>(magic.data())),
-        1, "Haskell return marker policy failed") == 1;
-}
-
-bool BondMarkerPolicy(bool exact, std::span<const unsigned char> script)
-{
-    elements_hs_runtime_init();
-    const auto result = elements_hs_bond_marker_policy_v1(exact, script.size(),
-        const_cast<unsigned char*>(script.data()));
-    return CheckedStatus(result,1,"Haskell bond marker policy failed") == 1;
-}
-
-uint32_t TaprootWitnessPolicy(bool annex, bool bond, uint64_t count, uint32_t leaf, uint64_t script_size, uint64_t input)
-{
-    elements_hs_runtime_init();
-    const auto result = elements_hs_taproot_witness_policy_v1(annex | (bond << 1), count, leaf, script_size, input);
-    return CheckedStatus(result,1,"Haskell Taproot witness policy failed");
-}
-
 CtvAction CtvAdmission(uint32_t flags, uint64_t size)
 {
     elements_hs_runtime_init();
@@ -740,16 +592,6 @@ std::vector<unsigned char> ParseConfigurationField(ConfigurationField kind, cons
         throw std::runtime_error("Haskell configuration parser failed");
     output.resize(result);
     return output;
-}
-
-int EvaluatorIdentity(bool frozen, bool private_catalogue, const std::string& catalogue, const std::string& program)
-{
-    elements_hs_runtime_init();
-    const auto code=elements_hs_evaluator_identity_v1(uint32_t(frozen) | (uint32_t(private_catalogue)<<1),
-        catalogue.size(),reinterpret_cast<unsigned char*>(const_cast<char*>(catalogue.data())),
-        program.size(),reinterpret_cast<unsigned char*>(const_cast<char*>(program.data())));
-    if (code!=0 && code!=1 && code!=3) throw std::runtime_error("Haskell evaluator identity validation failed");
-    return code;
 }
 
 GrpcTextAdmission AdmitGrpcText(const std::string& address, const std::string& authority)
@@ -795,11 +637,6 @@ std::vector<std::string> GrpcPlan(std::span<const std::string> fields)
 }
 
 namespace {
-int32_t HashUsddPayload(unsigned char* input, uint32_t size, unsigned char* output)
-{
-    CSHA256().Write(input, size).Finalize(output);
-    return 1;
-}
 template <typename Result, Result fallback = 0, typename Plan, typename Value, typename... Args>
 auto ReadAdmission(const Plan& plan, const std::function<Value(Args...)>& read)
 {
@@ -833,8 +670,7 @@ void RequireAdmission(const Binding& binding, const std::function<bool(Args...)>
 }
 using NativeDigestEffect = std::function<int32_t(uint32_t, uint64_t, unsigned char*, unsigned char*)>;
 
-
-bool ExchangeResult(int code, std::span<const char* const> errors, std::string& error, const char* failure)
+bool WorkflowResult(int code, std::span<const char* const> errors, std::string& error, const char* failure)
 {
     if (code < 0 || static_cast<size_t>(code) > errors.size()) throw std::runtime_error(failure);
     if (code && errors[code-1]) error = errors[code-1];
@@ -871,6 +707,48 @@ int ReadWorkflow(const Binding& binding, const NativeWorkflow& native, Params...
     if (context.failure) std::rethrow_exception(context.failure);
     return result;
 }
+}
+
+bool ProductionIdentity(const std::function<bool(uint32_t)>& read, std::string* error)
+{
+    const int code = CheckedStatus(ReadAdmission<int32_t>(elements_hs_production_identity_v1, read),
+        32, "Haskell production identity validation failed");
+    static constexpr const char* fields[]{
+        "network id",
+        "data directory",
+        "RPC port",
+        "parent RPC port",
+        "onion target port",
+        "P2P port",
+        "P2P message-magic derivation",
+        "local enforcer-rule derivation",
+        "P2P message magic",
+        "P2PKH prefix",
+        "P2SH prefix",
+        "WIF prefix",
+        "extended public key prefix",
+        "extended secret key prefix",
+        "blinded address prefix",
+        "parent P2PKH prefix",
+        "parent P2SH prefix",
+        "bech32/blech32 namespaces",
+        "Elements/parent/slot mode",
+        "runtime Elements/header/signed-block codecs",
+        "parent-chain identity",
+        "signed-block/genesis mode",
+        "child genesis/asset identity",
+        "peer seeds/genesis checkpoint",
+        "Elements M1 proposal identity",
+        "historical parent proposal milestones",
+        "parent replay checkpoint assertions",
+        "parent replay identity",
+        "reserved identity field",
+        "reserved identity field",
+        "Taproot/Simplicity activation",
+        "issuance/policy identity",
+    };
+    if (code && error) *error = std::string("Elements production identity mismatch: ") + fields[code-1];
+    return code == 0;
 }
 
 bool ReadAuthFile(AuthFileMode mode, const NativeWorkflow& native)
@@ -917,7 +795,6 @@ bool RunParentHeader(ParentHeaderWorkflow kind, uint32_t height, const NativeWor
     return CheckedStatus(result,1,"Haskell parent header workflow failed") == 1;
 }
 
-
 bool MeasureWork(bool saturate, uint64_t count, const std::function<const CTransaction&(uint64_t)>& transaction,
     uint64_t& total, uint64_t* last)
 {
@@ -952,24 +829,6 @@ bool MeasureWork(bool saturate, uint64_t count, const std::function<const CTrans
     return code == 0;
 }
 
-bool ValidateWithdrawalEnvelope(bool inactive, const NativeWorkflow& native, std::string& error)
-{
-    static constexpr const char* errors[]{
-        "ECX M6 envelope requires a coinbase transaction", "duplicate ECX M6 envelope",
-        "malformed ECX M6 envelope", "invalid ECX M6 envelope length", "noncanonical ECX M6 envelope script",
-        "ECX M6 envelope may appear only when hashWithdrawalBundle changes",
-        "ECX M6 envelope exists while clearing the withdrawal bundle commitment",
-        "withdrawal bundle commitment lacks its ECX M6 envelope",
-        "ECX M6 envelope does not hash to hashWithdrawalBundle", "ECX M6 checkpoint is not a prior block",
-        "ECX M6 checkpoint is not the committed active-chain state",
-        "ECX M6 preimage has a noncanonical transaction prefix", "ECX M6 preimage has an invalid output",
-        "ECX M6 commitment outputs must remain zero-valued", "ECX M6 preimage has trailing or noncanonical locktime bytes",
-        "ECX M6 preimage lacks its canonical commitment or PXST output",
-        "ECX M6 PXST does not bind the selected active-chain checkpoint"};
-    return ExchangeResult(ReadWorkflow(elements_hs_exchange_envelope_workflow_v1, native, uint32_t(inactive)),
-        errors, error, "Haskell M6 envelope workflow failed");
-}
-
 std::optional<std::array<unsigned char,80>> AnchorCheckpoint(std::span<const std::byte> encoded)
 {
     if (encoded.size()!=145) throw std::invalid_argument("Invalid checkpoint anchor framing");
@@ -991,7 +850,6 @@ bool BmmWait(const std::function<int32_t(uint32_t)>& action)
     const int code = ReadAdmission<int32_t,-1>(elements_hs_bmm_wait_v1,action);
     return CheckedStatus(code,1,"Haskell BMM wait failed") == 1;
 }
-
 
 bool BmmProduction(bool ecx, const std::function<bool(uint32_t)>& action)
 {
@@ -1048,1435 +906,10 @@ void DepositVerify(uint64_t index, uint64_t inputs, uint64_t witnesses, const st
         "drivechain deposit input or witness index is out of range","Haskell live deposit verification failed",index,inputs,witnesses);
 }
 
-bool ExchangeFrozenBounds(std::span<const uint64_t> fields)
-{
-    if (fields.size()!=1 && fields.size()!=2 && fields.size()!=3 && fields.size()!=5 && fields.size()!=9 && fields.size()!=16 && fields.size()!=17)
-        throw std::runtime_error("invalid exchange bounds shape");
-    elements_hs_runtime_init();
-    const int code = elements_hs_exchange_frozen_bounds_v1(fields.size(), const_cast<uint64_t*>(fields.data()));
-    return CheckedStatus(code,1,"Haskell frozen exchange bounds failed") == 0;
-}
-
-std::optional<std::pair<uint32_t,bool>> ParseHashArguments(bool direct, const std::function<std::string(uint32_t)>& read,
-    const std::function<void(uint32_t,std::span<const unsigned char,32>)>& publish)
-{
-    if (!read || !publish) throw std::invalid_argument("missing hash argument callback");
-    const int code=ReadAdmission<int32_t,-1>([&](HsFunPtr callback,void* context) {
-        return elements_hs_configuration_hashes_v1(direct,callback,context);
-    },std::function<int32_t(uint32_t,unsigned char*)>{[&](uint32_t action,unsigned char* bytes) {
-        if (action>=44 || !bytes) throw std::logic_error("invalid hash argument action");
-        if (action>=22) publish(action-22,std::span<const unsigned char,32>{bytes,32});
-        else {
-            const auto text=read(action);
-            if (text.size()!=64) return int32_t{1};
-            std::copy(text.begin(),text.end(),bytes);
-        }
-        return int32_t{0};
-    }});
-    if (!code) return std::nullopt;
-    if (code<5 || code>90 || (code%4!=1 && code%4!=2)) throw std::runtime_error("Haskell hash argument parsing failed");
-    return std::pair<uint32_t,bool>{code/4-1,code%4==2};
-}
-
-
-
-
-
-
-
-namespace {
-int ExchangeIdentityRelation(uint32_t mode, std::span<const unsigned char* const> identities)
-{
-    elements_hs_runtime_init();
-    if (identities.size() > 45) throw std::invalid_argument("too many exchange identities");
-    std::vector<unsigned char> bytes;
-    for (const auto* identity : identities) {
-        if (!identity) throw std::invalid_argument("null exchange identity");
-        bytes.insert(bytes.end(), identity, identity + 32);
-    }
-    const int code = elements_hs_exchange_identity_relation_v1(mode, identities.size(), bytes.data());
-    return CheckedStatus(code,mode>=5 ? 5 : mode>=3 ? 2 : 1,"Haskell exchange identity uniqueness failed");
-}
-}
-
-bool ExchangeDistinct(std::span<const unsigned char* const> identities) { return ExchangeIdentityRelation(0, identities) == 0; }
-bool ExchangeCarryIdentity(uint32_t profile, std::span<const unsigned char* const,15> identities)
-{
-    return profile<=1 && ExchangeIdentityRelation(7+profile,identities)==0;
-}
-void ExchangeDeploymentIdentities(bool direct_price, std::span<const unsigned char* const,22> identities)
-{
-    const int code=ExchangeIdentityRelation(direct_price ? 6 : 5,identities);
-    static constexpr const char* errors[]{
-        "finite, activation, and incremental-successor configuration hashes must be distinct",
-        "proof program identity is missing",
-        "incremental proof program identity collides with another proof role",
-        "incremental activation covenant identity is missing or collides",
-        "incremental successor state-node identity is missing or collides"};
-    if (code) throw std::runtime_error(errors[code-1]);
-}
-
-bool ExchangeFrozenIdentities(bool direct_price, std::span<const unsigned char* const,22> identities, std::string& error)
-{
-    const int code=ExchangeIdentityRelation(direct_price ? 10 : 9,identities);
-    static constexpr const char* errors[]{"finite, activation, and incremental-successor configurations collide",
-        "incremental proof program identity collides", "frozen ECX bond V2 covenant CMR roles collide",
-        "incremental successor state-node identity collides"};
-    if (code>4) throw std::runtime_error("invalid frozen identity result");
-    error=code ? errors[code-1] : "";
-    return code==0;
-}
-
-void ExchangeActivationFacts(std::span<const unsigned char* const,40> identities)
-{
-    const int code=ExchangeIdentityRelation(11,identities);
-    if (code>2) throw std::runtime_error("invalid activation facts result");
-    if (code) throw std::runtime_error(code==1 ?
-        "FrozenConfigurationV2/V18 bond/deployment/covenant identities do not match physical Tx1/Tx2 activation facts" :
-        "ECX bond V2 activation lacks a complete frozen covenant CMR tuple");
-}
-
-void ExchangeRuntimeIdentities(std::span<const unsigned char* const,16> identities)
-{
-    if (ExchangeIdentityRelation(12,identities))
-        throw std::runtime_error("runtime proof/matcher identities differ from FrozenConfigurationV2/V18");
-}
-
-void ExchangeDeploymentBlinders(bool public_deployment, std::span<const unsigned char* const,3> identities)
-{
-    const int code=ExchangeIdentityRelation(public_deployment ? 1 : 4,identities);
-    if (code) throw std::runtime_error(public_deployment ? "public ECX deployment requires zero blinders" :
-        code==1 ? "ECX bond V2 issuance blinder must be nonzero and distinct" : "ECX bond V2 inventory blinders must be distinct");
-}
-
-int UsddExtractBlock(bool zero_genesis, std::span<const unsigned char,69> profile,
-    const std::function<int64_t(uint32_t,uint64_t,uint64_t,uint64_t,unsigned char*)>& effect,
-    std::span<const unsigned char> state, std::span<const unsigned char> empty_roots, uint64_t count, uint8_t prefix, bool derive)
-{
-    if ((derive || !state.empty() || !empty_roots.empty()) && (state.size()!=2080 || empty_roots.size()!=2080))
-        throw std::invalid_argument("invalid block accumulator buffers");
-    const int code = ReadAdmission<int64_t, -1>([&](HsFunPtr callback, void* context) {
-        return elements_hs_usdd_extract_block_v4(derive ? 2 : !state.empty(),zero_genesis,count,prefix,
-            const_cast<unsigned char*>(state.data()),const_cast<unsigned char*>(empty_roots.data()),const_cast<unsigned char*>(profile.data()),
-            callback,context,reinterpret_cast<HsFunPtr>(HashUsddPayload));
-    }, effect);
-    return CheckedStatus(code,8,"Haskell block claim extraction failed");
-}
-uint32_t UsddAdmission(uint32_t lane, std::span<const unsigned char> bytes, uint64_t limit,
-    std::array<uint32_t, 3> profile, bool bmm, bool active, const std::function<int32_t(uint32_t)>& identity)
-{
-    const int code = ReadBoundAdmission<int32_t,-1>(elements_hs_usdd_admission_v4,identity,lane,bytes.size(),limit,
-        profile.data(),const_cast<unsigned char*>(bytes.data()),bmm,active);
-    return CheckedStatus(code,9,"Haskell USDD admission failed");
-}
-uint32_t UsddAnnex(std::span<const unsigned char> bytes, uint64_t limit, std::array<uint32_t, 3> profile)
-{
-    elements_hs_runtime_init();
-    const int code = elements_hs_usdd_annex_v1(bytes.size(), limit, profile.data(), const_cast<unsigned char*>(bytes.data()));
-    return CheckedStatus(code,15,"Haskell USDD annex validation failed");
-}
-struct UsddInputs {
-    std::array<unsigned char*,7> pointers;
-    std::array<uint64_t,7> sizes;
-    explicit UsddInputs(const std::array<std::span<const unsigned char>,7>& fields) {
-        for (size_t i = 0; i < fields.size(); ++i) Set(i,fields[i]);
-    }
-    void Set(size_t i, std::span<const unsigned char> bytes) {
-        pointers[i] = const_cast<unsigned char*>(bytes.data());
-        sizes[i] = bytes.size();
-    }
-    void Read(const UsddWitness& row, bool parameterized, std::array<uint64_t,4>& shape) {
-        Set(0,row.cmr);
-        Set(6,row.annex);
-        shape = {row.items,row.control.size(),row.control.empty() ? 0U : row.control[0],parameterized};
-    }
-};
-uint32_t UsddLegacy(uint32_t mode, std::array<std::span<const unsigned char>, 7> fields,
-    std::array<uint32_t, 5> profile, uint64_t limit, bool bmm, bool active, std::array<uint64_t,4> shape)
-{
-    elements_hs_runtime_init();
-    UsddInputs input{fields};
-    const int code = elements_hs_usdd_legacy_v2(mode, input.pointers.data(), input.sizes.data(), profile.data(),
-        limit, bmm, active, shape.data(), reinterpret_cast<HsFunPtr>(HashUsddPayload));
-    return CheckedStatus(code,mode == 2 ? 511 : mode == 1 ? 9 : 5,"Haskell raw USDD identity failed");
-}
-std::pair<uint32_t,uint64_t> UsddResources(uint64_t count,
-    std::array<std::span<const unsigned char>,7> fields, std::array<uint32_t,5> profile,
-    uint64_t limit, bool parameterized, const std::function<UsddWitness(uint64_t)>& read)
-{
-    UsddInputs input{fields};
-    std::array<uint64_t,4> shape{};
-    uint64_t total{0};
-    const std::function<int32_t(uint64_t)> action = [&](uint64_t index) {
-        input.Read(read(index),parameterized,shape);
-        return 1;
-    };
-    const auto flags = ReadBoundAdmission<int32_t,-1>(elements_hs_usdd_resources_v1,action,
-        count,input.pointers.data(),input.sizes.data(),profile.data(),limit,shape.data(),&total,
-        reinterpret_cast<HsFunPtr>(HashUsddPayload));
-    return {CheckedStatus(flags,511,"Haskell USDD resource scan failed"),total};
-}
-std::array<unsigned char,64> UsddClaimHashes(uint32_t mode, std::span<const unsigned char,69> profile,
-    std::span<const unsigned char,168> input)
-{
-    elements_hs_runtime_init();
-    std::array<unsigned char,64> output{};
-    if (elements_hs_usdd_claim_hashes_v2(mode, 0, input.size(), const_cast<unsigned char*>(profile.data()),
-            const_cast<unsigned char*>(input.data()), output.data(), reinterpret_cast<HsFunPtr>(HashUsddPayload)) != 0)
-        throw std::runtime_error("Haskell claim hashing failed");
-    return output;
-}
-
-int UsddClaimPrefix(uint64_t index, std::span<const unsigned char,69> profile,
-    std::span<const unsigned char> input, std::vector<unsigned char>& leaves)
-{
-    elements_hs_runtime_init();
-    std::vector<unsigned char> output(std::max<size_t>(1,input.size()/200*32));
-    const int code = elements_hs_usdd_claim_hashes_v2(3,index,input.size(),const_cast<unsigned char*>(profile.data()),
-        const_cast<unsigned char*>(input.data()),output.data(),reinterpret_cast<HsFunPtr>(HashUsddPayload));
-    if (code < 0 || code > 2) throw std::runtime_error("Haskell claim prefix failed");
-    if (!code) { output.resize(input.size()/200*32); leaves = std::move(output); }
-    return code;
-}
-
-void UsddFrontierWire(uint64_t count, bool reading, const std::function<bool(uint32_t)>& action)
-{
-    if (ReadBoundAdmission<int32_t,-1>(elements_hs_frontier_wire_v1,action,count,reading ? 1U : 0U) != 1)
-        throw std::runtime_error("Haskell withdrawal frontier serialization failed");
-}
-
-bool UsddAccumulatorVersion(uint32_t version)
-{
-    elements_hs_runtime_init();
-    return CheckedStatus(elements_hs_usdd_accumulator_version_v1(version),1,
-        "Haskell accumulator version validation failed") == 1;
-}
-
 int64_t WalletBalanceTotal(int64_t trusted, int64_t pending, int64_t immature)
 {
     elements_hs_runtime_init();
     return elements_hs_wallet_balance_v1(trusted, pending, immature);
-}
-
-bool UsddAccumulator(uint32_t mode, uint64_t count, uint8_t prefix, std::span<unsigned char,2080> state,
-    std::span<const unsigned char,2080> empty_roots, std::span<const unsigned char> leaf, uint64_t* next_count)
-{
-    elements_hs_runtime_init();
-    if (leaf.size() % 32) throw std::invalid_argument("partial withdrawal tree leaf");
-    unsigned char empty{};
-    uint64_t cursor = count;
-    const int code = elements_hs_usdd_accumulator_v3(mode, count, prefix, state.data(),
-        const_cast<unsigned char*>(empty_roots.data()), leaf.empty() ? &empty : const_cast<unsigned char*>(leaf.data()), leaf.size() / 32,
-        reinterpret_cast<HsFunPtr>(HashUsddPayload), &cursor);
-    const bool complete = CheckedStatus(code,1,"Haskell USDD accumulator failed") == 0;
-    if (next_count) *next_count = cursor;
-    return complete;
-}
-int UsddCheckpoint(uint64_t before_count, uint64_t after_count, uint8_t prefix,
-    std::span<const unsigned char,2080> before, std::span<const unsigned char,2080> after,
-    std::span<const unsigned char,2080> empty_roots, std::span<const unsigned char> profile,
-    std::span<unsigned char,32> output)
-{
-    elements_hs_runtime_init();
-    if (profile.size() > UINT32_MAX) throw std::length_error("USDD checkpoint profile too large");
-    const int code = elements_hs_usdd_checkpoint_v1(before_count, after_count, prefix,
-        const_cast<unsigned char*>(before.data()), const_cast<unsigned char*>(after.data()),
-        const_cast<unsigned char*>(empty_roots.data()), const_cast<unsigned char*>(profile.data()), profile.size(),
-        output.data(), reinterpret_cast<HsFunPtr>(HashUsddPayload));
-    return CheckedStatus(code,3,"Haskell USDD checkpoint failed");
-}
-bool ExchangeAbsent(std::span<const unsigned char* const> identities) { return ExchangeIdentityRelation(1, identities) == 0; }
-
-bool ExchangeRegistry(std::span<const std::array<unsigned char, 32>, 5> encryption,
-    std::span<const std::array<unsigned char, 32>, 5> attestation, std::string& error)
-{
-    elements_hs_runtime_init();
-    static_assert(sizeof(encryption[0]) == 32);
-    const int code = elements_hs_exchange_registry_v1(const_cast<unsigned char*>(encryption[0].data()),
-        const_cast<unsigned char*>(attestation[0].data()));
-    static constexpr const char* errors[]{"incomplete frozen ECX bond V2 custodian registry",
-        "duplicate frozen ECX bond V2 custodian registry key"};
-    return ExchangeResult(code, errors, error, "Haskell exchange custodian registry failed");
-}
-
-std::vector<unsigned char> ExchangeRegistryEncoding(std::span<const std::array<unsigned char,32>,5> encryption,
-    std::span<const std::array<unsigned char,32>,5> attestation)
-{
-    std::vector<unsigned char> bytes;
-    for (const auto& key : encryption) bytes.insert(bytes.end(),key.begin(),key.end());
-    for (const auto& key : attestation) bytes.insert(bytes.end(),key.begin(),key.end());
-    return ExchangeInboxEntry(InboxCodec::REGISTRY,{}, {},bytes);
-}
-
-void ExchangeRegistryDecoding(std::span<const unsigned char> bytes, std::span<std::array<unsigned char,32>,5> encryption,
-    std::span<std::array<unsigned char,32>,5> attestation)
-{
-    std::array<unsigned char,320> decoded{};
-    uint64_t count{};
-    elements_hs_runtime_init();
-    const int code = elements_hs_exchange_registry_decode_v1(bytes.size(),const_cast<unsigned char*>(bytes.data()),decoded.data(),&count);
-    if (code<0 || code>2 || count>5) throw std::runtime_error("Haskell registry decoding failed");
-    for (size_t i=0;i<count;++i) {
-        std::copy_n(decoded.data()+i*64,32,encryption[i].begin());
-        std::copy_n(decoded.data()+i*64+32,32,attestation[i].begin());
-    }
-    if (code) throw std::runtime_error(code==1 ? "ECX bond V2 custodian registry indices/keys are noncanonical" : "ECX bond V2 custodian registry contains duplicate keys");
-}
-
-bool ExchangeCustodyCheck(uint32_t mode, std::span<const unsigned char> values,
-    std::span<const unsigned char> context)
-{
-    elements_hs_runtime_init();
-    return CheckedStatus(elements_hs_exchange_custody_check_v1(mode, values.size(),
-        const_cast<unsigned char*>(values.data()), context.size(),
-        const_cast<unsigned char*>(context.data())), 1, "Haskell custody projection check failed") == 1;
-}
-
-bool ExchangeCapitalIdentity(uint32_t profile, std::span<const unsigned char, 32> program,
-    std::span<const unsigned char> values, std::initializer_list<const unsigned char*> identities,
-    std::initializer_list<uint64_t> context, std::initializer_list<const unsigned char*> snapshot_context,
-    std::span<unsigned char> snapshot)
-{
-    elements_hs_runtime_init();
-    std::vector<unsigned char> expected;
-    for (const auto* identity : identities) {
-        if (!identity) throw std::invalid_argument("null exchange capital identity");
-        expected.insert(expected.end(), identity, identity + 32);
-    }
-    if (profile>3 || identities.size()!=(profile==0 ? 5U : 7U) || context.size()!=(profile==2 ? 2U : 0U) ||
-        (snapshot.empty() ? snapshot_context.size()!=0 : profile==2 || snapshot.size()!=914 || snapshot_context.size()!=3))
-        throw std::runtime_error("Haskell exchange capital identity failed");
-    for (const auto value : context) {
-        const auto offset=expected.size();
-        expected.resize(offset+8);
-        WriteBE64(expected.data()+offset,value);
-    }
-    for (const auto* field : snapshot_context) {
-        if (!field) throw std::invalid_argument("null capital snapshot context");
-        expected.insert(expected.end(),field,field+32);
-    }
-    const int code = elements_hs_exchange_capital_v2(profile,
-        const_cast<unsigned char*>(program.data()), values.size(), const_cast<unsigned char*>(values.data()),
-        expected.size(), expected.data(), snapshot.size(), snapshot.data());
-    return CheckedStatus(code,1,"Haskell exchange capital identity failed") == 0;
-}
-
-bool ExchangeSuccessorBinding(bool incremental, std::span<const unsigned char> values,
-    std::span<const unsigned char* const,4> identities, std::span<const uint64_t,3> context)
-{
-    std::array<unsigned char,128> hashes;
-    for (size_t i=0;i<identities.size();++i) {
-        if (!identities[i]) throw std::invalid_argument("null successor context identity");
-        std::copy_n(identities[i],32,hashes.data()+32*i);
-    }
-    elements_hs_runtime_init();
-    return CheckedStatus(elements_hs_exchange_successor_binding_v1(incremental,values.size(),
-        const_cast<unsigned char*>(values.data()),hashes.data(),const_cast<uint64_t*>(context.data())),
-        1,"Haskell successor context binding failed")==0;
-}
-
-bool ExchangeSwapSuccessorBinding(std::span<const unsigned char> values,
-    std::span<const unsigned char* const,6> identities, std::span<const uint64_t,4> context)
-{
-    std::array<unsigned char,192> hashes;
-    for (size_t i=0;i<identities.size();++i) {
-        if (!identities[i]) throw std::invalid_argument("null swap successor identity");
-        std::copy_n(identities[i],32,hashes.data()+32*i);
-    }
-    elements_hs_runtime_init();
-    return CheckedStatus(elements_hs_exchange_successor_binding_v1(2,values.size(),
-        const_cast<unsigned char*>(values.data()),hashes.data(),const_cast<uint64_t*>(context.data())),
-        1,"Haskell swap successor context binding failed")==0;
-}
-
-std::optional<std::vector<unsigned char>> ExchangeForcedV3BlockBytes(
-    uint32_t mode, std::span<const unsigned char> bytes)
-{
-    static constexpr std::array<size_t,5> capacities{4199,145,1,1,1};
-    if (mode>=capacities.size()) return std::nullopt;
-    if ((mode==0 && (bytes.size()<237 || bytes.size()>4301)) ||
-        (mode==1 && bytes.size()!=186) || (mode==2 && bytes.size()>14) ||
-        (mode==3 && (bytes.size()<96 || bytes.size()>4204)) ||
-        (mode==4 && bytes.size()!=1)) return std::nullopt;
-    elements_hs_runtime_init();
-    std::vector<unsigned char> result(capacities[mode]);
-    const unsigned char empty=0;
-    const auto size=CheckedStatus(elements_hs_exchange_forced_v3_block_bytes_v1(mode,bytes.size(),
-        const_cast<unsigned char*>(bytes.empty() ? &empty : bytes.data()),result.size(),result.data()),
-        result.size(),"Haskell exact forced block codec failed");
-    if (!size) return std::nullopt;
-    if (size<0 || static_cast<size_t>(size)>result.size()) throw std::logic_error("invalid forced V3 block codec size");
-    result.resize(size);
-    return result;
-}
-
-bool ExchangeForcedV3Frame(std::span<const unsigned char> script,
-    std::span<const unsigned char,32> economic_hash, std::vector<unsigned char>& payload)
-{
-    if (script.size()<2 || script.size()>4108) return false;
-    std::array<unsigned char,4104> bytes;
-    elements_hs_runtime_init();
-    const auto size = CheckedStatus(elements_hs_exchange_forced_v3_bytes_v1(0,script.size(),
-        const_cast<unsigned char*>(script.data()),const_cast<unsigned char*>(economic_hash.data()),
-        bytes.size(),bytes.data()),bytes.size(),"Haskell exact forced frame failed");
-    if (!size) return false;
-    payload.assign(bytes.begin(),bytes.begin()+size);
-    return true;
-}
-
-bool RunExchangeSession(ExchangeSession mode, const NativeWorkflow& native)
-{
-    return CheckedStatus(ReadWorkflow(elements_hs_exchange_session_v1,native,static_cast<uint32_t>(mode)),
-        1,"Haskell exchange session failed")==1;
-}
-
-
-
-
-std::vector<unsigned char> ExchangeEnvelopePayload(uint32_t height, const unsigned char* checkpoint, std::span<const unsigned char> body)
-{
-    elements_hs_runtime_init();
-    std::vector<unsigned char> payload(45 + std::min<size_t>(body.size(),100000));
-    const int code = elements_hs_exchange_envelope_payload_v1(height,const_cast<unsigned char*>(checkpoint),
-        body.size(),const_cast<unsigned char*>(body.data()),payload.size(),payload.data());
-    if (code == 1) throw std::invalid_argument("ECX M6 envelope preimage size is invalid");
-    if (code != 0) throw std::runtime_error("Haskell ECX envelope encoding failed");
-    return payload;
-}
-
-
-
-
-bool ExchangeSourceMarker(uint32_t& seen, SourceMarker kind, bool present, std::string& error)
-{
-    elements_hs_runtime_init();
-    uint32_t next{0};
-    const int code = elements_hs_exchange_source_marker_v1(seen, static_cast<uint32_t>(kind), present, &next);
-    static constexpr const char* errors[]{
-        "an Elements transaction may contain only one ECX forced action",
-        "an Elements transaction may contain only one ECX deposit marker",
-        "ECX source transaction is premature before exchange activation"};
-    if (!ExchangeResult(code, errors, error, "Haskell exchange source marker failed")) return false;
-    seen = next;
-    return true;
-}
-
-bool ExchangeSourceAdmission(const std::function<uint64_t(uint64_t)>& read, std::string& error)
-{
-    const int code = ReadAdmission<uint64_t>(elements_hs_exchange_source_admission_v1, read);
-    static constexpr const char* errors[]{"ECX bond-inbox relay profile is not frozen",
-        "ECX bond-inbox source transaction has an invalid input/output/witness form",
-        "ECX bond-inbox source transaction exceeds its frozen exact byte cap",
-        "ECX bond-inbox source witness exceeds its frozen exact byte cap"};
-    return ExchangeResult(code,errors,error,"Haskell source admission failed");
-}
-
-bool AdmitTransaction(TransactionAdmission kind, const CTransaction& tx,
-    uint64_t issuance, uint64_t inventory, uint64_t burn, uint64_t authority,
-    const std::function<std::array<unsigned char,64>()>& derive)
-{
-    const bool public_bond = kind == TransactionAdmission::PUBLIC_BOND;
-    const bool inputs_only = kind == TransactionAdmission::ORDINARY_INPUTS;
-    std::vector<unsigned char> view(32);
-    WriteLE64(view.data(), tx.vin.size());
-    WriteLE64(view.data()+8, inputs_only ? 0 : tx.vout.size());
-    WriteLE64(view.data()+16, inputs_only ? 0 : tx.witness.vtxoutwit.size());
-    WriteLE64(view.data()+24, inputs_only ? 0 : tx.witness.vtxinwit.size());
-    const auto amount = [&](const CConfidentialValue& value) {
-        const auto offset = view.size();
-        view.resize(offset+8);
-        WriteLE64(view.data()+offset, value.IsExplicit() ? value.GetAmount() : 0);
-    };
-    // Only total, side-effect-free native predicates are snapshotted eagerly.
-    // Cryptographic derivation stays deferred until Haskell admits its inputs.
-    for (const auto& input : tx.vin) {
-        const auto& issue = input.assetIssuance;
-        view.push_back(unsigned(input.m_is_pegin) | (unsigned(issue.IsNull()) << 1) |
-            (unsigned(issue.nAmount.IsNull()) << 2) | (unsigned(issue.nAmount.IsExplicit()) << 3) |
-            (unsigned(issue.nInflationKeys.IsNull()) << 4) | (unsigned(issue.nInflationKeys.IsExplicit()) << 5) |
-            (unsigned(issue.assetBlindingNonce.IsNull()) << 6));
-        if (public_bond) { amount(issue.nAmount); amount(issue.nInflationKeys); }
-    }
-    if (!inputs_only) {
-        for (const auto& output : tx.vout) {
-            view.push_back(unsigned(output.nAsset.IsExplicit()) | (unsigned(output.nValue.IsExplicit()) << 1) |
-                (unsigned(output.nNonce.IsNull()) << 2) | (unsigned(output.scriptPubKey.empty()) << 3) |
-                (unsigned(output.scriptPubKey.IsUnspendable()) << 4));
-            if (public_bond) {
-                const auto offset = view.size();
-                view.resize(offset+32);
-                if (output.nAsset.IsExplicit()) std::copy_n(output.nAsset.GetAsset().begin(),32,view.begin()+offset);
-                amount(output.nValue);
-            }
-        }
-        for (const auto& witness : tx.witness.vtxoutwit)
-            view.push_back(unsigned(witness.vchRangeproof.empty()) | (unsigned(witness.vchSurjectionproof.empty()) << 1));
-        for (const auto& witness : tx.witness.vtxinwit)
-            view.push_back(unsigned(witness.vchIssuanceAmountRangeproof.empty()) | (unsigned(witness.vchInflationKeysRangeproof.empty()) << 1));
-    }
-    const int code = ReadBoundAdmission<int32_t,-1>(elements_hs_exchange_transaction_admission_v1,
-        std::function<int32_t(unsigned char*)>{[&](unsigned char* identities) {
-            if (!public_bond || !identities || !derive) throw std::logic_error("invalid transaction asset derivation");
-            const auto result = derive();
-            std::copy(result.begin(),result.end(),identities);
-            return int32_t{1};
-        }}, static_cast<uint32_t>(kind),view.size(),view.data(),issuance,inventory,burn,authority);
-    return CheckedStatus(code,1,"Haskell transaction admission failed") == 1;
-}
-
-bool ExchangeDeriveInbox(uint64_t count, uint64_t forced, uint64_t deposits,
-    const std::function<int64_t(uint32_t,uint64_t,uint64_t)>& action, std::string& error)
-{
-    const int code = ReadBoundAdmission<int64_t,-1>(elements_hs_exchange_derive_inbox_v1,action,count,forced,deposits);
-    static constexpr const char* errors[]{nullptr,
-        "an Elements transaction may contain only one ECX forced action",
-        "an Elements transaction may contain only one ECX deposit marker",
-        "ECX forced inbox index overflow", "ECX deposit inbox index overflow",
-        "ECX forced-action source tranche is overweight: unknown ECX forced-action kind",
-        "ECX forced-action source tranche is overweight: parent-height tranche exceeds the 64-operation budget"};
-    return ExchangeResult(code,errors,error,"Haskell inbox derivation failed");
-}
-
-bool ExchangeParentTarget(std::optional<uint64_t>& height,
-    const std::function<uint64_t(uint32_t)>& read, std::string& error)
-{
-    uint64_t output{0};
-    const int code = ReadAdmission<uint64_t>([&](HsFunPtr callback, void* context) {
-        return elements_hs_exchange_parent_target_v1(height.has_value(), height.value_or(0), callback, context, &output);
-    }, read);
-    if (code < 0 || code > 2) throw std::runtime_error("Haskell exchange parent target validation failed");
-    if (code) {
-        error = code == 1 ? "ECX block assembly requires an authenticated target parent height"
-                          : "ECX target parent height is outside the committed 32-bit range";
-        return false;
-    }
-    height = output;
-    return true;
-}
-
-bool ExchangeTranche(std::span<const uint8_t> kinds, uint32_t& work, std::string& error)
-{
-    work = 0;
-    error.clear();
-    elements_hs_runtime_init();
-    const int code = elements_hs_exchange_tranche_v1(kinds.size(), const_cast<uint8_t*>(kinds.data()), &work);
-    if (code < 0 || code > 2) throw std::runtime_error("Haskell exchange tranche validation failed");
-    if (code) error = code == 1 ? "unknown ECX forced-action kind" : "parent-height tranche exceeds the 64-operation budget";
-    return code == 0;
-}
-
-int ExchangeForcedBody(uint32_t kind, std::span<const unsigned char> body,
-    std::span<const unsigned char, 32> chain, std::span<const unsigned char, 16> market)
-{
-    elements_hs_runtime_init();
-    const int code = elements_hs_exchange_forced_body_v1(kind, body.size(),
-        const_cast<unsigned char*>(body.data()), const_cast<unsigned char*>(chain.data()),
-        const_cast<unsigned char*>(market.data()));
-    return CheckedStatus(code,5,"Haskell forced body validation failed");
-}
-
-bool ExchangeSpendScan(bool unique, uint64_t start, uint64_t end,
-    const std::function<uint64_t(uint64_t)>& read, std::optional<uint64_t>& match)
-{
-    uint64_t index{0};
-    const int code = ReadAdmission<uint64_t, UINT64_MAX>([&](HsFunPtr callback, void* context) {
-        return elements_hs_exchange_spend_scan_v1(unique, start, end, callback, context, &index);
-    }, read);
-    if (code < 0 || code > 2) throw std::runtime_error("Haskell exchange spend scan failed");
-    if (code == 2) return false;
-    match = code == 1 ? std::optional<uint64_t>{index} : std::nullopt;
-    return true;
-}
-
-bool ExchangeDeploymentOutputs(uint64_t skipped, uint64_t count, const std::function<uint64_t(uint64_t)>& read)
-{
-    uint64_t unused{0};
-    const int code=ReadAdmission<uint64_t,UINT64_MAX>([&](HsFunPtr callback,void* context) {
-        return elements_hs_exchange_spend_scan_v1(2,skipped,count,callback,context,&unused);
-    },read);
-    if (code!=0 && code!=2) throw std::runtime_error("Haskell deployment output scan failed");
-    return code==0;
-}
-
-
-std::vector<unsigned char> ExchangeGenesisState(GenesisCodec codec, uint64_t height, uint64_t price,
-    std::initializer_list<const unsigned char*> hashes, std::span<const unsigned char> bond, std::span<const unsigned char> funding)
-{
-    const auto mode = static_cast<uint32_t>(codec);
-    const bool private_state = codec == GenesisCodec::PRIVATE_STATE;
-    static constexpr size_t hash_counts[]{4,8,11,1,2,0,0,0,10,10,10,15}, output_sizes[]{242,1713,468,34,64,383,100,41,914,914,914,914};
-    static constexpr size_t body_sizes[]{0,242,0,0,0,0,0,0,850,1627,364,8};
-    if (mode >= std::size(hash_counts) || hashes.size() != hash_counts[mode] || bond.size() != body_sizes[mode] ||
-        funding.size() != (private_state ? 725U : 0U)) throw std::runtime_error("invalid genesis codec inputs");
-    std::vector<unsigned char> input;
-    input.reserve(hashes.size()*32 + bond.size() + funding.size());
-    for (const auto* hash : hashes) {
-        if (!hash) throw std::runtime_error("null genesis codec identity");
-        input.insert(input.end(), hash, hash+32);
-    }
-    input.insert(input.end(), bond.begin(), bond.end());
-    input.insert(input.end(), funding.begin(), funding.end());
-    std::vector<unsigned char> output(output_sizes[mode]);
-    elements_hs_runtime_init();
-    if (elements_hs_exchange_genesis_state_v1(mode, height, price, input.size(), input.data(), output.size(), output.data()) != 0)
-        throw std::runtime_error("Haskell exchange genesis state encoding failed");
-    return output;
-}
-
-std::vector<unsigned char> ExchangeInboxEntry(InboxCodec codec, std::array<uint64_t, 7> fields,
-    std::initializer_list<const unsigned char*> hashes, std::span<const unsigned char> body)
-{
-    const auto mode = static_cast<uint32_t>(codec);
-    static constexpr size_t hash_counts[]{3,5,2,2,5,5,0,0,0,4,2,0,0,4,6,6}, overhead[]{30,33,8,0,41,33,0,0,0,4,12,5,0,2,12,21}, body_sizes[]{0,0,0,16,499,515,503,0,0,0,0,320,0,0,0,0};
-    if (mode > 15 || mode == 7 || mode == 8 || mode == 12 || hashes.size() != hash_counts[mode] ||
-        (mode != 0 && mode != 10 && body.size() != body_sizes[mode]))
-        throw std::runtime_error("invalid inbox entry inputs");
-    std::vector<unsigned char> input;
-    for (const auto* hash : hashes) {
-        if (!hash) throw std::runtime_error("null inbox entry identity");
-        input.insert(input.end(), hash, hash+32);
-    }
-    input.insert(input.end(), body.begin(), body.end());
-    std::vector<unsigned char> output(mode == 6 ? 236 : input.size() + overhead[mode]);
-    elements_hs_runtime_init();
-    if (elements_hs_exchange_inbox_entry_v1(mode, fields.data(), input.size(), input.data(), output.size(), output.data()) != 0)
-        throw std::runtime_error("Haskell inbox entry encoding failed");
-    return output;
-}
-
-
-bool ExchangeHeader(HeaderPhase phase, const std::function<bool(uint32_t)>& read, std::string& error)
-{
-    const auto mode = static_cast<uint32_t>(phase);
-    if (mode>2) throw std::runtime_error("Haskell exchange header validation failed");
-    static constexpr ReplayStoreFlow flows[]{ReplayStoreFlow::HEADER_INACTIVE,ReplayStoreFlow::HEADER_ACTIVE,ReplayStoreFlow::HEADER_GENESIS};
-    const auto result=ParentReplayStore(flows[mode],[&](uint32_t step) { return read(step-1); });
-    static constexpr const char* errors[]{
-        "ECX header extensions are forbidden before activation",
-        "all ECX header extensions are required and nonzero after activation",
-        "ECX activation header does not commit the frozen genesis roots"};
-    if (result) error = errors[mode];
-    return result == 0;
-}
-
-bool ExchangeConnection(bool activation, const std::function<bool(uint32_t)>& read, std::string& error)
-{
-    const int result = ReadBoundAdmission<int32_t,0>(elements_hs_exchange_connection_v1,read,activation);
-    if (result < 0 || result > 2) throw std::runtime_error("Haskell exchange connection validation failed");
-    if (result) error = result == 1 ? "ECX header roots do not match deterministic singleton and inbox derivation"
-                                   : "ECX activation cannot overwrite a reserved chainstate outpoint";
-    return result == 0;
-}
-
-bool ExchangeDisconnect(DisconnectPhase phase, const std::function<bool(uint32_t)>& perform, std::string& error)
-{
-    const int result = ReadBoundAdmission<int32_t,0>(elements_hs_exchange_disconnect_v1,perform,static_cast<uint32_t>(phase));
-    static constexpr const char* errors[]{
-        "prior ECX header state is unavailable during disconnect",
-        "prior ECX inbox header state is unavailable during disconnect",
-        "ECX inbox undo does not reproduce the disconnected header state",
-        "ECX activation tracker could not be removed",
-        "ECX activation inbox trackers could not be removed",
-        "ECX inbox count underflow during disconnect"};
-    return ExchangeResult(result, errors, error, "Haskell exchange disconnect failed");
-}
-
-bool ProductionIdentity(const std::function<bool(uint32_t)>& read, std::string* error)
-{
-    const int code = CheckedStatus(ReadAdmission<int32_t>(elements_hs_production_identity_v1, read),
-        32, "Haskell production identity validation failed");
-    static constexpr const char* fields[]{
-        "network id",
-        "data directory",
-        "RPC port",
-        "parent RPC port",
-        "onion target port",
-        "P2P port",
-        "P2P message-magic derivation",
-        "local enforcer-rule derivation",
-        "P2P message magic",
-        "P2PKH prefix",
-        "P2SH prefix",
-        "WIF prefix",
-        "extended public key prefix",
-        "extended secret key prefix",
-        "blinded address prefix",
-        "parent P2PKH prefix",
-        "parent P2SH prefix",
-        "bech32/blech32 namespaces",
-        "Elements/parent/slot mode",
-        "runtime Elements/header/signed-block codecs",
-        "parent-chain identity",
-        "signed-block/genesis mode",
-        "child genesis/asset identity",
-        "peer seeds/genesis checkpoint",
-        "Elements M1 proposal identity",
-        "historical parent proposal milestones",
-        "parent replay checkpoint assertions",
-        "replay/annex identity",
-        "SP1 resource schedule",
-        "SP1 V7 controller-bound activation",
-        "Taproot/Simplicity activation",
-        "issuance/policy identity",
-    };
-    if (code && error) *error = std::string("Elements production identity mismatch: ") + fields[code-1];
-    return code == 0;
-}
-
-static bool VerifierStartupResult(int result, std::string* error)
-{
-    const int code = CheckedStatus(result, 6, "Haskell verifier startup validation failed");
-    static constexpr const char* errors[]{
-        "USDD SP1 activation has no frozen verifier semantic identity",
-        "linked USDD SP1 verifier ABI does not match the production identity",
-        "linked USDD SP1 verifier semantic-identity format does not match the production identity",
-        "linked USDD SP1 verifier could not export its semantic identity",
-        "linked USDD SP1 verifier semantics do not match the production identity",
-        "USDD SP1 activation requires the pinned verifier, but this binary was built without it"};
-    if (code && error) *error = errors[code-1];
-    return code == 0;
-}
-
-
-bool VerifierIdentity(bool active, uint32_t abi, uint32_t format,
-    const std::array<unsigned char,32>& expected, RustVerifierVersion version,
-    RustVerifierVersion identity_version, RustVerifierIdentity identity, std::string* error)
-{
-    if (error) error->clear();
-    elements_hs_runtime_init();
-    return VerifierStartupResult(elements_hs_verifier_identity_v1(active, abi, format,
-        const_cast<unsigned char*>(expected.data()), reinterpret_cast<HsFunPtr>(version),
-        reinterpret_cast<HsFunPtr>(identity_version), reinterpret_cast<HsFunPtr>(identity)), error);
-}
-
-bool ActivationShape(const std::function<int64_t(uint32_t)>& read)
-{
-    return CheckedStatus(ReadAdmission<int64_t,-1>(elements_hs_activation_shape_v1, read),
-        1, "Haskell activation shape validation failed") == 1;
-}
-
-int64_t ActivationBudget(int64_t ordinary, uint32_t input, const std::function<bool(uint32_t)>& read)
-{
-    int64_t budget{};
-    CheckedStatus(ReadBoundAdmission<int32_t,-1>(elements_hs_activation_budget_v1, read, ordinary, input, &budget),
-        0, "Haskell activation budget validation failed");
-    return budget;
-}
-
-bool ExchangeConfiguration(const std::function<bool(uint32_t)>& read, std::string& error)
-{
-    const int result = ReadAdmission<int32_t>(elements_hs_exchange_configuration_v1,read);
-    static constexpr const char* errors[]{
-        nullptr,
-        "ECX genesis state outpoint collides with a reserved chainstate record",
-        "ECX activation parameters are incomplete",
-        "ECX collateral vault script hash does not match its frozen bytes"};
-    return ExchangeResult(result, errors, error, "Haskell exchange configuration failed");
-}
-
-uint32_t ExchangeTracker(TrackerPhase phase, const std::function<bool(uint32_t)>& read)
-{
-    const int result = ReadBoundAdmission<int32_t,0>(elements_hs_exchange_tracker_v1,read,static_cast<uint32_t>(phase));
-    return CheckedStatus(result,phase == TrackerPhase::ENCODING ? 2 : 1,"Haskell exchange tracker validation failed");
-}
-
-bool ExchangeAvailable(Availability kind, const std::function<bool(uint32_t)>& read)
-{
-    const int result = ReadBoundAdmission<int32_t,0>(elements_hs_exchange_availability_v1,read,static_cast<uint32_t>(kind));
-    return CheckedStatus(result,1,"Haskell exchange availability failed") == 0;
-}
-
-bool ExchangeSnapshot(const std::function<bool(uint32_t)>& read, std::string& error)
-{
-    static constexpr const char* errors[]{"active tip has no complete ECX consensus context", nullptr,
-        "persisted ECX context disagrees with the active tip"};
-    return ExchangeResult(ReadAdmission<int32_t>(elements_hs_exchange_snapshot_v1,read),errors,error,
-        "Haskell exchange snapshot evaluation failed");
-}
-
-
-bool ExchangeGenesisInitialization(uint32_t version, const std::function<bool(uint32_t)>& read, std::string& error)
-{
-    const int code = ReadBoundAdmission<int32_t,0>(elements_hs_exchange_genesis_initialization_v1,read,version);
-    static constexpr const char* errors[]{
-        "ECX genesis initialization requires nonzero authenticated context",
-        "ECX legacy genesis cannot contain checkpoint initialization fields",
-        "ECX checkpoint genesis initialization has invalid ordering or version",
-        "ECX genesis initialization is not the pinned authenticated ancestor"};
-    return ExchangeResult(code, errors, error, "Haskell exchange genesis initialization failed");
-}
-
-bool ExchangeDeployment(uint32_t version, const std::function<bool(uint32_t)>& read, std::string& error)
-{
-    const int code = ReadBoundAdmission<int32_t,0>(elements_hs_exchange_deployment_v1,read,version);
-    static constexpr const char* errors[]{
-        "unsupported ECX deployment version",
-        "public ECX deployment requires zero blinders",
-        "ECX bond V2 activation is disabled",
-        "ECX bond V2 identities are not source-frozen"};
-    return ExchangeResult(code, errors, error, "Haskell exchange deployment validation failed");
-}
-
-int ExchangeRequiredIdentity(bool public_deployment, bool direct_price, const std::function<bool(uint32_t)>& read)
-{
-    const int code = ReadBoundAdmission<int32_t,0>(elements_hs_exchange_required_identities_v1,read,
-        unsigned(public_deployment) | (unsigned(direct_price) << 1));
-    return CheckedStatus(code,45,"Haskell required exchange identities failed");
-}
-
-static int ReadTransactionShape(uint32_t phase, const std::function<bool(uint32_t)>& read)
-{
-    return ReadBoundAdmission<int32_t,0>(elements_hs_exchange_transaction_shape_v1,read,phase);
-}
-
-bool ExchangeTransactionShape(TransactionShape phase, const std::function<bool(uint32_t)>& read, std::string& error)
-{
-    const int code = phase==TransactionShape::ISSUANCE ?
-        (ParentReplayStore(ReplayStoreFlow::EXCHANGE_ISSUANCE,[&](uint32_t step) { return read(step-1); }) ? 4 : 0) :
-        ReadTransactionShape(static_cast<uint32_t>(phase),read);
-    static constexpr const char* errors[]{
-        "ECX singleton must be transition input zero",
-        "ECX transition has no successor output zero",
-        "ECX bond V2 physical deployment/genesis linkage changed",
-        "ECX bond V2 deployment/genesis issuance shape changed",
-        "ECX bond V2 deployment outputs differ from the authorized facts",
-        "ECX bond V2 activation requires confirmed ordered deployment and genesis UTXOs",
-        "ECX bond V2 genesis singleton is not the exact derived empty state",
-        "ECX bond-inbox source lacks its designated Taproot annex input",
-        "ECX bond-inbox designated input is not an exact key-path annex spend",
-        "ECX bond-inbox source contains a second Taproot annex",
-        "ECX bond-inbox source has too many or duplicate markers",
-        "ECX bond-inbox staging output index is invalid",
-        "ECX bond-inbox staging output is not the exact confidential frozen descriptor form",
-        "ECX bond-inbox staging output serialization is invalid",
-        "ECX bond-inbox marker source authorization is invalid",
-        "ECX bond-inbox source transaction must contain exactly one marker",
-        "ECX V18 staging renderer inputs or frozen identity are invalid",
-        "private ECX BMM parameters require a private-E2E build",
-        "private ECX BMM parameters are restricted to elementsregtest",
-        "-ecxprivatebmmcheckpoint requires an explicit -ecxprivatebmmactivationheight",
-        "-ecxprivatebmmactivationheight requires -ecxprivatebmmcheckpoint=1",
-        "invalid -ecxprivatebmmactivationheight",
-        "ECX bond V2 deployment transaction shape is invalid",
-        "ECX forced-action output index is out of range",
-        nullptr,
-        "output is not a canonical ECX forced action",
-        "ECX forced action marker envelope is non-canonical",
-        "ECX deposit marker envelope or chain id is non-canonical",
-        "ECX deposit marker has an invalid trader or referenced vout",
-        "ECX deposit does not match the confidential collateral vault profile",
-        "ECX forced action contains an invalid x-only trader key",
-        "ECX forced action signature is invalid",
-        "tracked ECX singleton is missing from the UTXO set",
-        "tracked ECX singleton does not match its persisted root"};
-    return ExchangeResult(code, errors, error, "Haskell exchange transaction shape failed");
-}
-
-bool ExchangeActivationSettings(const std::function<bool(uint32_t)>& read)
-{
-    const int code = ReadTransactionShape(16,read);
-    if (code == 0 || code == 25) return code == 25;
-    if (code == 23) throw std::runtime_error(
-        "ECX runtime activation parameters are restricted to elementsregtest; "
-        "production deployments must freeze them in source");
-    if (code == 24) throw std::runtime_error(
-        "ECX regtest activation requires -ecxactivationheight, "
-        "-ecxgenesisstateoutpoint, -ecxgenesisstateroot, -ecxchainid, "
-        "-ecxforcedactiondomain, -ecxdepositinboxdomain, "
-        "-ecxcollateralvaultscript, and -ecxcollateralvaultscripthash together");
-    throw std::runtime_error("Haskell exchange activation settings failed");
-}
-
-uint32_t ExchangeBondSettings(const std::function<bool(uint32_t)>& read)
-{
-    const int code = ReadTransactionShape(17,read);
-    return CheckedStatus(code,38,"Haskell exchange bond settings failed");
-}
-
-bool ExchangePhysicalInputs(bool public_deployment, const std::function<bool(uint32_t)>& read)
-{
-    const int code = ReadBoundAdmission<int32_t,0>(elements_hs_exchange_physical_inputs_v1,read,public_deployment);
-    return CheckedStatus(code,1,"Haskell exchange physical inputs failed") == 0;
-}
-
-bool ExchangeProfile(bool collateral, const std::function<bool(uint32_t)>& read)
-{
-    const int result = ReadBoundAdmission<int32_t,0>(elements_hs_exchange_profile_v1,read,collateral);
-    if (result < 0 || result > 1) throw std::runtime_error("Haskell exchange output profile failed");
-    return result == 0;
-}
-
-static constexpr const char* CURSOR_ERRORS[]{
-    "ECX state transition is missing its processed-cursor marker",
-    "ECX processed-cursor marker requires a state transition",
-    "ECX processed cursors are not monotonic or are outside the state transition",
-    nullptr,
-    "an ECX block may contain only one processed-cursor marker"};
-
-
-bool ExchangeDeriveCursors(uint64_t count, uint32_t flags, uint64_t previous_forced, uint64_t previous_deposit,
-    const std::function<int32_t(uint32_t, uint64_t, uint64_t, uint64_t*)>& read,
-    uint64_t& forced, uint64_t& deposit, std::string& error)
-{
-    std::array<uint64_t, 2> result{};
-    const int code = ReadBoundAdmission<int32_t,-1>(elements_hs_exchange_derive_cursors_v1,read,
-        count,flags,previous_forced,previous_deposit,result.data());
-    if (!ExchangeResult(code,CURSOR_ERRORS,error,"Haskell cursor derivation failed")) return false;
-    forced = result[0];
-    deposit = result[1];
-    return true;
-}
-
-template <typename Binding, typename... Params>
-static int ReadScalarAdmission(const Binding& binding,
-    const std::function<uint64_t(uint32_t,uint64_t,uint64_t)>& read, Params... params)
-{
-    const std::function<int32_t(uint32_t,uint64_t,uint64_t,uint64_t*)> action =
-        [&](uint32_t step, uint64_t a, uint64_t b, uint64_t* field) { *field=read(step,a,b); return 1; };
-    return ReadBoundAdmission<int32_t,-1>(binding,action,params...);
-}
-
-bool StartupArgs(uint32_t slot, uint32_t timeout_maximum, const std::function<uint64_t(uint32_t)>& read)
-{
-    return CheckedStatus(ReadScalarAdmission(elements_hs_startup_args_v1,
-        [&](uint32_t step, uint64_t, uint64_t) { return read(step); }, slot,
-        uint64_t{MAX_MONEY}, uint64_t{timeout_maximum}), 1, "Haskell startup admission failed")==0;
-}
-
-void FeeFreeSelection(int64_t age, const std::function<uint64_t(uint32_t)>& read)
-{
-    if (ReadScalarAdmission(elements_hs_fee_free_selection_v1,
-        [&](uint32_t step, uint64_t, uint64_t) { return read(step); }, age)!=1)
-        throw std::runtime_error("Haskell fee-free selection failed");
-}
-
-
-bool DepositInputLimit(bool enabled, uint64_t count, uint64_t limit,
-    const std::function<uint64_t(uint32_t,uint64_t,uint64_t)>& read)
-{
-    return CheckedStatus(ReadScalarAdmission(elements_hs_deposit_input_limit_v1,
-        read,uint32_t{enabled},count,limit),1,"Haskell deposit input limit failed") == 1;
-}
-
-static uint32_t ResourceAdmission(std::array<uint64_t,6> options, const UsddResourceSource& source,
-    const std::function<uint64_t(uint32_t,uint64_t)>& read)
-{
-    UsddInputs input{source.fields};
-    auto profile = source.profile;
-    std::array<uint64_t,4> shape{};
-    uint64_t total{0};
-    const auto result = ReadScalarAdmission(elements_hs_usdd_resource_workflow_v1,
-        [&](uint32_t step,uint64_t index,uint64_t) {
-            if (step!=6) return read(step,index);
-            input.Read(source.read(index),source.parameterized,shape);
-            return uint64_t{1};
-        },options.data(),input.pointers.data(),input.sizes.data(),profile.data(),source.limit,
-        shape.data(),&total,reinterpret_cast<HsFunPtr>(HashUsddPayload));
-    return CheckedStatus(result,options[0]==2 ? 8 : options[0]==1 ? 1 : 10,"Haskell USDD resource admission failed");
-}
-
-uint32_t UsddBlockResources(uint64_t count, uint64_t lane, uint64_t weight,
-    const std::function<uint64_t(uint32_t,uint64_t)>& read, const UsddResourceSource* source)
-{
-    if (source) return ResourceAdmission({0,0,count,0,lane,weight},*source,read);
-    uint64_t total{0};
-    return CheckedStatus(ReadScalarAdmission(elements_hs_usdd_block_resources_v1,
-        [&](uint32_t step,uint64_t index,uint64_t) { return read(step,index); },
-        count,lane,weight,&total),10,"Haskell USDD block resource admission failed");
-}
-
-bool UsddPackageResources(uint32_t flags, uint64_t count, uint64_t initial, uint64_t lane,
-    const std::function<uint64_t(uint32_t,uint64_t)>& read, const UsddResourceSource* source)
-{
-    if (source) return ResourceAdmission({1,flags,count,initial,lane,0},*source,read)==0;
-    uint64_t total{0};
-    return CheckedStatus(ReadScalarAdmission(elements_hs_usdd_package_resources_v1,
-        [&](uint32_t step,uint64_t index,uint64_t) { return read(step,index); },
-        flags,count,initial,lane,&total),1,"Haskell USDD package admission failed")==0;
-}
-
-uint32_t UsddPolicyWeight(uint32_t flags, uint64_t count,
-    const std::function<uint64_t(uint32_t,uint64_t)>& read, bool expanded_activation, const UsddResourceSource* source)
-{
-    if (source) return ResourceAdmission({2,0,count,0,0,0},*source,read);
-    const auto run = [&](const auto& binding) {
-        return ReadScalarAdmission(binding,
-            [&](uint32_t step,uint64_t index,uint64_t) { return read(step,index); },flags,count);
-    };
-    return CheckedStatus(expanded_activation ? run(elements_hs_usdd_policy_weight_v2) :
-        run(elements_hs_usdd_policy_weight_v1),8,"Haskell USDD policy admission failed");
-}
-
-bool ExchangeSourcePackage(bool enabled, uint64_t count,
-    const std::function<uint64_t(uint32_t,uint64_t)>& action, uint64_t& selected, bool modified)
-{
-    uint64_t next{0};
-    const auto code = CheckedStatus(ReadScalarAdmission(elements_hs_source_selection_v1,
-        [&](uint32_t step,uint64_t index,uint64_t) { return action(step,index); },
-        static_cast<uint32_t>(enabled),static_cast<uint32_t>(modified),count,&next),1,"Haskell source package evaluation failed");
-    if (code==0) selected=next;
-    return code==0;
-}
-
-bool AdmitTlsCredentialFile(bool private_key, const std::function<uint64_t(uint32_t)>& read)
-{
-    return CheckedStatus(ReadScalarAdmission(elements_hs_tls_file_admission_v1,
-        [&](uint32_t step,uint64_t,uint64_t) { return read(step); },static_cast<uint32_t>(private_key)),
-        1,"Haskell mTLS credential admission failed") == 1;
-}
-
-
-
-bool RunExchangeStateWorkflow(ExchangeStateWorkflow kind, uint64_t count,
-    const std::function<uint64_t(uint32_t,uint64_t,uint64_t)>& action, std::string& error)
-{
-    const int code = ReadScalarAdmission(elements_hs_exchange_state_workflow_v1,action,static_cast<uint32_t>(kind),count);
-    const bool successor = kind == ExchangeStateWorkflow::TRANSITION || kind == ExchangeStateWorkflow::SUCCESSOR_AUTHORITY;
-    if (code >= 101 && code <= 104) {
-        static constexpr const char* errors[]{
-            "ECX transition changed the state authority asset",
-            "ECX transition changed the state authority value"};
-        if (code == 101) error = successor ? "ECX successor authority must use an explicit asset/value and null nonce" :
-            "ECX state authority must use an explicit asset/value and null nonce";
-        else if (code == 104) error = successor ? "ECX successor state authority must be a P2TR output" :
-            "ECX state authority must be a P2TR output";
-        else error = errors[code-102];
-        return false;
-    }
-    if (code == 233 || code == 234) {
-        error = code == 233 ? "tracked ECX singleton is missing from the UTXO set" :
-            "tracked ECX singleton does not match its persisted root";
-        return false;
-    }
-    static constexpr const char* errors[]{
-        "more than one transaction spends the ECX singleton",
-        "ECX singleton must be transition input zero",
-        "ECX transition has no successor output zero",
-        nullptr,
-        "a block may contain at most one ECX state transition"};
-    if (code == 4) throw std::runtime_error("missing exchange authority rejection");
-    return ExchangeResult(code,errors,error,"Haskell exchange state workflow failed");
-}
-
-static bool SourceResult(int code, bool successor, std::string& error)
-{
-    if (code < 0 || code > 3) throw std::runtime_error("Haskell source tracking failed");
-    if (!code) return true;
-    error = successor ? "ECX successor bond-inbox " : "ECX bond-inbox ";
-    if (code == 3) error += "duplicate wtxid has inconsistent source facts";
-    else {
-        error += "block ";
-        error += code == 1 ? "source byte accounting overflowed" :
-            successor ? "exceeds source byte caps" : "exceeds deduplicated source byte caps";
-    }
-    return false;
-}
-
-bool ExchangeSourcePredecessor(bool successor, uint64_t proof_profile, uint64_t height, uint64_t parent,
-    std::span<const unsigned char,32> head, std::span<const unsigned char,16> count,
-    std::span<const unsigned char,16> processed, std::string& error)
-{
-    std::array<uint64_t,7> fields{successor,proof_profile,height,parent};
-    std::array<unsigned char,64> input{};
-    std::copy(head.begin(),head.end(),input.begin());
-    std::copy(count.begin(),count.end(),input.begin()+32);
-    std::copy(processed.begin(),processed.end(),input.begin()+48);
-    std::array<unsigned char,48> output{};
-    elements_hs_runtime_init();
-    const int code = elements_hs_exchange_inbox_entry_v1(12,fields.data(),input.size(),input.data(),output.size(),output.data());
-    if (code < 0 || code > 2) throw std::runtime_error("Haskell source predecessor failed");
-    if (code == 1) error = std::string(successor ? "ECX successor bond-inbox" : "ECX bond-inbox") + " source tracker has no canonical predecessor";
-    if (code == 2) error = "finite ECX bond-inbox source tracker exceeds its u64 wire";
-    return code == 0;
-}
-
-bool ExchangeTrackSource(bool successor, std::array<uint64_t, 4> fields,
-    std::initializer_list<const unsigned char*> hashes, std::vector<unsigned char>& state, std::string& error)
-{
-    if (hashes.size() != 3 || state.size() > state.max_size()-104)
-        throw std::runtime_error("invalid source tracking input");
-    std::array<unsigned char,96> identities{};
-    auto destination = identities.begin();
-    for (const auto* hash : hashes) {
-        if (!hash) throw std::runtime_error("null source tracking hash");
-        destination = std::copy_n(hash,32,destination);
-    }
-    std::vector<unsigned char> next(state.size()+104);
-    uint64_t written{0};
-    elements_hs_runtime_init();
-    const int code = elements_hs_exchange_sources_v1(fields.data(),identities.data(),state.size(),state.data(),next.data(),&written);
-    if (!SourceResult(code,successor,error)) return false;
-    if (written != state.size() && written != next.size()) throw std::runtime_error("invalid source tracking output");
-    next.resize(written);
-    state = std::move(next);
-    return true;
-}
-
-static bool MarkerResult(int code, bool wide, std::string& error)
-{
-    static constexpr const char* finite[]{"ECX bond-inbox process deadline overflows u64",
-        "ECX bond-inbox enqueue refund boundary is earlier than the frozen observed-parent delay",
-        "ECX bond-inbox block exceeds its marker/index bounds",
-        "ECX bond-inbox marker changed after source verification"};
-    static constexpr const char* successor[]{"ECX successor bond-inbox process deadline overflows u64",
-        "ECX successor bond-inbox enqueue refund boundary is too early",
-        "ECX successor bond-inbox block exceeds marker/index bounds",
-        "ECX successor bond-inbox marker changed after source verification",
-        "ECX successor bond-inbox entry count overflows u128"};
-    if (code < 0 || code > (wide ? 5 : 4)) throw std::runtime_error("Haskell marker append failed");
-    if (code) error = (wide ? successor : finite)[code-1];
-    return code == 0;
-}
-
-bool ExchangeAppendMarker(std::array<uint64_t, 14> fields,
-    std::initializer_list<const unsigned char*> hashes, std::span<const unsigned char, 16> count,
-    std::span<const unsigned char> script,
-    const std::function<void(uint32_t, std::span<const unsigned char>, std::span<unsigned char, 32>)>& effect,
-    std::array<unsigned char, 48>& state, std::string& error)
-{
-    if (hashes.size() != 5 || script.size() != 507) throw std::runtime_error("invalid marker append input");
-    std::vector<unsigned char> input;
-    for (const auto* hash : hashes) {
-        if (!hash) throw std::runtime_error("null marker append hash");
-        input.insert(input.end(), hash, hash+32);
-    }
-    input.insert(input.end(), count.begin(), count.end());
-    input.insert(input.end(), script.begin(), script.end());
-    const int code = ReadAdmission<int32_t, -1>([&](HsFunPtr callback, void* context) {
-        return elements_hs_exchange_append_marker_v1(fields.data(), input.data(), callback, context, state.data());
-    }, NativeDigestEffect{[&](uint32_t kind, uint64_t size, unsigned char* bytes, unsigned char* digest) {
-        if (kind > 2 || size > 716 || !bytes || !digest) return int32_t{-1};
-        effect(kind, {bytes, static_cast<size_t>(size)}, std::span<unsigned char,32>{digest,32});
-        return int32_t{0};
-    }});
-    return MarkerResult(code, fields[0], error);
-}
-
-bool ExchangeBondMarker(uint64_t limit, std::span<const unsigned char> payload,
-    std::initializer_list<const unsigned char*> identities, std::string& error)
-{
-    if (identities.size() != 4) throw std::runtime_error("invalid marker identities");
-    std::vector<unsigned char> expected;
-    for (const auto* hash : identities) {
-        if (!hash) throw std::runtime_error("null marker identity");
-        expected.insert(expected.end(),hash,hash+32);
-    }
-    elements_hs_runtime_init();
-    const int code = elements_hs_exchange_bond_marker_v1(limit,payload.size(),const_cast<unsigned char*>(payload.data()),expected.data());
-    static constexpr const char* errors[]{"ECX bond-inbox marker identities/availability claim are invalid",
-        "ECX bond-inbox marker staging sentinels are invalid"};
-    return ExchangeResult(code,errors,error,"Haskell marker validation failed");
-}
-
-static bool DecodeExchangeMarker(uint32_t mode, size_t size, std::span<const unsigned char> script, std::vector<unsigned char>& payload)
-{
-    std::array<uint64_t,7> fields{};
-    std::vector<unsigned char> decoded(size);
-    elements_hs_runtime_init();
-    if (elements_hs_exchange_inbox_entry_v1(mode,fields.data(),script.size(),
-            const_cast<unsigned char*>(script.data()),decoded.size(),decoded.data()) != 0) return false;
-    payload = std::move(decoded);
-    return true;
-}
-
-bool ExchangeMarkerFrame(bool successor, std::span<const unsigned char> script, std::vector<unsigned char>& payload)
-{
-    return DecodeExchangeMarker(successor ? 8 : 7,503,script,payload);
-}
-
-bool ExchangeLegacyMarkerFrame(bool forced, std::span<const unsigned char> script, std::vector<unsigned char>& payload)
-{
-    // Bound allocation before crossing the FFI; Haskell checks the exact frame.
-    if (script.size() < 11 || script.size() > 258) return false;
-    return DecodeExchangeMarker(forced ? 16 : 17,forced ? script.size()-3 : 73,script,payload);
-}
-
-bool ExchangeCursorPayload(std::span<const unsigned char> payload, bool& marker,
-    uint64_t& forced, uint64_t& deposit, std::string& error)
-{
-    // One excess byte preserves invalid-length recognition without copying large pushes.
-    std::array<unsigned char,22> input{};
-    const size_t size = std::min(payload.size(),input.size());
-    std::copy_n(payload.begin(),size,input.begin());
-    std::vector<unsigned char> decoded;
-    marker = false;
-    if (!DecodeExchangeMarker(18,17,std::span{input}.first(size),decoded)) {
-        error = "Haskell cursor payload decoding failed";
-        return false;
-    }
-    marker = decoded[0] != 0;
-    if (decoded[0] == 2) {
-        error = "ECX processed-cursor marker has an invalid version or length";
-        return false;
-    }
-    if (marker) {
-        forced = ReadLE64(decoded.data()+1);
-        deposit = ReadLE64(decoded.data()+9);
-    }
-    return true;
-}
-
-bool ExchangeAnnexHeader(std::span<const unsigned char> annex, uint64_t expected, uint64_t limit,
-    uint32_t& bundle_length, uint8_t& receipt_count, std::string& error)
-{
-    unsigned char empty{};
-    std::array<uint64_t,2> decoded{};
-    elements_hs_runtime_init();
-    const int code = elements_hs_exchange_annex_header_v1(expected,limit,annex.size(),
-        annex.empty() ? &empty : const_cast<unsigned char*>(annex.data()),decoded.data());
-    static constexpr const char* errors[]{"ECX bond-inbox source annex has a noncanonical prefix/version",
-        "ECX bond-inbox source annex has invalid bundle/receipt lengths"};
-    if (!ExchangeResult(code,errors,error,"Haskell annex header failed")) return false;
-    bundle_length = decoded[0];
-    receipt_count = decoded[1];
-    return true;
-}
-
-std::string ConfigurationIdentity(const std::string& network, std::span<const unsigned char,64> identities, const CustodyHash& hash)
-{
-    if (!hash || network.size()>std::numeric_limits<size_t>::max()-258) throw std::invalid_argument("invalid identity inputs");
-    std::string record(network.size()+258,'\0');
-    uint64_t written{0};
-    const int code=ReadAdmission<int32_t,-1>([&](HsFunPtr callback,void* context) {
-        return elements_hs_configuration_identity_v1(network.size(),reinterpret_cast<unsigned char*>(const_cast<char*>(network.data())),
-            const_cast<unsigned char*>(identities.data()),callback,context,record.size(),reinterpret_cast<unsigned char*>(record.data()),&written);
-    },NativeDigestEffect{[&](uint32_t kind,uint64_t size,unsigned char* input,unsigned char* output) {
-        if (kind!=0 || size>record.size() || !input || !output) return int32_t{-1};
-        const auto digest=hash(kind,{input,static_cast<size_t>(size)});
-        std::copy(digest.begin(),digest.end(),output);
-        return int32_t{0};
-    }});
-    if (code!=0 || written>record.size()) throw std::runtime_error("Haskell identity record failed");
-    record.resize(written);
-    return record;
-}
-
-bool MaterialName(bool chainstates, const std::string& filename)
-{
-    elements_hs_runtime_init();
-    const auto result=elements_hs_material_name_v1(chainstates,filename.size(),
-        reinterpret_cast<unsigned char*>(const_cast<char*>(filename.data())));
-    return CheckedStatus(result,1,"Haskell material filename failed") == 1;
-}
-
-bool IdentityWrite(const std::function<bool(uint32_t)>& perform)
-{
-    if (!perform) throw std::invalid_argument("missing identity write actions");
-    const auto result=ReadAdmission<int32_t,-1>(elements_hs_identity_write_v1,perform);
-    return CheckedStatus(result,1,"Haskell identity write failed") == 1;
-}
-
-std::array<unsigned char,32> ExchangeCustodyRoot(uint64_t bundle_length,
-    std::initializer_list<const unsigned char*> identities, std::span<const unsigned char> receipts, const CustodyHash& hash)
-{
-    if (identities.size()!=6 || !hash) throw std::invalid_argument("invalid custody root inputs");
-    std::vector<unsigned char> fields;
-    for (const auto* field : identities) {
-        if (!field) throw std::invalid_argument("null custody identity");
-        fields.insert(fields.end(),field,field+32);
-    }
-    std::array<unsigned char,32> root{};
-    unsigned char empty{};
-    const int code = ReadAdmission<int32_t, -1>([&](HsFunPtr callback, void* context) {
-        return elements_hs_exchange_custody_root_v1(bundle_length,fields.data(),receipts.size(),
-            receipts.empty() ? &empty : const_cast<unsigned char*>(receipts.data()),callback,context,root.data());
-    }, NativeDigestEffect{[&](uint32_t kind, uint64_t size, unsigned char* input, unsigned char* output) {
-        if (kind>5 || size>229 || !input || !output) return int32_t{-1};
-        const auto digest = hash(kind,{input,static_cast<size_t>(size)});
-        std::copy(digest.begin(),digest.end(),output);
-        return int32_t{0};
-    }});
-    if (code!=0) throw std::runtime_error("Haskell custody root failed");
-    return root;
-}
-
-std::array<unsigned char,128> ExchangeGenesisRoots(uint64_t height, uint64_t mtp, uint64_t price,
-    std::initializer_list<const unsigned char*> identities, const CustodyHash& hash)
-{
-    if (identities.size()!=12 || !hash) throw std::invalid_argument("invalid genesis root inputs");
-    std::array<unsigned char,384> fields;
-    size_t offset=0;
-    for (const auto* field : identities) {
-        if (!field) throw std::invalid_argument("null genesis root identity");
-        std::copy_n(field,32,fields.begin()+offset);
-        offset+=32;
-    }
-    std::array<unsigned char,128> roots{};
-    const int code=ReadAdmission<int32_t,-1>([&](HsFunPtr callback, void* context) {
-        return elements_hs_exchange_genesis_roots_v1(height,mtp,price,fields.data(),callback,context,roots.data());
-    },NativeDigestEffect{[&](uint32_t kind,uint64_t size,unsigned char* input,unsigned char* output) {
-        if (kind>9 || size>1713 || !output || (!input && size)) return int32_t{-1};
-        const auto digest=hash(kind,{input,static_cast<size_t>(size)});
-        std::copy(digest.begin(),digest.end(),output);
-        return int32_t{0};
-    }});
-    if (code!=0) throw std::runtime_error("Haskell genesis root construction failed");
-    return roots;
-}
-
-bool ExchangeFrozenConfiguration(std::span<const unsigned char> input, std::span<const unsigned char,16> market,
-    const CustodyHash& effect, std::string& error)
-{
-    error.clear();
-    if (!effect) throw std::invalid_argument("missing frozen configuration effect");
-    const int code=ReadAdmission<int32_t,-1>([&](HsFunPtr callback, void* context) {
-        return elements_hs_exchange_frozen_configuration_v1(input.size(),const_cast<unsigned char*>(input.data()),
-            const_cast<unsigned char*>(market.data()),callback,context);
-    },NativeDigestEffect{[&](uint32_t kind,uint64_t size,unsigned char* bytes,unsigned char* output) {
-        static constexpr size_t sizes[]{383,100,130,32,160,64,32,1,32,96,485,260};
-        if (kind>=std::size(sizes) || size!=sizes[kind] || !bytes || !output) return int32_t{-1};
-        const auto result=effect(kind,{bytes,static_cast<size_t>(size)});
-        std::copy(result.begin(),result.end(),output);
-        return int32_t{0};
-    }});
-    static constexpr const char* reasons[]{"outer/base identity","USDD checkpoint profile","risk profile",
-        "availability profile","Truthcoin authentication profile","Truthcoin anchor deployment","hybrid oracle profile",
-        "direct native price lane","central matcher profile","base accumulator profile","duplicate base identity",
-        "policy asset aliases an unrelated base identity","bond/covenant identities","staging descriptor commitment",
-        "bond inbox/matcher limits","versioned oracle conversion identities","recursive proof/bond constants or trailing bytes",
-        "duplicate outer identity","cross-role identity collision"};
-    if (code==0) return true;
-    if (code<1 || code>20) throw std::runtime_error("Haskell frozen configuration decoding failed");
-    error=code==1 ? "canonical FrozenConfigurationV2/V18 must be exactly 1977 bytes" :
-        std::string("noncanonical FrozenConfigurationV2/V18: ")+reasons[code-2];
-    return false;
-}
-
-bool ExchangeCustodyReceipts(uint32_t count, std::span<const unsigned char> encoded,
-    std::vector<unsigned char>& receipts, uint8_t& bitmap, std::string& error)
-{
-    if (count < 3 || count > 5) throw std::invalid_argument("invalid custody receipt count");
-    std::vector<unsigned char> decoded(count * 138 + 1);
-    unsigned char empty{};
-    elements_hs_runtime_init();
-    const int code = elements_hs_exchange_receipts_v1(count,encoded.size(),
-        encoded.empty() ? &empty : const_cast<unsigned char*>(encoded.data()),decoded.size(),decoded.data());
-    static constexpr const char* errors[]{
-        "ECX bond-inbox source annex truncated a receipt length",
-        "ECX bond-inbox source annex receipt length is noncanonical",
-        "ECX bond-inbox source annex receipts are not registry ordered",
-        "ECX bond-inbox source annex receipt evidence is invalid"};
-    if (!ExchangeResult(code,errors,error,"Haskell custody receipt decoding failed")) return false;
-    bitmap = decoded.back();
-    decoded.pop_back();
-    receipts = std::move(decoded);
-    return true;
-}
-
-static const char* SourceBudgetError(bool invalid_cursor)
-{
-    return invalid_cursor ? "ECX source backlog cursors are invalid" : "ECX source backlog exceeds consensus bounds";
-}
-
-bool ExchangeTemplateBudget(int64_t height, int64_t activation, const std::function<uint64_t(uint32_t)>& read,
-    uint64_t& budget, std::string& error)
-{
-    const auto code = CheckedStatus(ReadScalarAdmission(elements_hs_template_budget_v1,
-        [&](uint32_t step, uint64_t, uint64_t) { return read(step); }, height, activation, &budget),
-        3, "Haskell template budget evaluation failed");
-    if (code==0) error.clear();
-    else error = code==1 ? "cannot read ECX source backlog: "+error : SourceBudgetError(code==2);
-    return code==0;
-}
-
-std::array<uint64_t, 2> ExchangePending(std::array<uint64_t, 4> fields)
-{
-    elements_hs_runtime_init();
-    std::array<uint64_t, 2> result{};
-    if (elements_hs_exchange_inbox_v1(5, fields.size(), fields.data(), result.data()) != 0)
-        throw std::logic_error("invalid checked exchange inbox counts");
-    return result;
-}
-
-bool ExchangeInbox(std::span<const uint64_t> fields, uint64_t& output, std::string& error)
-{
-    if (fields.size() != 3 && fields.size() != 4 && fields.size() != 12) throw std::invalid_argument("invalid exchange inbox projection");
-    const bool budget = fields.size() == 4;
-    if (budget) { output = 0; error.clear(); }
-    elements_hs_runtime_init();
-    std::array<uint64_t, 2> result{};
-    const int code = elements_hs_exchange_inbox_v1(fields.size()==3 ? 4 : !budget, fields.size(),
-        const_cast<uint64_t*>(fields.data()), result.data());
-    if (code < 0 || code > 8 || result[0] > 1) throw std::runtime_error("Haskell exchange inbox validation failed");
-    if (result[0]) output = result[1];
-    static constexpr const char* errors[]{
-        "ECX processed cursor exceeds its source entry count",
-        "ECX source appends exceed the combined same-parent limit",
-        "ECX source suffix exceeds the maximum transition witness profile",
-        "ECX combined unconsumed source backlog exceeds consensus bounds",
-        "ECX pending source backlog has no authenticated parent height",
-        "ECX prior backlog age commitment is missing or invalid",
-        "ECX source backlog exceeded the forced-inclusion deadline",
-        "ECX activation block must carry the frozen inbox genesis state"};
-    if (code) error = budget
-        ? SourceBudgetError(code == 1)
-        : errors[code-1];
-    return code == 0;
-}
-
-void BmmFixedIdentity(std::span<uint32_t, 2> fields, std::span<unsigned char, 121> payload)
-{
-    elements_hs_runtime_init();
-    if (elements_hs_bmm_identity_v1(fields.data(), payload.data()) != 0)
-        throw std::runtime_error("Haskell BMM fixed identity failed");
-}
-
-void BmmCheckpointPreset(uint32_t mode, std::span<uint32_t, 16> fields,
-    std::span<unsigned char, 32> block_hash)
-{
-    elements_hs_runtime_init();
-    if (elements_hs_bmm_checkpoint_v1(mode, fields.data(), block_hash.data()) != 0)
-        throw std::runtime_error("Haskell BMM checkpoint failed");
-}
-
-uint32_t BmmConsensusPreset(uint32_t mode, std::span<uint64_t, 6> fields,
-    std::span<unsigned char, 32> pow_limit, std::span<unsigned char, 22> challenge)
-{
-    elements_hs_runtime_init();
-    const auto size = elements_hs_bmm_preset_v1(mode, fields.data(), pow_limit.data(), challenge.data());
-    if (size < 0 || size > 22) throw std::runtime_error("Haskell BMM preset failed");
-    return size;
-}
-
-int64_t BmmDifficultyInterval(int64_t timespan, int64_t spacing)
-{
-    elements_hs_runtime_init();
-    int64_t interval{0};
-    if (elements_hs_bmm_interval_v1(timespan, spacing, &interval) != 0)
-        throw std::runtime_error("Haskell difficulty interval failed");
-    return interval;
-}
-
-std::array<uint32_t,2> BmmHeaderLayout(uint32_t version, uint32_t flags)
-{
-    elements_hs_runtime_init();
-    std::array<uint32_t,2> layout{};
-    // The fresh header field is available only under its explicit wire mode.
-    constexpr uint32_t legacy_fields{0x1ffU};
-    constexpr uint32_t swap_forced_field{1U << 9};
-    const uint32_t allowed_fields = legacy_fields | ((flags & (1U << 6)) ? swap_forced_field : 0U);
-    if (elements_hs_bmm_header_layout_v1(version,flags,layout.size(),layout.data()) != 0 ||
-        (layout[1] & ~allowed_fields) != 0)
-        throw std::runtime_error("Haskell header layout failed");
-    return layout;
-}
-
-bool MerkleReplacement(uint32_t mode, uint32_t index, uint32_t position, uint32_t flags)
-{
-    elements_hs_runtime_init();
-    const int result = elements_hs_merkle_replacement_v1(mode,index,position,flags);
-    if (result < 0 || result > 1) throw std::runtime_error("Haskell Merkle replacement failed");
-    return result == 1;
-}
-
-void BmmPrivateTemplate(uint32_t height, uint32_t time, uint32_t median, uint32_t slot,
-    std::span<const unsigned char, 32> critical, std::span<uint32_t, 4> fields,
-    std::span<unsigned char, 37> commitment)
-{
-    elements_hs_runtime_init();
-    if (elements_hs_bmm_private_template_v1(height, time, median, slot,
-            const_cast<unsigned char*>(critical.data()), fields.data(), commitment.data()) != 0)
-        throw std::runtime_error("Haskell private BMM template failed");
 }
 
 std::vector<unsigned char> BmmFingerprint(const FingerprintReader& reader, uint32_t profile)
@@ -2536,7 +969,7 @@ bool DepositProofResult(int32_t result, std::string& error)
         "drivechain deposit transaction does not spend exactly one authenticated prior CTIP",
         "drivechain deposit value does not equal the authenticated CTIP increase",
     }};
-    return ExchangeResult(result, errors, error, "Haskell deposit proof evaluation failed");
+    return WorkflowResult(result, errors, error, "Haskell deposit proof evaluation failed");
 }
 } // namespace
 
@@ -2585,7 +1018,6 @@ bool RunBmmStateFlow(BmmStateStep start, const std::function<int32_t(BmmStateSte
     return CheckedStatus(ReadBoundAdmission<int64_t,INT64_MIN>(elements_hs_bmm_state_run_v1,read,
         static_cast<uint32_t>(start)),1,"Haskell BMM state flow failed") == 0;
 }
-
 
 void EventFields(EventLayoutKind kind, uint32_t status,
     const std::function<void(uint32_t, std::string_view, std::optional<std::string_view>)>& append)
@@ -2721,28 +1153,12 @@ int DepositMatch(int64_t slot, int64_t amount, int64_t bound, bool has_address, 
         9,"Haskell raw deposit match failed");
 }
 
-
-
-
-
-
-
-
-
-
-
 int M6Id(uint64_t outputs, uint64_t inputs, int64_t previous, int64_t maximum, bool has_slot,
     const std::function<int64_t(uint32_t,uint64_t)>& action)
 {
     return CheckedStatus(ReadBoundAdmission<int64_t,-1>(elements_hs_m6_id_v1,action,outputs,inputs,previous,maximum,has_slot),
         6,"Haskell M6 id preparation failed");
 }
-
-
-
-
-
-
 
 bool TreasuryDelta(int64_t previous, int64_t current, int64_t claimed, int64_t maximum)
 {
@@ -2766,7 +1182,6 @@ bool DepositMessageMatches(uint32_t kind, const std::string& message)
         reinterpret_cast<unsigned char*>(const_cast<char*>(message.data()))),1,
         "Invalid Haskell deposit message result") == 1;
 }
-
 
 static bool PredicateResult(int code, const char* invalid, const char* failed)
 {
@@ -2895,10 +1310,6 @@ bool RejectParentResult(bool invalid, bool unavailable)
         1, "Haskell parent result admission failed") == 1;
 }
 
-
-
-
-
 bool RunDepositAuthentication(const std::function<bool(DepositVerifyStep)>& action)
 {
     return RunDepositFlow(61, action);
@@ -2934,7 +1345,6 @@ uint32_t DepositStateFacts(bool present, bool matches, const std::string& decode
     return uint32_t{present} | (uint32_t{!decode_error.empty()} << 1) | (uint32_t{matches} << 2);
 }
 
-
 bool RunDepositStateWorkflow(DepositWorkflow kind, const std::function<uint32_t(DepositVerifyStep)>& action,
     const std::string& decode_error, std::string& error)
 {
@@ -2949,9 +1359,6 @@ bool RunDepositStateWorkflow(DepositWorkflow kind, const std::function<uint32_t(
         uint32_t{5}, static_cast<uint32_t>(kind)), "Haskell deposit action invalid", "Haskell deposit state workflow failed");
 }
 
-
-
-
 bool ReadPersistedCtip(uint32_t facts, int64_t amount, const std::function<int32_t(uint32_t)>& read,
     EvidenceDecode decode, void* context, std::string& error)
 {
@@ -2963,9 +1370,8 @@ bool ReadPersistedCtip(uint32_t facts, int64_t amount, const std::function<int32
         "persisted drivechain CTIP state script is malformed",
         "persisted drivechain CTIP state payload is invalid",
         "persisted drivechain CTIP state payload cannot be decoded"}};
-    return ExchangeResult(result,errors,error,"Haskell persisted CTIP workflow failed");
+    return WorkflowResult(result,errors,error,"Haskell persisted CTIP workflow failed");
 }
-
 
 static bool DepositEvidenceResult(int32_t result, std::string& error)
 {
@@ -2977,7 +1383,7 @@ static bool DepositEvidenceResult(int32_t result, std::string& error)
         "drivechain deposit sequence transition is invalid",
         "drivechain deposit header chain length is invalid",
     }};
-    return ExchangeResult(result, errors, error, "Haskell deposit evidence evaluation failed");
+    return WorkflowResult(result, errors, error, "Haskell deposit evidence evaluation failed");
 }
 
 bool DepositEvidence(std::span<const std::vector<unsigned char>> stack, const unsigned char* prevout,
@@ -3014,7 +1420,7 @@ bool ParseDeterministicDeposit(uint64_t inputs, uint64_t index, uint64_t witness
     }
     constexpr const char* errors[]{"drivechain deposit input index is out of range",
         "drivechain deposit evidence contains malformed transaction or merkle proof data"};
-    return ExchangeResult(result,errors,error,"Haskell deposit parsing failed");
+    return WorkflowResult(result,errors,error,"Haskell deposit parsing failed");
 }
 
 static bool AuthenticatedDepositResult(int32_t result, std::string& error)
@@ -3029,9 +1435,8 @@ static bool AuthenticatedDepositResult(int32_t result, std::string& error)
         "drivechain deposit destination script does not match enforcer data",
         "drivechain deposit output value and fee do not equal the authenticated deposit value",
     }};
-    return ExchangeResult(result, errors, error, "Haskell authenticated deposit evaluation failed");
+    return WorkflowResult(result, errors, error, "Haskell authenticated deposit evaluation failed");
 }
-
 
 bool RunDepositClaim(DepositClaimWorkflow kind, uint64_t inputs, uint64_t index, uint64_t witnesses,
     uint64_t outputs, std::span<const std::vector<unsigned char>> stack, const unsigned char* asset,
@@ -3080,7 +1485,7 @@ static bool DepositOutputsResult(int32_t result, std::string& error)
         "The committed deposit recipient must receive the exact explicit pegged-asset amount.",
         "Drivechain deposit transaction must contain exactly one recipient output.",
     }};
-    return ExchangeResult(result, errors, error, "Haskell deposit output evaluation failed");
+    return WorkflowResult(result, errors, error, "Haskell deposit output evaluation failed");
 }
 
 bool RunNativeRecipient(NativeRecipient kind, int64_t amount, std::string_view source, const NativeWorkflow& native)
@@ -3121,7 +1526,7 @@ bool CheckNativeDeposit(const CTransaction& tx, uint64_t index, bool canonical,
     if (canonical && result == 3) return false;
     constexpr const char* errors[]{"Drivechain deposit input or witness index is out of range.",
         "Committed Elements fee must be less than the authenticated deposit value."};
-    return ExchangeResult(result,errors,error,"Haskell native deposit output workflow failed");
+    return WorkflowResult(result,errors,error,"Haskell native deposit output workflow failed");
 }
 
 int32_t TreasurySlot(uint32_t script, uint32_t opcode)
@@ -3138,7 +1543,6 @@ bool TreasuryMatches(std::span<const unsigned char> script, uint32_t opcode, int
     return CheckedStatus(elements_hs_treasury_match_v1(expected,opcode,script.size(),
         const_cast<unsigned char*>(script.data())),1,"Haskell treasury matching failed") == 1;
 }
-
 
 bool WithdrawalBytes(WithdrawalOp op, std::span<const unsigned char> input,
                      std::vector<unsigned char>& output, std::string* error)
@@ -3168,13 +1572,9 @@ bool WithdrawalBytes(WithdrawalOp op, std::span<const unsigned char> input,
     const auto command = static_cast<uint32_t>(op) - 1;
     if (command >= lengths.size() || size - 1 < lengths[command].first || size - 1 > lengths[command].second)
         throw std::runtime_error("Haskell withdrawal reply has invalid length");
-    if (op == WithdrawalOp::EXTRACT_ETHEREUM_CLAIM && size != 1 && size != 61)
-        throw std::runtime_error("Haskell withdrawal claim reply has invalid length");
     output.assign(reply.begin() + 1, reply.begin() + size);
     return true;
 }
-
-
 
 std::vector<unsigned char> WithdrawalTransport(std::span<const unsigned char> transaction, bool strip_marker)
 {
@@ -3191,8 +1591,6 @@ std::vector<unsigned char> WithdrawalTransport(std::span<const unsigned char> tr
     return reply;
 }
 
-
-
 WithdrawalBundleAdmission AdmitWithdrawalBundle(bool busy, const unsigned char* current, const unsigned char* requested)
 {
     std::array<unsigned char,65> input{};
@@ -3204,4 +1602,103 @@ WithdrawalBundleAdmission AdmitWithdrawalBundle(bool busy, const unsigned char* 
         output[0] > 1 || output[1] > 1) throw std::runtime_error("Haskell withdrawal bundle admission failed");
     return {output[0] != 0, output[1] != 0};
 }
+template <typename Binding, typename... Params>
+static int ReadScalarAdmission(const Binding& binding,
+    const std::function<uint64_t(uint32_t,uint64_t,uint64_t)>& read, Params... params)
+{
+    const std::function<int32_t(uint32_t,uint64_t,uint64_t,uint64_t*)> action =
+        [&](uint32_t step, uint64_t a, uint64_t b, uint64_t* field) { *field=read(step,a,b); return 1; };
+    return ReadBoundAdmission<int32_t,-1>(binding,action,params...);
+}
+
+bool StartupArgs(uint32_t slot, uint32_t timeout_maximum, const std::function<uint64_t(uint32_t)>& read)
+{
+    return CheckedStatus(ReadScalarAdmission(elements_hs_startup_args_v1,
+        [&](uint32_t step, uint64_t, uint64_t) { return read(step); }, slot,
+        uint64_t{MAX_MONEY}, uint64_t{timeout_maximum}), 1, "Haskell startup admission failed")==0;
+}
+
+std::array<uint32_t,2> BmmHeaderLayout(uint32_t version, uint32_t flags)
+{
+    elements_hs_runtime_init();
+    std::array<uint32_t,2> layout{};
+    constexpr uint32_t allowed_fields{0x143U}; // withdrawal, BMM, dynafed, critical hash
+    if (elements_hs_bmm_header_layout_v1(version,flags,layout.size(),layout.data()) != 0 ||
+        (layout[1] & ~allowed_fields) != 0)
+        throw std::runtime_error("Haskell header layout failed");
+    return layout;
+}
+
+void BmmFixedIdentity(std::span<uint32_t, 2> fields, std::span<unsigned char, 121> payload)
+{
+    elements_hs_runtime_init();
+    if (elements_hs_bmm_identity_v1(fields.data(), payload.data()) != 0)
+        throw std::runtime_error("Haskell BMM fixed identity failed");
+}
+
+void FeeFreeSelection(int64_t age, const std::function<uint64_t(uint32_t)>& read)
+{
+    if (ReadScalarAdmission(elements_hs_fee_free_selection_v1,
+        [&](uint32_t step, uint64_t, uint64_t) { return read(step); }, age)!=1)
+        throw std::runtime_error("Haskell fee-free selection failed");
+}
+
+bool DepositInputLimit(bool enabled, uint64_t count, uint64_t limit,
+    const std::function<uint64_t(uint32_t,uint64_t,uint64_t)>& read)
+{
+    return CheckedStatus(ReadScalarAdmission(elements_hs_deposit_input_limit_v1,
+        read,uint32_t{enabled},count,limit),1,"Haskell deposit input limit failed") == 1;
+}
+
+bool MerkleReplacement(uint32_t mode, uint32_t index, uint32_t position, uint32_t flags)
+{
+    elements_hs_runtime_init();
+    const int result = elements_hs_merkle_replacement_v1(mode,index,position,flags);
+    if (result < 0 || result > 1) throw std::runtime_error("Haskell Merkle replacement failed");
+    return result == 1;
+}
+
+void BmmCheckpointPreset(uint32_t mode, std::span<uint32_t, 16> fields,
+    std::span<unsigned char, 32> block_hash)
+{
+    elements_hs_runtime_init();
+    if (elements_hs_bmm_checkpoint_v1(mode, fields.data(), block_hash.data()) != 0)
+        throw std::runtime_error("Haskell BMM checkpoint failed");
+}
+
+int64_t BmmDifficultyInterval(int64_t timespan, int64_t spacing)
+{
+    elements_hs_runtime_init();
+    int64_t interval{0};
+    if (elements_hs_bmm_interval_v1(timespan, spacing, &interval) != 0)
+        throw std::runtime_error("Haskell difficulty interval failed");
+    return interval;
+}
+
+void BmmPrivateTemplate(uint32_t height, uint32_t time, uint32_t median, uint32_t slot,
+    std::span<const unsigned char, 32> critical, std::span<uint32_t, 4> fields,
+    std::span<unsigned char, 37> commitment)
+{
+    elements_hs_runtime_init();
+    if (elements_hs_bmm_private_template_v1(height, time, median, slot,
+            const_cast<unsigned char*>(critical.data()), fields.data(), commitment.data()) != 0)
+        throw std::runtime_error("Haskell private BMM template failed");
+}
+
+uint32_t BmmConsensusPreset(uint32_t mode, std::span<uint64_t, 6> fields,
+    std::span<unsigned char, 32> pow_limit, std::span<unsigned char, 22> challenge)
+{
+    elements_hs_runtime_init();
+    const auto size = elements_hs_bmm_preset_v1(mode, fields.data(), pow_limit.data(), challenge.data());
+    if (size < 0 || size > 22) throw std::runtime_error("Haskell BMM preset failed");
+    return size;
+}
+
+bool AdmitTlsCredentialFile(bool private_key, const std::function<uint64_t(uint32_t)>& read)
+{
+    return CheckedStatus(ReadScalarAdmission(elements_hs_tls_file_admission_v1,
+        [&](uint32_t step,uint64_t,uint64_t) { return read(step); },static_cast<uint32_t>(private_key)),
+        1,"Haskell mTLS credential admission failed") == 1;
+}
+
 } // namespace drivechain::haskell

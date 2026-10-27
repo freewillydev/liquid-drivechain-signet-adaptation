@@ -121,43 +121,6 @@ extern "C" void elements_hs_runtime_init(void);
 bool CheckBitcoinSignetBlockSolution(const Sidechain::Bitcoin::CBlock& block,
     const CScript& challenge, const uint256& genesis_hash, std::string* error = nullptr);
 
-template <typename Function, typename... Args>
-bool ReferenceSimplicity(Function function, Args... args) noexcept
-{
-    try {
-        elements_hs_runtime_init();
-        return function(args...) == 1;
-    } catch (...) {
-        return false;
-    }
-}
-
-inline bool elements_haskell_groth16_header(uint32_t version, const unsigned char* input, uint32_t size)
-{
-    return ReferenceSimplicity(elements_hs_groth16_header_v1,version,size,const_cast<unsigned char*>(input));
-}
-
-inline bool elements_haskell_canonical_values(uint32_t version, const unsigned char* input, uint32_t size)
-{
-    return ReferenceSimplicity(elements_hs_canonical_values_v1,version,size,const_cast<unsigned char*>(input));
-}
-
-inline bool elements_haskell_canonical_activation(const unsigned char* input, uint32_t size)
-{
-    return ReferenceSimplicity(elements_hs_canonical_activation_v1,size,const_cast<unsigned char*>(input));
-}
-
-inline bool elements_haskell_muldiv128(uint64_t high, uint64_t low, uint64_t multiplier,
-    uint64_t divisor_high, uint64_t divisor_low, uint64_t* output_high, uint64_t* output_low)
-{
-    if (!output_high || !output_low) return false;
-    uint64_t result[2];
-    if (!ReferenceSimplicity(elements_hs_muldiv128_v1,high,low,multiplier,divisor_high,divisor_low,result)) return false;
-    *output_high = result[0];
-    *output_low = result[1];
-    return true;
-}
-
 namespace drivechain::haskell {
 
 inline void BmmAdvance(int64_t interval, uint32_t time, uint32_t bits, std::span<uint32_t, 16> fields)
@@ -531,7 +494,7 @@ inline bool BlockPublish(uint32_t flags, const std::function<int32_t(uint32_t)>&
     return ReferenceCheckedStatus(ReferenceReadBoundAdmission<int32_t,-1>(elements_hs_block_publish_v1,
         action,flags),1,"Haskell block publication failed") == 0;
 }
-inline bool ReferenceExchangeResult(int code, std::span<const char* const> errors, std::string& error, const char* failure)
+inline bool ReferenceRuleResult(int code, std::span<const char* const> errors, std::string& error, const char* failure)
 {
     ReferenceCheckedStatus(code, errors.size(), failure);
     if (code && errors[code-1]) error = errors[code-1];
@@ -549,7 +512,7 @@ inline bool AuthenticatedDepositResult(int32_t result, std::string& error)
         "drivechain deposit destination script does not match enforcer data",
         "drivechain deposit output value and fee do not equal the authenticated deposit value",
     }};
-    return ReferenceExchangeResult(result, errors, error, "Haskell authenticated deposit evaluation failed");
+    return ReferenceRuleResult(result, errors, error, "Haskell authenticated deposit evaluation failed");
 }
 
 inline bool AuthenticatedDeposit(uint64_t inputs, uint64_t index, uint64_t witnesses, uint32_t facts,
@@ -580,7 +543,7 @@ inline bool DepositOutputs(uint32_t facts, int64_t value, std::span<const unsign
         "The committed deposit recipient must receive the exact explicit pegged-asset amount.",
         "Drivechain deposit transaction must contain exactly one recipient output.",
     }};
-    return ReferenceExchangeResult(result, errors, error, "Haskell deposit output evaluation failed");
+    return ReferenceRuleResult(result, errors, error, "Haskell deposit output evaluation failed");
 }
 
 inline int BmmSplitSignature(std::vector<unsigned char>& signature)
@@ -633,11 +596,6 @@ int ReplayUpvote(std::span<const unsigned char> hashes, std::span<const unsigned
 bool ReplayAlarm(std::span<uint16_t> votes);
 int64_t ReplayLeading(std::span<const unsigned char> hashes, std::span<uint16_t> votes);
 int ReplayExplicit(uint16_t vote, std::span<const unsigned char> hashes, std::span<uint16_t> votes);
-bool ExchangeEnvelopeHeader(std::span<const unsigned char> payload, std::string& error);
-bool ExchangeEnvelopeScan(const std::function<int32_t(uint32_t)>& read, std::string& error);
-bool ExchangeM6Preimage(std::span<const unsigned char> raw,
-    std::span<unsigned char, 64> commitments, std::string& error);
-bool ExchangeCheckpoint(const std::function<bool(uint32_t)>& read, std::string& error);
 uint64_t BmmWorkBudget(uint64_t count, const std::function<uint64_t(uint32_t,uint64_t,uint64_t)>& read);
 bool BmmWorkTotal(bool saturate, uint64_t count, const std::function<uint64_t(uint64_t)>& read, uint64_t& total);
 int CtipOwners(uint64_t count, uint64_t maximum, const std::function<int64_t(uint32_t)>& action);
@@ -650,33 +608,6 @@ int M5Deposit(int64_t old_value, int64_t new_value, uint64_t maximum, uint64_t o
 int M6Withdrawal(uint64_t decreases, uint64_t changes, uint64_t inputs, uint32_t threshold, bool single,
     const std::function<int64_t(uint32_t)>& action);
 int32_t BmmLifecycle(BmmLifecyclePhase phase, uint32_t facts, const std::string& state_error, std::string& error);
-inline int ReferenceExchangeIdentityRelation(uint32_t mode, std::span<const unsigned char* const> identities)
-{
-    elements_hs_runtime_init();
-    if (identities.size() > 45) throw std::invalid_argument("too many exchange identities");
-    std::vector<unsigned char> bytes;
-    for (const auto* identity : identities) {
-        if (!identity) throw std::invalid_argument("null exchange identity");
-        bytes.insert(bytes.end(), identity, identity + 32);
-    }
-    const int code = elements_hs_exchange_identity_relation_v1(mode, identities.size(), bytes.data());
-    return ReferenceCheckedStatus(code,mode>=5 ? 5 : mode>=3 ? 2 : 1,"Haskell exchange identity uniqueness failed");
-}
-
-inline bool ReferenceVerifierStartupResult(int result, std::string* error)
-{
-    const int code = ReferenceCheckedStatus(result, 6, "Haskell verifier startup validation failed");
-    static constexpr const char* errors[]{
-        "USDD SP1 activation has no frozen verifier semantic identity",
-        "linked USDD SP1 verifier ABI does not match the production identity",
-        "linked USDD SP1 verifier semantic-identity format does not match the production identity",
-        "linked USDD SP1 verifier could not export its semantic identity",
-        "linked USDD SP1 verifier semantics do not match the production identity",
-        "USDD SP1 activation requires the pinned verifier, but this binary was built without it"};
-    if (code && error) *error = errors[code-1];
-    return code == 0;
-}
-
 inline int32_t ReferenceSignetResult(int32_t result, std::string& error)
 {
     constexpr std::array<const char*, 6> errors{{
@@ -738,7 +669,7 @@ inline bool ReferenceBmmProofResult(int32_t result, std::string& error)
         "BMM proof contains an invalid parent-chain proof-of-work header",
         "sidechain block has no coinbase transaction",
     }};
-    return ReferenceExchangeResult(result, errors, error, "Haskell BMM proof evaluation failed");
+    return ReferenceRuleResult(result, errors, error, "Haskell BMM proof evaluation failed");
 }
 
 enum class BmmCodecPhase : uint32_t { ENCODE_SIZE, DECODE_SIZE, DECODE_SHAPE, CANONICAL, ATTACH, STATE_ASSET, STATE_PUSH, STATE_DROP, STATE_END, STATE_PAYLOAD, STATE_EXCEPTION };
@@ -843,27 +774,6 @@ inline int BmmSubmit(int64_t bid, int64_t maximum, const std::function<int64_t(u
 {
     return ReferenceCheckedStatus(ReferenceReadBoundAdmission<int64_t,-1>(elements_hs_bmm_submit_v1,action,bid,maximum),
         2,"Haskell BMM submission failed");
-}
-
-void ExchangeProofIdentities(std::span<const unsigned char* const> identities);
-
-inline void ExchangeProofIdentities(std::span<const unsigned char* const> identities)
-{
-    const int code = ReferenceExchangeIdentityRelation(3, identities);
-    if (code) throw std::runtime_error(code == 1 ? "proof program identity is missing" :
-        "incremental proof program identity collides with another proof role");
-}
-
-bool ExchangeIsolated(std::span<const unsigned char* const> identities);
-
-inline bool ExchangeIsolated(std::span<const unsigned char* const> identities) { return ReferenceExchangeIdentityRelation(2, identities) == 0; }
-
-bool VerifierStartup(bool active, const std::function<bool(uint32_t)>& read, std::string* error);
-
-inline bool VerifierStartup(bool active, const std::function<bool(uint32_t)>& read, std::string* error)
-{
-    if (error) error->clear();
-    return ReferenceVerifierStartupResult(ReferenceReadBoundAdmission<int32_t,-1>(elements_hs_verifier_startup_v1, read, active), error);
 }
 
 int32_t SignetValidation(SignetStep step, uint64_t a, uint64_t b, uint64_t c, uint64_t d, std::string& error);
@@ -974,28 +884,6 @@ inline WithdrawalEventDecision ClassifyWithdrawalEvent(std::string_view status)
         output[0] > 2 || output[1] > 1) throw std::runtime_error("Haskell withdrawal event policy failed");
     return {output[0], output[1] != 0};
 }
-int ExchangeAuthority(bool successor, const std::function<bool(uint32_t)>& read);
-
-inline int ExchangeAuthority(bool successor, const std::function<bool(uint32_t)>& read)
-{
-    const int result = ReferenceReadBoundAdmission<int32_t,0>(elements_hs_exchange_authority_v1,read,successor);
-    if (result < 0 || result > 4) throw std::runtime_error("Haskell exchange authority validation failed");
-    return result;
-}
-
-bool ExchangeTransition(uint64_t count, const std::function<uint64_t(uint32_t, uint64_t)>& action, std::string& error);
-
-inline bool ExchangeTransition(uint64_t count, const std::function<uint64_t(uint32_t, uint64_t)>& action, std::string& error)
-{
-    const int code = ReferenceReadBoundAdmission<uint64_t,UINT64_MAX>(elements_hs_exchange_transition_v1,action,count);
-    static constexpr const char* errors[]{
-        "more than one transaction spends the ECX singleton",
-        "ECX singleton must be transition input zero",
-        "ECX transition has no successor output zero",
-        nullptr,
-        "a block may contain at most one ECX state transition"};
-    return ReferenceExchangeResult(code,errors,error,"Haskell state transition derivation failed");
-}
 uint32_t CtipScript(const std::function<int32_t(uint32_t)>& read);
 
 inline uint32_t CtipScript(const std::function<int32_t(uint32_t)>& read)
@@ -1020,7 +908,7 @@ inline bool PersistedCtip(uint32_t facts, int64_t amount, uint32_t script,
         "persisted drivechain CTIP state payload is invalid",
         "persisted drivechain CTIP state payload cannot be decoded",
     }};
-    return ReferenceExchangeResult(result, errors, error, "Haskell persisted CTIP evaluation failed");
+    return ReferenceRuleResult(result, errors, error, "Haskell persisted CTIP evaluation failed");
 }
 inline int64_t BmmRetarget(uint32_t height, int64_t interval, int64_t target, uint32_t time, uint32_t start)
 {
@@ -1050,7 +938,7 @@ inline bool ReferenceDepositProofResult(int32_t result, std::string& error)
         "drivechain deposit transaction does not spend exactly one authenticated prior CTIP",
         "drivechain deposit value does not equal the authenticated CTIP increase",
     }};
-    return ReferenceExchangeResult(result, errors, error, "Haskell deposit proof evaluation failed");
+    return ReferenceRuleResult(result, errors, error, "Haskell deposit proof evaluation failed");
 }
 
 inline bool DepositDestination(std::size_t count, DestinationInspect inspect, void* context, std::string& error)

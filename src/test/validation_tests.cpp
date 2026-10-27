@@ -20,7 +20,6 @@
 #include <drivechain_parent_replay.h>
 #include <dbwrapper.h>
 #include <elements_drivechain_identity.h>
-#include <ecx_exchange_state.h>
 #include <init.h>
 #include <haskell/rpc_security_constants.h>
 #include <key.h>
@@ -40,15 +39,11 @@
 #include <rpc/request.h>
 #include <signet.h>
 #include <script/signingprovider.h>
-#include <script/usdd_sp1_annex.h>
-#include <test/ecx_simplicity_test_shim.h>
 #include <streams.h>
 #include <sync.h>
 #include <uint256.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
-#include <usdd_sp1_resources.h>
-#include <usdd_withdrawal_accumulator.h>
 #include <util/chaintype.h>
 #include <util/signalinterrupt.h>
 #include <validation.h>
@@ -323,61 +318,6 @@ BOOST_AUTO_TEST_CASE(parent_messages_publication_and_failure_boundaries)
     }),std::logic_error,[](const auto& error) { return std::string(error.what()) == "first replay fault"; });
     BOOST_CHECK(trace == expected);
 }
-BOOST_AUTO_TEST_CASE(m4_publication_and_exception_boundaries)
-{
-    namespace hs = drivechain::haskell;
-    const auto thread = std::this_thread::get_id();
-    std::vector<std::pair<uint32_t,uint64_t>> trace;
-    const std::array<uint16_t,3> votes{0,2,0};
-    const hs::NativeWorkflow native = [&](uint32_t step, uint64_t slot, std::span<const unsigned char> input) {
-        BOOST_CHECK(std::this_thread::get_id() == thread);
-        trace.emplace_back(step,slot);
-        if (step == 0) return std::vector<unsigned char>{24,1,25,1,26,1};
-        if (step == 2) {
-            BOOST_CHECK_EQUAL(hs::BmmSelectedBid(1,3),3);
-            std::vector<unsigned char> row(35,0);
-            row[0] = 1;
-            row[1] = slot;
-            row[33] = 1;
-            return row;
-        }
-        BOOST_REQUIRE_EQUAL(step,3U);
-        BOOST_CHECK_EQUAL(slot,24U);
-        BOOST_REQUIRE_EQUAL(input.size(),35U);
-        BOOST_CHECK_EQUAL(input[0],1);
-        BOOST_CHECK_EQUAL(input[1],24);
-        BOOST_CHECK_EQUAL(input[33],2);
-        return std::vector<unsigned char>{};
-    };
-    const auto run = [&](const hs::NativeWorkflow& action) {
-        return hs::ReplayMessages(1,1,{1,1,1,1},[&](uint32_t step, uint64_t slot, auto input) {
-            if (step == 0) {
-                std::vector<unsigned char> message{4,5};
-                for (uint16_t vote : votes) {
-                    message.push_back(vote & 255);
-                    message.push_back(vote >> 8);
-                }
-                return message;
-            }
-            if (step == 40) return std::vector<unsigned char>{};
-            BOOST_REQUIRE(step >= 30 && step <= 33);
-            return action(step-30,slot,input);
-        });
-    };
-    BOOST_CHECK_EQUAL(run(native),0x304);
-    BOOST_CHECK((trace == std::vector<std::pair<uint32_t,uint64_t>>{{0,0},{2,24},{3,24},{2,25}}));
-    trace.clear();
-    BOOST_CHECK_EXCEPTION(run([&](uint32_t step, uint64_t slot, auto input) {
-        if (step == 2) throw std::logic_error("vote snapshot fault");
-        return native(step,slot,input);
-    }), std::logic_error, [](const auto& error) { return std::string(error.what()) == "vote snapshot fault"; });
-    BOOST_CHECK((trace == std::vector<std::pair<uint32_t,uint64_t>>{{0,0}}));
-    std::string error{"unchanged"};
-    BOOST_CHECK(hs::ValidateWithdrawalEnvelope(true,[](uint32_t, uint64_t, auto) -> std::vector<unsigned char> {
-        throw std::logic_error("inactive envelope read");
-    },error));
-    BOOST_CHECK_EQUAL(error,"unchanged");
-}
 BOOST_AUTO_TEST_SUITE_END()
 
 namespace {
@@ -452,87 +392,26 @@ BOOST_AUTO_TEST_CASE(replay_traversal_preserves_native_lock_scope)
     AssertLockHeld(mutex);
 }
 
-BOOST_AUTO_TEST_CASE(incomplete_candidate_cannot_commit_chainstate)
-{
-    for (bool incomplete : {false, true}) for (bool dry_run : {false, true}) {
-        unsigned reads{0};
-        const bool rejected = drivechain::haskell::ParentReplayAll<2>({
-            [&] { return incomplete; }, [&] { ++reads; return !dry_run; },
-        });
-        BOOST_CHECK_EQUAL(rejected, incomplete && !dry_run);
-        BOOST_CHECK_EQUAL(reads, incomplete ? 1U : 0U);
-    }
-    LOCK(cs_main);
-    auto& chainstate = m_node.chainman->ActiveChainstate();
-    CCoinsViewCache view(&chainstate.CoinsTip());
-    const auto before = view.GetBestBlock();
-    CBlockIndex index;
-    BlockValidationState state;
-    // No block hash pointer: rejection must precede block/index processing.
-    BOOST_CHECK(!chainstate.ConnectBlock(CBlock{}, state, &index, view, nullptr,
-        /*fJustCheck=*/false, /*allow_incomplete_candidate=*/true));
-    BOOST_CHECK(state.IsError());
-    BOOST_CHECK_EQUAL(state.GetRejectReason(), "incomplete candidate validation cannot commit chain state");
-    BOOST_CHECK(view.GetBestBlock() == before);
-    BOOST_CHECK(!index.m_usdd_withdrawal_accumulator.has_value());
-}
 
-// Frozen pre-migration byte order, independent of Haskell presence/codec helpers.
+// Independent native encoding: presence bits distinguish absence from zero.
 static uint256 ReferenceForkScriptCacheKey(const PrecomputedTransactionData& data,
-    const CTransaction& tx, unsigned int flags, const ValidationCache& cache, uint16_t revision)
+    const CTransaction& tx, unsigned int flags, const ValidationCache& cache, bool correct_domain)
 {
     CSHA256 hasher = cache.ScriptExecutionCacheHasher();
-    const auto tag = [&](std::string_view text) {
-        uint256 digest;
-        CSHA256().Write(reinterpret_cast<const unsigned char*>(text.data()),text.size()).Finalize(digest.begin());
-        hasher.Write(digest.begin(),32);
-    };
-    const auto presence = [&](const auto&... values) {
-        const size_t count = (size_t{values.has_value()} + ...);
-        const unsigned char code = count == 0 ? 0 : count == sizeof...(values) ? 1 : 2;
-        hasher.Write(&code,1);
-    };
-    const auto hash = [&](const std::optional<uint256>& value) { hasher.Write(value.value_or(uint256{}).begin(),32); };
-    const auto number = [&](const std::optional<uint64_t>& value) {
+    const std::string domain = correct_domain ? "Elements/BMM-script-cache/v1" : "Elements/BMM-script-cache/v0";
+    hasher.Write(tx.GetWitnessHash().ToUint256().begin(), 32)
+        .Write(reinterpret_cast<unsigned char*>(&flags), sizeof(flags))
+        .Write(reinterpret_cast<const unsigned char*>(domain.c_str()), domain.size() + 1);
+    const unsigned char mtp_present = data.m_bmm_parent_mtp.has_value();
+    hasher.Write(&mtp_present, 1);
+    if (data.m_bmm_parent_mtp) {
         unsigned char bytes[8];
-        WriteBE64(bytes,value.value_or(0));
-        hasher.Write(bytes,8);
-    };
-    const unsigned char authenticated = data.m_ecx_activation_execution_anchor_authenticated;
-    hasher.Write(&authenticated,1).Write(tx.GetWitnessHash().ToUint256().begin(),32)
-        .Write(reinterpret_cast<unsigned char*>(&flags),sizeof(flags));
-    tag("ECX/Simplicity-cache/v10");
-    unsigned char revision_bytes[2];
-    WriteBE16(revision_bytes,revision);
-    hasher.Write(revision_bytes,2);
-    presence(data.m_prior_active_exchange_state_root); hash(data.m_prior_active_exchange_state_root);
-    presence(data.m_prior_active_forced_inbox_root,data.m_prior_active_forced_processed_cursor); hash(data.m_prior_active_forced_inbox_root);
-    presence(data.m_prior_active_deposit_inbox_root,data.m_prior_active_deposit_processed_cursor); hash(data.m_prior_active_deposit_inbox_root);
-    presence(data.m_current_bmm_parent_block_hash,data.m_current_bmm_parent_height,data.m_current_bmm_parent_mtp); hash(data.m_current_bmm_parent_block_hash);
-    number(data.m_current_bmm_parent_height); number(data.m_current_bmm_parent_mtp);
-    number(data.m_prior_active_forced_processed_cursor); number(data.m_prior_active_deposit_processed_cursor);
-    presence(data.m_bond_v2_configuration_hash,data.m_bond_v2_asset_id,data.m_bond_v2_deployment_commitment,
-        data.m_bond_v2_transition_cmr,data.m_bond_v2_collateral_vault_script_sha256,data.m_bond_v2_collateral_vault_cmr,
-        data.m_bond_v2_insurance_reserve_script_sha256,data.m_bond_v2_insurance_reserve_cmr);
-    hash(data.m_bond_v2_configuration_hash); hash(data.m_bond_v2_asset_id); hash(data.m_bond_v2_deployment_commitment);
-    hash(data.m_bond_v2_transition_cmr); hash(data.m_bond_v2_collateral_vault_script_sha256); hash(data.m_bond_v2_collateral_vault_cmr);
-    hash(data.m_bond_v2_insurance_reserve_script_sha256); hash(data.m_bond_v2_insurance_reserve_cmr);
-    presence(data.m_bond_v2_incremental_activation_program_id,data.m_bond_v2_incremental_activation_configuration_hash,
-        data.m_bond_v2_incremental_activation_cmr,data.m_incremental_successor_program_id,
-        data.m_bond_v2_incremental_successor_configuration_hash,data.m_incremental_successor_transition_cmr,
-        data.m_incremental_successor_state_node_domain_sha256);
-    hash(data.m_bond_v2_incremental_activation_program_id); hash(data.m_bond_v2_incremental_activation_configuration_hash);
-    hash(data.m_bond_v2_incremental_activation_cmr); hash(data.m_incremental_successor_program_id);
-    hash(data.m_bond_v2_incremental_successor_configuration_hash); hash(data.m_incremental_successor_transition_cmr);
-    hash(data.m_incremental_successor_state_node_domain_sha256);
-    presence(data.m_prior_active_bond_inbox_root,data.m_prior_active_bond_inbox_count,data.m_current_sidechain_height);
-    hash(data.m_prior_active_bond_inbox_root); number(data.m_prior_active_bond_inbox_count); number(data.m_current_sidechain_height);
-    presence(data.m_bmm_parent_mtp); number(data.m_bmm_parent_mtp);
-    tag("USDD/V11/ATOMIC_CANONICAL_BMM_ENDPOINT/SCRIPT_CACHE/V1");
-    const unsigned char endpoint_revision[]{0,1};
-    hasher.Write(endpoint_revision,2);
-    presence(data.m_prior_active_bmm_parent_checkpoint);
-    hasher.Write(data.m_prior_active_bmm_parent_checkpoint.value_or(PriorActiveBmmParentCheckpoint{}).data(),80);
+        WriteLE64(bytes, *data.m_bmm_parent_mtp);
+        hasher.Write(bytes, 8);
+    }
+    const unsigned char endpoint_present = data.m_prior_active_bmm_parent_checkpoint.has_value();
+    hasher.Write(&endpoint_present, 1);
+    if (endpoint_present) hasher.Write(data.m_prior_active_bmm_parent_checkpoint->data(), 80);
     uint256 result;
     hasher.Finalize(result.begin());
     return result;
@@ -548,139 +427,49 @@ BOOST_AUTO_TEST_CASE(fork_script_cache_context_fields_are_distinct)
     spend.vin.emplace_back(outpoint);
     spend.vout.emplace_back(policyAsset, 900, CScript() << OP_TRUE);
     const CTransaction tx(spend);
-    using Data = PrecomputedTransactionData;
-    const std::array hashes{
-        &Data::m_prior_active_exchange_state_root, &Data::m_prior_active_forced_inbox_root,
-        &Data::m_prior_active_deposit_inbox_root, &Data::m_current_bmm_parent_block_hash,
-        &Data::m_bond_v2_configuration_hash, &Data::m_bond_v2_asset_id,
-        &Data::m_bond_v2_deployment_commitment, &Data::m_bond_v2_transition_cmr,
-        &Data::m_bond_v2_collateral_vault_script_sha256, &Data::m_bond_v2_collateral_vault_cmr,
-        &Data::m_bond_v2_insurance_reserve_script_sha256, &Data::m_bond_v2_insurance_reserve_cmr,
-        &Data::m_bond_v2_incremental_activation_program_id, &Data::m_bond_v2_incremental_activation_configuration_hash,
-        &Data::m_bond_v2_incremental_activation_cmr, &Data::m_incremental_successor_program_id,
-        &Data::m_bond_v2_incremental_successor_configuration_hash, &Data::m_incremental_successor_transition_cmr,
-        &Data::m_incremental_successor_state_node_domain_sha256, &Data::m_prior_active_bond_inbox_root};
-    const std::array scalars{
-        &Data::m_current_bmm_parent_height, &Data::m_current_bmm_parent_mtp,
-        &Data::m_prior_active_forced_processed_cursor, &Data::m_prior_active_deposit_processed_cursor,
-        &Data::m_prior_active_bond_inbox_count, &Data::m_current_sidechain_height, &Data::m_bmm_parent_mtp};
-    Data base;
-    for (auto field : hashes) base.*field = uint256::ONE;
-    for (auto field : scalars) base.*field = 1;
-    base.m_prior_active_bmm_parent_checkpoint = std::array<unsigned char, 80>{1};
-    TxValidationState state;
+    PrecomputedTransactionData base;
+    base.m_bmm_parent_mtp = 1;
+    base.m_prior_active_bmm_parent_checkpoint = PriorActiveBmmParentCheckpoint{1};
     auto& cache = m_node.chainman->m_validation_cache;
+    TxValidationState state;
     BOOST_REQUIRE(CheckInputScripts(tx, state, coins, 0, true, true, base, cache, nullptr));
-    const auto check_reference = [&](Data& context) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
-        // Revision 14 must match the native reference; revision 13 must not hit.
-        for (uint16_t revision : {13,14})
-        for (unsigned int flags : {0U, static_cast<unsigned int>(SCRIPT_VERIFY_P2SH), 0x01020304U}) {
-            BOOST_TEST_CONTEXT("revision=" << revision << " flags=" << flags) {
-                ValidationCache isolated{32768,32768};
-                isolated.m_script_execution_cache.insert(ReferenceForkScriptCacheKey(context,tx,flags,isolated,revision));
-                std::vector<CCheck*> checks;
-                TxValidationState probe;
-                BOOST_CHECK(CheckInputScripts(tx,probe,coins,flags,true,true,context,isolated,&checks));
-                const bool hit = checks.empty();
-                for (auto* check : checks) delete check;
-                BOOST_CHECK_EQUAL(hit,revision==14);
-            }
-        }
-    };
-    const auto check_hit = [&](Data& context, bool expected) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+    const auto probe = [&](PrecomputedTransactionData& context, ValidationCache& selected, unsigned int flags, bool hit)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
         std::vector<CCheck*> checks;
-        TxValidationState probe;
-        const bool accepted = CheckInputScripts(tx, probe, coins, 0, true, true, context, cache, &checks);
-        const bool hit = checks.empty();
+        TxValidationState result;
+        BOOST_CHECK(CheckInputScripts(tx, result, coins, flags, true, true, context, selected, &checks));
+        BOOST_CHECK_EQUAL(checks.empty(), hit);
         for (auto* check : checks) delete check;
-        BOOST_CHECK(accepted);
-        BOOST_CHECK_EQUAL(hit, expected);
-        check_reference(context);
     };
-    check_hit(base, true);
-    auto& changed = base;
-    for (auto field : hashes) {
-        changed.*field = uint256S("02");
-        check_hit(changed, false);
-        (changed.*field).reset();
-        check_hit(changed, false);
-        changed.*field = uint256::ONE;
-    }
-    for (auto field : scalars) {
-        for (const auto value : std::array<uint64_t, 5>{0, 2, 0x100000000ULL,
-                uint64_t{1} << 63, std::numeric_limits<uint64_t>::max()}) {
-            changed.*field = value;
-            check_hit(changed, false);
+    const auto check = [&](PrecomputedTransactionData& context, bool hit) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
+        probe(context, cache, 0, hit);
+        for (bool correct : {false, true}) for (unsigned int flags : {0U, 1U, 0x01020304U}) {
+            ValidationCache isolated{32768,32768};
+            isolated.m_script_execution_cache.insert(ReferenceForkScriptCacheKey(context,tx,flags,isolated,correct));
+            probe(context, isolated, flags, correct);
         }
-        (changed.*field).reset();
-        check_hit(changed, false);
-        changed.*field = 1;
+    };
+    check(base, true);
+    for (uint64_t mtp : {uint64_t{0}, uint64_t{2}, uint64_t{UINT32_MAX}+1, UINT64_MAX}) {
+        base.m_bmm_parent_mtp = mtp;
+        check(base, false);
     }
-    changed.m_ecx_activation_execution_anchor_authenticated = true;
-    check_hit(changed, false);
-    changed.m_ecx_activation_execution_anchor_authenticated = false;
+    base.m_bmm_parent_mtp.reset();
+    check(base, false);
+    base.m_bmm_parent_mtp = 1;
     for (size_t i = 0; i < 80; ++i) {
-        (*changed.m_prior_active_bmm_parent_checkpoint)[i] ^= 1;
-        check_hit(changed, false);
-        (*changed.m_prior_active_bmm_parent_checkpoint)[i] ^= 1;
+        (*base.m_prior_active_bmm_parent_checkpoint)[i] ^= 1;
+        check(base, false);
+        (*base.m_prior_active_bmm_parent_checkpoint)[i] ^= 1;
     }
-    changed.m_prior_active_bmm_parent_checkpoint.reset();
-    check_hit(changed, false);
-    changed.m_prior_active_bmm_parent_checkpoint = std::array<unsigned char, 80>{1};
-    check_hit(base, true);
-    Data mixed;
-    check_reference(mixed);
-    for (size_t i = 0; i < hashes.size(); ++i) {
-        uint256 value;
-        std::fill(value.begin(),value.end(),i+1);
-        mixed.*hashes[i] = value;
-        check_reference(mixed);
-    }
-    for (size_t i = 0; i < scalars.size(); ++i) {
-        mixed.*scalars[i] = 0x0807060504030201ULL+i;
-        check_reference(mixed);
-    }
-    mixed.m_prior_active_bmm_parent_checkpoint = PriorActiveBmmParentCheckpoint{};
-    std::iota(mixed.m_prior_active_bmm_parent_checkpoint->begin(),mixed.m_prior_active_bmm_parent_checkpoint->end(),0);
-    mixed.m_ecx_activation_execution_anchor_authenticated = true;
-    check_reference(mixed);
+    base.m_prior_active_bmm_parent_checkpoint.reset();
+    check(base, false);
+    base.m_prior_active_bmm_parent_checkpoint = PriorActiveBmmParentCheckpoint{1};
+    check(base, true);
 }
 
-BOOST_AUTO_TEST_CASE(haskell_rust_journal_verifier)
-{
-    const std::array<unsigned char,32> identity{1};
-    const std::array<unsigned char,3> malformed{0x50,1,2};
-    BOOST_CHECK(usdd::VerifyUsddSp1AnnexForJournal(malformed,{},identity) == usdd::Sp1VerifierResult::REJECTED);
-    BOOST_CHECK(usdd::VerifyUsddSp1AnnexForJournal(malformed,identity,{}) == usdd::Sp1VerifierResult::REJECTED);
-#if defined(HAVE_USDD_SP1_VERIFIER)
-    BOOST_CHECK(usdd::VerifyUsddSp1AnnexForJournal(malformed,identity,identity) == usdd::Sp1VerifierResult::REJECTED);
-#else
-    BOOST_CHECK(usdd::VerifyUsddSp1AnnexForJournal(malformed,identity,identity) == usdd::Sp1VerifierResult::UNAVAILABLE);
-#endif
-}
 
-BOOST_AUTO_TEST_CASE(haskell_rust_custody_verifier)
-{
-#ifdef ECX_ENABLE_SP1_GROTH16_VERIFIER
-    const std::array<unsigned char,2> malformed{1,2};
-    const std::array<unsigned char,414> receipts{};
-    BOOST_CHECK(!drivechain::haskell::VerifyCustody(ecx::ecx_witness_availability_verify_custody_receipts_v1,
-        malformed,malformed,receipts,3));
-#endif
-}
 
-BOOST_AUTO_TEST_CASE(haskell_rust_usdd_jet)
-{
-    bool accepted{true};
-    BOOST_REQUIRE(ecx_test_usdd_jet_frame(nullptr,0,&accepted));
-    BOOST_CHECK(!accepted);
-    for (unsigned char tag : {0x50,0x51}) {
-        const std::array<unsigned char,3> annex{tag,1,2};
-        accepted = true;
-        BOOST_REQUIRE(ecx_test_usdd_jet_frame(annex.data(),annex.size(),&accepted));
-        BOOST_CHECK(!accepted);
-    }
-}
 
 BOOST_AUTO_TEST_CASE(rpc_direct_generation_guard_order)
 {
@@ -1027,41 +816,13 @@ BOOST_AUTO_TEST_CASE(block_deposit_preflight_matches_native_order)
     }
 }
 
-BOOST_AUTO_TEST_CASE(parent_context_source_order)
+BOOST_AUTO_TEST_CASE(retired_parent_context_selector_has_no_effects)
 {
-    using Steps = std::vector<uint32_t>;
-    for (bool elements : {false, true}) for (bool native : {false, true})
-    for (bool available : {false, true}) {
-        Steps expected{1};
-        if (!elements) expected.push_back(2);
-        else {
-            expected.push_back(3);
-            expected.push_back(native ? 4 : 5);
-            expected.push_back(available ? 6 : 7);
-        }
-        for (size_t fault = 0; fault <= expected.size(); ++fault) {
-            Steps observed;
-            bool threw{false};
-            try {
-                BOOST_CHECK(drivechain::haskell::ParentReplayStore(
-                    drivechain::haskell::ReplayStoreFlow::PARENT_CONTEXT, [&](uint32_t step) -> uint32_t {
-                        observed.push_back(step);
-                        if (observed.size() == fault + 1) throw std::runtime_error("parent context read");
-                        switch (step) {
-                        case 1: return elements;
-                        case 3: return native;
-                        case 4: case 5: return available;
-                        default: return 1;
-                        }
-                    }));
-            } catch (const std::runtime_error& e) {
-                BOOST_CHECK_EQUAL(e.what(), "parent context read");
-                threw = true;
-            }
-            BOOST_CHECK_EQUAL(threw, fault < expected.size());
-            BOOST_CHECK(observed == Steps(expected.begin(), expected.begin() + std::min(fault + 1, expected.size())));
-        }
-    }
+    unsigned calls{0};
+    BOOST_CHECK_THROW(drivechain::haskell::ParentReplayStore(
+        drivechain::haskell::ReplayStoreFlow::PARENT_CONTEXT, [&](uint32_t) { ++calls; return 1; }),
+        std::runtime_error);
+    BOOST_CHECK_EQUAL(calls, 0U);
 }
 
 BOOST_AUTO_TEST_CASE(next_block_height_boundaries)
@@ -1076,41 +837,6 @@ BOOST_AUTO_TEST_CASE(next_block_height_boundaries)
     }
 }
 
-BOOST_AUTO_TEST_CASE(capital_connection_preserves_last_match_and_publication)
-{
-    for (unsigned mask = 0; mask < 32; ++mask) {
-        const bool enabled = mask & 1, active = mask & 2, parent = mask & 4;
-        const bool derived = mask & 8, check_only = mask & 16;
-        size_t index{1}, selected{0};
-        unsigned error{0}, publications{0}, derivations{0};
-        const auto result = drivechain::haskell::ParentReplayStore(
-            drivechain::haskell::ReplayStoreFlow::CAPITAL_CONNECTION,
-            [&](uint32_t step) -> uint32_t {
-            switch (step) {
-            case 1: return enabled;
-            case 2: return active;
-            case 3: return parent;
-            case 4: error = 1; return 0;
-            case 5: return index < 5;
-            case 6: return index != 2;
-            case 7: return index != 3;
-            case 8: selected = index; return 1;
-            case 9: ++index; return 1;
-            case 10: ++derivations; return derived;
-            case 11: error = 2; return 0;
-            case 12: return check_only;
-            case 13: ++publications; return 1;
-            default: throw std::logic_error("unexpected capital action");
-            }
-        });
-        const bool eligible = enabled && active;
-        BOOST_CHECK_EQUAL(result, !eligible || (parent && derived));
-        BOOST_CHECK_EQUAL(selected, eligible && parent ? 4U : 0U);
-        BOOST_CHECK_EQUAL(derivations, eligible && parent ? 1U : 0U);
-        BOOST_CHECK_EQUAL(publications, eligible && parent && derived && !check_only ? 1U : 0U);
-        BOOST_CHECK_EQUAL(error, !eligible ? 0U : !parent ? 1U : !derived ? 2U : 0U);
-    }
-}
 
 BOOST_AUTO_TEST_CASE(peer_block_dispatch_preserves_effects)
 {
@@ -1134,29 +860,6 @@ BOOST_AUTO_TEST_CASE(peer_block_dispatch_preserves_effects)
     }
 }
 
-BOOST_AUTO_TEST_CASE(annex_accounting_gate_preserves_effects)
-{
-    for (bool enabled : {false, true}) for (bool fail : {false, true}) {
-        uint64_t total{7};
-        std::vector<uint32_t> seen;
-        const auto run = [&] {
-            return drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::ANNEX_ACCOUNTING,
-                [&](uint32_t step) -> uint32_t {
-                    seen.push_back(step);
-                    if (step == 1) return enabled;
-                    if (step != 2) throw std::logic_error("unexpected accounting action");
-                    if (fail) throw std::runtime_error("accounting read failure");
-                    total += 3;
-                    return 1;
-                });
-        };
-        if (enabled && fail) BOOST_CHECK_EXCEPTION(run(), std::runtime_error,
-            [](const std::runtime_error& error) { return std::string{error.what()} == "accounting read failure"; });
-        else BOOST_CHECK_EQUAL(run(), 1U);
-        BOOST_CHECK_EQUAL(total, enabled && !fail ? 10U : 7U);
-        BOOST_CHECK(seen == (enabled ? std::vector<uint32_t>{1,2} : std::vector<uint32_t>{1}));
-    }
-}
 
 BOOST_AUTO_TEST_CASE(fee_free_selection_raw_values)
 {
@@ -1305,58 +1008,6 @@ BOOST_AUTO_TEST_CASE(fee_free_selection_effect_order)
     }
 }
 
-BOOST_AUTO_TEST_CASE(template_commitment_effect_order)
-{
-    const auto caller = std::this_thread::get_id();
-    for (bool envelope : {false,true}) for (uint32_t mask=0; mask<(envelope ? 128U : 4U); ++mask) {
-        const auto bit = [&](uint32_t n) { return (mask>>n)&1; };
-        const auto value = [&](uint32_t step) -> uint32_t {
-            switch (step) {
-            case 1: case 4: return bit(0);
-            case 2: return bit(1);
-            case 3: case 10: case 11: return 1;
-            case 5: return bit(0) && bit(1) && bit(2);
-            default: return bit(step-3);
-            }
-        };
-        std::vector<uint32_t> expected;
-        const auto read = [&](uint32_t step) { expected.push_back(step); return value(step); };
-        const auto reference = [&]() -> uint32_t {
-            if (read(1) && read(2)) read(3);
-            if (envelope && read(4) && read(5) && (read(6) || !read(7))) {
-                if (!read(8) || !read(9)) { read(11); return 0; }
-                read(10);
-            }
-            return 1;
-        };
-        const auto wanted = reference();
-        for (size_t fault=0; fault<=expected.size(); ++fault) {
-            std::vector<uint32_t> seen, published;
-            const auto run = [&] {
-                return drivechain::haskell::ParentReplayStore(envelope ?
-                    drivechain::haskell::ReplayStoreFlow::TEMPLATE_ENVELOPE : drivechain::haskell::ReplayStoreFlow::TEMPLATE_VERSION,
-                    [&](uint32_t step) {
-                        BOOST_CHECK(std::this_thread::get_id()==caller);
-                        seen.push_back(step);
-                        if (seen.size()==fault+1) throw std::runtime_error("commitment fault");
-                        if (step==3 || step==10) {
-                            BOOST_CHECK_EQUAL(drivechain::haskell::BmmSelectedBid(1,0),1);
-                            published.push_back(step);
-                        }
-                        return value(step);
-                    });
-            };
-            if (fault==expected.size()) BOOST_CHECK_EQUAL(run(),wanted);
-            else BOOST_CHECK_EXCEPTION(run(),std::runtime_error,
-                [](const std::runtime_error& err) { return std::string{err.what()}=="commitment fault"; });
-            const std::vector<uint32_t> prefix(expected.begin(),expected.begin()+std::min(fault+1,expected.size()));
-            BOOST_CHECK(seen==prefix);
-            std::vector<uint32_t> writes;
-            for (size_t i=0; i<fault; ++i) if (expected[i]==3 || expected[i]==10) writes.push_back(expected[i]);
-            BOOST_CHECK(published==writes);
-        }
-    }
-}
 
 BOOST_AUTO_TEST_CASE(template_selection_effect_order)
 {
@@ -1397,60 +1048,6 @@ BOOST_AUTO_TEST_CASE(template_selection_effect_order)
     }
 }
 
-BOOST_AUTO_TEST_CASE(template_source_budget_composition)
-{
-    const auto caller = std::this_thread::get_id();
-    for (bool enabled : {false,true}) for (bool loaded : {false,true}) {
-        for (int64_t height : {int64_t{-1},int64_t{10},int64_t{11},INT64_MAX}) {
-            for (const auto& fields : std::vector<std::array<uint64_t,4>>{
-                {0,0,0,0},{1,0,1,0},{64,0,0,0},{65,0,0,0},{0,1,0,0},
-                {UINT64_MAX,UINT64_MAX,UINT64_MAX,UINT64_MAX},{UINT64_MAX,0,UINT64_MAX,0}}) {
-                std::vector<uint32_t> expected{0};
-                uint64_t wanted_budget{0};
-                std::string wanted_error;
-                bool wanted{true};
-                if (enabled && height>10) {
-                    expected.push_back(1);
-                    if (!loaded) { wanted=false; wanted_error="cannot read ECX source backlog: snapshot failure"; }
-                    else {
-                        expected.insert(expected.end(),{2,3,4,5});
-                        wanted=drivechain::haskell::ExchangeInbox(fields,wanted_budget,wanted_error);
-                    }
-                }
-                for (size_t fault=0; fault<=expected.size(); ++fault) {
-                    uint64_t budget{99};
-                    std::string error;
-                    std::vector<uint32_t> seen;
-                    const auto run = [&] {
-                        return drivechain::haskell::ExchangeTemplateBudget(height,10,[&](uint32_t step) -> uint64_t {
-                            BOOST_CHECK(std::this_thread::get_id()==caller);
-                            seen.push_back(step);
-                            if (seen.size()==fault+1) throw std::runtime_error("budget fault");
-                            if (step==0) return enabled;
-                            if (step==1) {
-                                BOOST_CHECK_EQUAL(drivechain::haskell::BmmSelectedBid(1,0),1);
-                                if (!loaded) error="snapshot failure";
-                                return loaded;
-                            }
-                            return fields.at(step-2);
-                        },budget,error);
-                    };
-                    if (fault==expected.size()) {
-                        BOOST_CHECK_EQUAL(run(),wanted);
-                        BOOST_CHECK_EQUAL(budget,wanted_budget);
-                        BOOST_CHECK_EQUAL(error,wanted_error);
-                    } else {
-                        BOOST_CHECK_EXCEPTION(run(),std::runtime_error,
-                            [](const std::runtime_error& err) { return std::string{err.what()}=="budget fault"; });
-                        BOOST_CHECK_EQUAL(budget,99);
-                    }
-                    const std::vector<uint32_t> prefix(expected.begin(),expected.begin()+std::min(fault+1,expected.size()));
-                    BOOST_CHECK(seen==prefix);
-                }
-            }
-        }
-    }
-}
 
 BOOST_AUTO_TEST_CASE(template_admission_effect_order)
 {
@@ -2142,812 +1739,14 @@ BOOST_AUTO_TEST_CASE(subsidy_limit_test)
     BOOST_CHECK_EQUAL(nSum, CAmount{2099999997690000});
 }
 
-BOOST_AUTO_TEST_CASE(usdd_inclusion_native_reference)
-{
-    for (size_t count : {1U,2U,3U,7U,8U,9U,16U,17U,31U,32U,33U,64U,65U,127U,128U,129U}) {
-        std::vector<usdd::EthereumWithdrawalClaim> claims(count);
-        for (size_t i = 0; i < count; ++i) {
-            claims[i].claim_index = i;
-            claims[i].amount_usdt_micro = i + 1;
-            claims[i].leaf = usdd::ComputeWithdrawalLeaf(claims[i]);
-        }
-        for (size_t index = 0; index < count; ++index) {
-            usdd::WithdrawalInclusionProof proof;
-            usdd::WithdrawalHash actual;
-            BOOST_REQUIRE(usdd::BuildWithdrawalInclusionProof(claims, index, proof, actual));
-            BOOST_CHECK(proof.claim == claims[index]);
-            std::vector<usdd::WithdrawalHash> layer;
-            for (const auto& claim : claims) layer.push_back(claim.leaf);
-            size_t position = index;
-            for (size_t depth = 0; depth < 64; ++depth) {
-                const size_t sibling = position ^ 1;
-                BOOST_CHECK(proof.siblings[depth] == (sibling < layer.size() ? layer[sibling] : usdd::WithdrawalEmptyRoot(depth)));
-                std::vector<usdd::WithdrawalHash> next;
-                for (size_t offset = 0; offset < layer.size(); offset += 2) {
-                    next.push_back(usdd::WithdrawalNode(layer[offset], offset+1 < layer.size() ? layer[offset+1] : usdd::WithdrawalEmptyRoot(depth)));
-                }
-                layer = std::move(next);
-                position >>= 1;
-            }
-            BOOST_CHECK(actual == layer.front());
-        }
-    }
-}
 
-BOOST_AUTO_TEST_CASE(usdd_inclusion_prefix_failure_contract)
-{
-    std::vector<usdd::EthereumWithdrawalClaim> claims(130);
-    for (size_t i = 0; i < claims.size(); ++i) {
-        claims[i].claim_index = i;
-        claims[i].amount_usdt_micro = i+1;
-        claims[i].leaf = usdd::ComputeWithdrawalLeaf(claims[i]);
-    }
-    usdd::WithdrawalInclusionProof sentinel;
-    sentinel.claim.claim_index = 999;
-    for (auto& sibling : sentinel.siblings) sibling.fill(0x77);
-    usdd::WithdrawalHash sentinel_root;
-    sentinel_root.fill(0xa5);
-    const auto rejected = [&](const auto& prefix, uint64_t index, const std::string& expected) {
-        auto proof = sentinel;
-        auto root = sentinel_root;
-        std::string error{"existing"};
-        BOOST_CHECK(!usdd::BuildWithdrawalInclusionProof(prefix,index,proof,root,&error));
-        BOOST_CHECK_EQUAL(error,expected);
-        BOOST_CHECK(proof.claim == sentinel.claim);
-        BOOST_CHECK(proof.siblings == sentinel.siblings);
-        BOOST_CHECK(root == sentinel_root);
-    };
-    rejected(std::vector<usdd::EthereumWithdrawalClaim>{},0,"USDD withdrawal proof index is outside the claim prefix");
-    for (size_t corrupt : {0U,127U,128U,129U}) {
-        for (bool wrong_index : {false,true}) {
-            auto changed = claims;
-            if (wrong_index) ++changed[corrupt].claim_index;
-            else changed[corrupt].leaf[0] ^= 1;
-            rejected(changed,1,"noncanonical USDD withdrawal claim prefix");
-            rejected(changed,claims.size(),"USDD withdrawal proof index is outside the claim prefix");
-        }
-    }
-    for (unsigned field = 0; field < 6; ++field) {
-        auto changed = claims;
-        auto& claim = changed[1];
-        switch (field) {
-        case 0: claim.elements_genesis[0] ^= 1; break;
-        case 1: claim.asset_id[0] ^= 1; break;
-        case 2: claim.vault_id[0] ^= 1; break;
-        case 3: claim.burn_id[0] ^= 1; break;
-        case 4: ++claim.amount_usdt_micro; break;
-        case 5: claim.recipient[0] ^= 1; break;
-        }
-        rejected(changed,1,"noncanonical USDD withdrawal claim prefix");
-    }
-    usdd::WithdrawalInclusionProof original;
-    usdd::WithdrawalHash original_root;
-    std::string error{"existing"};
-    BOOST_REQUIRE(usdd::BuildWithdrawalInclusionProof(claims,1,original,original_root,&error));
-    BOOST_CHECK_EQUAL(error,"existing");
-    // Transaction metadata is not re-bound here; the leaf commits the supplied burn ID.
-    claims[1].burn_txid_display.fill(0x33);
-    claims[1].burn_vout = UINT32_MAX;
-    auto proof = sentinel;
-    auto root = sentinel_root;
-    BOOST_REQUIRE(usdd::BuildWithdrawalInclusionProof(claims,1,proof,root,nullptr));
-    BOOST_CHECK(proof.claim == claims[1]);
-    BOOST_CHECK(proof.siblings == original.siblings);
-    BOOST_CHECK(root == original_root);
-}
 
-BOOST_AUTO_TEST_CASE(usdd_accumulator_native_reference)
-{
-    const auto root = [](const usdd::WithdrawalAccumulatorState& state) {
-        auto node = usdd::WithdrawalEmptyRoot(0);
-        for (size_t level = 0; level < 64; ++level) {
-            node = (state.count >> level) & 1 ? usdd::WithdrawalNode(state.frontier[level], node) :
-                usdd::WithdrawalNode(node, usdd::WithdrawalEmptyRoot(level));
-        }
-        return node;
-    };
-    std::vector<uint64_t> counts{0,UINT64_MAX,UINT64_MAX-1};
-    for (size_t level = 0; level < 64; ++level) {
-        counts.push_back(uint64_t{1} << level);
-        counts.push_back((uint64_t{1} << level) - 1);
-    }
-    usdd::WithdrawalHash leaf;
-    leaf.fill(0x77);
-    for (uint64_t count : counts) for (bool clean : {false,true}) {
-        usdd::WithdrawalAccumulatorState state;
-        state.count = count;
-        for (size_t level = 0; level < 64; ++level) {
-            state.frontier[level].fill(clean && !((count >> level) & 1) ? 0 : level + 1);
-        }
-        state.root = root(state);
-        BOOST_CHECK(usdd::ComputeWithdrawalAccumulatorRoot(state) == state.root);
-        BOOST_CHECK_EQUAL(state.IsSane(), clean || count == UINT64_MAX);
-        auto corrupted = state;
-        corrupted.root[0] ^= 1;
-        BOOST_CHECK(!corrupted.IsSane());
-        auto expected = state;
-        if (count != UINT64_MAX) {
-            auto node = leaf;
-            size_t level{0};
-            while ((count >> level) & 1) {
-                node = usdd::WithdrawalNode(expected.frontier[level], node);
-                expected.frontier[level].fill(0);
-                ++level;
-            }
-            expected.frontier[level] = node;
-            ++expected.count;
-            expected.root = root(expected);
-        }
-        std::string error = "unchanged";
-        BOOST_CHECK_EQUAL(state.Append(leaf, &error), count != UINT64_MAX);
-        BOOST_CHECK(state == expected);
-        BOOST_CHECK_EQUAL(error, count == UINT64_MAX ? "USDD withdrawal accumulator count overflow" : "unchanged");
-    }
-}
 
-BOOST_AUTO_TEST_CASE(usdd_accumulator_serialization_contract)
-{
-    std::vector<uint32_t> calls;
-    BOOST_CHECK_THROW(drivechain::haskell::UsddFrontierWire(5,false,[&](uint32_t step) -> bool {
-        calls.push_back(step);
-        if (step==2) throw std::ios_base::failure("fixture stream failure");
-        return true;
-    }),std::ios_base::failure);
-    BOOST_CHECK(calls==std::vector<uint32_t>({0,2}));
-    auto sentinel = usdd::WithdrawalAccumulatorState::Empty();
-    sentinel.count = 123;
-    sentinel.root.fill(0xa5);
-    for (auto& hash : sentinel.frontier) hash.fill(0x5a);
-    for (unsigned version = 0; version < 256; ++version) {
-        if (version == usdd::WITHDRAWAL_ACCUMULATOR_VERSION) continue;
-        DataStream stream;
-        stream << uint8_t(version) << uint64_t{0x5555555555555555};
-        auto decoded = sentinel;
-        BOOST_CHECK_EXCEPTION(stream >> decoded, std::ios_base::failure, [](const auto& error) {
-            return std::string(error.what()).starts_with("unsupported USDD withdrawal accumulator version");
-        });
-        BOOST_CHECK_EQUAL(stream.size(), 8U);
-        BOOST_CHECK(decoded == sentinel);
-    }
-    std::vector<uint64_t> wire_counts{0,3,7,UINT64_MAX};
-    for (unsigned bit=0; bit<64; ++bit) {
-        wire_counts.push_back(uint64_t{1} << bit);
-        wire_counts.push_back((uint64_t{1} << bit)-1);
-    }
-    for (const uint64_t count : wire_counts) {
-        usdd::WithdrawalAccumulatorState state;
-        state.count = count;
-        for (size_t level = 0; level < 64; ++level) {
-            if ((count >> level) & 1) state.frontier[level].fill(level + 1);
-        }
-        state.root = usdd::ComputeWithdrawalAccumulatorRoot(state);
-        std::vector<uint8_t> expected{usdd::WITHDRAWAL_ACCUMULATOR_VERSION};
-        for (unsigned byte = 0; byte < 8; ++byte) expected.push_back(count >> (8 * byte));
-        expected.insert(expected.end(), state.root.begin(), state.root.end());
-        for (size_t level = 0; level < 64; ++level) {
-            if ((count >> level) & 1) expected.insert(expected.end(), state.frontier[level].begin(), state.frontier[level].end());
-        }
-        DataStream encoded;
-        encoded << state;
-        BOOST_CHECK_EQUAL(HexStr(encoded), HexStr(expected));
-        auto dirty=state;
-        for (size_t level=0; level<64; ++level) {
-            if (!((count >> level) & 1)) dirty.frontier[level].fill(0xa5);
-        }
-        DataStream dirty_encoded;
-        dirty_encoded << dirty;
-        BOOST_CHECK_EQUAL(HexStr(dirty_encoded),HexStr(expected));
-        encoded << uint8_t{0x7e};
-        auto decoded = sentinel;
-        encoded >> decoded;
-        BOOST_CHECK(decoded == state);
-        BOOST_CHECK_EQUAL(encoded.size(), 1U);
-        uint8_t trailer{};
-        encoded >> trailer;
-        BOOST_CHECK_EQUAL(trailer, 0x7e);
-        for (const size_t length : {size_t{0}, size_t{1}, size_t{8}, size_t{9}, size_t{40}, expected.size()-1}) {
-            DataStream truncated{Span<const uint8_t>{expected}.first(length)};
-            BOOST_CHECK_THROW(truncated >> decoded, std::ios_base::failure);
-        }
-        expected[9] ^= 1;
-        DataStream corrupt{expected};
-        BOOST_CHECK_EXCEPTION(corrupt >> decoded, std::ios_base::failure, [](const auto& error) {
-            return std::string(error.what()).starts_with("malformed USDD withdrawal accumulator state");
-        });
-        BOOST_CHECK(corrupt.empty());
-    }
-}
 
-BOOST_AUTO_TEST_CASE(usdd_withdrawal_accumulator_matches_cross_language_transaction_vector)
-{
-    const auto address20 = [](const std::string& hex) {
-        const std::vector<unsigned char> bytes = ParseHex(hex);
-        BOOST_REQUIRE_EQUAL(bytes.size(), 20U);
-        usdd::EthereumAddress result{};
-        std::copy(bytes.begin(), bytes.end(), result.begin());
-        return result;
-    };
 
-    struct ScopedElementsSerialization {
-        const bool previous{g_con_elementsmode};
-        ScopedElementsSerialization() { g_con_elementsmode = true; }
-        ~ScopedElementsSerialization() { g_con_elementsmode = previous; }
-    } elements_serialization;
 
-    const uint256 genesis = uint256S(
-        "3336884b616fb495e5faedc77be45bf2951b9d7d0887aaafd2f54873a8ddb1d6");
-    const CAsset asset(uint256S(
-        "11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff"));
-    const std::vector<unsigned char> vault = ParseHex(
-        "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f");
-    const auto burn_script = [&](const std::string& recipient_hex, const uint64_t amount) {
-        std::vector<unsigned char> payload{'U', 'S', 'D', 'D', 1};
-        const std::vector<unsigned char> recipient = ParseHex(recipient_hex);
-        BOOST_REQUIRE_EQUAL(recipient.size(), 20U);
-        payload.insert(payload.end(), vault.begin(), vault.end());
-        payload.insert(payload.end(), recipient.begin(), recipient.end());
-        for (int shift = 56; shift >= 0; shift -= 8) {
-            payload.push_back(static_cast<unsigned char>(amount >> shift));
-        }
-        BOOST_REQUIRE_EQUAL(payload.size(), 65U);
-        return CScript() << OP_RETURN << payload;
-    };
 
-    CMutableTransaction mutable_transaction;
-    mutable_transaction.vout.emplace_back(
-        asset, 777000 * usdd::USDD_UNITS_PER_USDT_MICRO,
-        burn_script("000000000000000000000000000000000000beef", 777000));
-    mutable_transaction.vout.emplace_back(
-        asset, 888000 * usdd::USDD_UNITS_PER_USDT_MICRO,
-        burn_script("111122223333444455556666777788889999aaaa", 888000));
-    const CTransactionRef transaction = MakeTransactionRef(std::move(mutable_transaction));
 
-    DataStream serialized;
-    serialized << TX_NO_WITNESS(*transaction);
-    BOOST_CHECK_EQUAL(
-        HexStr(serialized),
-        "0200000000000201ffeeddccbbaa99887766554433221100ffeeddccbbaa00998877665544332211010000000004a19ba000436a415553444401101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f000000000000000000000000000000000000beef00000000000bdb2801ffeeddccbbaa99887766554433221100ffeeddccbbaa009988776655443322110100000000054afb0000436a415553444401101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f111122223333444455556666777788889999aaaa00000000000d8cc000000000");
-    BOOST_CHECK_EQUAL(
-        transaction->GetHash().GetHex(),
-        "f86aedd06a22c86b5883df2f3cae7a5c5389f135e378dfbedd6d39922e5e1ab2");
-
-    CBlock block;
-    block.vtx.push_back(transaction);
-    std::vector<usdd::EthereumWithdrawalClaim> claims;
-    std::string error;
-    BOOST_REQUIRE(usdd::ExtractEthereumWithdrawals(block, genesis, 0, claims, &error));
-    BOOST_REQUIRE_EQUAL(claims.size(), 2U);
-
-    const std::array<std::string, 2> expected_recipients{{
-        "000000000000000000000000000000000000beef",
-        "111122223333444455556666777788889999aaaa",
-    }};
-    const std::array<uint64_t, 2> expected_amounts{{777000, 888000}};
-    const std::array<std::string, 2> expected_burn_ids{{
-        "f7961bb911f26f0187638b835f593466c235c99f8c040559e3ca93e3bfe796ff",
-        "8a7a3e77f9f85e4c665465e06ad8ddbac07f4e217750f11e27f2a01fec6a84f8",
-    }};
-    const std::array<std::string, 2> expected_leaves{{
-        "8a4be6c5cc7da678d45e2b6beea0f2cd65bb6afc4d0ef7542ab2ccf12110c13f",
-        "411d36323ee653bda6c17167e4321e2437ae288a42e7786bed84832ba7baa7ec",
-    }};
-    for (size_t i = 0; i < claims.size(); ++i) {
-        BOOST_CHECK_EQUAL(
-            HexStr(claims[i].elements_genesis),
-            "3336884b616fb495e5faedc77be45bf2951b9d7d0887aaafd2f54873a8ddb1d6");
-        BOOST_CHECK_EQUAL(
-            HexStr(claims[i].asset_id),
-            "11223344556677889900aabbccddeeff00112233445566778899aabbccddeeff");
-        BOOST_CHECK_EQUAL(
-            HexStr(claims[i].vault_id),
-            "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f");
-        BOOST_CHECK_EQUAL(
-            HexStr(claims[i].burn_txid_display),
-            "f86aedd06a22c86b5883df2f3cae7a5c5389f135e378dfbedd6d39922e5e1ab2");
-        BOOST_CHECK_EQUAL(claims[i].burn_vout, i);
-        BOOST_CHECK_EQUAL(claims[i].claim_index, i);
-        BOOST_CHECK_EQUAL(claims[i].amount_usdt_micro, expected_amounts[i]);
-        BOOST_CHECK(claims[i].recipient == address20(expected_recipients[i]));
-        BOOST_CHECK_EQUAL(HexStr(claims[i].burn_id), expected_burn_ids[i]);
-        BOOST_CHECK_EQUAL(HexStr(claims[i].leaf), expected_leaves[i]);
-    }
-
-    auto state = usdd::WithdrawalAccumulatorState::Empty();
-    BOOST_CHECK(state.IsSane());
-    BOOST_CHECK_EQUAL(
-        HexStr(state.root),
-        "c13fcc5e95b202155d131894da01dff87c8ac722937c76415daab46e53ed40db");
-    for (const auto& claim : claims) BOOST_REQUIRE(state.Append(claim.leaf));
-    BOOST_CHECK_EQUAL(state.count, 2U);
-    BOOST_CHECK_EQUAL(HexStr(state.root),
-                      "9a9d19c855a9cb649c60024f7de206266056755cc93b4021211870d32a630719");
-
-    DataStream encoded;
-    encoded << state;
-    BOOST_CHECK_EQUAL(encoded.size(), 73U);
-    usdd::WithdrawalAccumulatorState decoded;
-    encoded >> decoded;
-    BOOST_CHECK(decoded == state);
-
-    usdd::WithdrawalInclusionProof proof;
-    usdd::WithdrawalHash proof_root;
-    BOOST_REQUIRE(usdd::BuildWithdrawalInclusionProof(claims, 1, proof, proof_root));
-    BOOST_CHECK(proof_root == state.root);
-    const std::vector<unsigned char> expected_siblings = ParseHex(
-        "8a4be6c5cc7da678d45e2b6beea0f2cd65bb6afc4d0ef7542ab2ccf12110c13f"
-        "fe43d66afa4a9a5c4f9c9da89f4ffb52635c8f342e7ffb731d68e36c5982072a"
-        "deb82e155954d6be14592c66ccf7a1ece193eeebcdabaf747b91f44519f09f47"
-        "2960044c62f2354e945e8d78fdd220a05f2c0879f24df6f11ef5cc26b5270a0e"
-        "4cfabc48c6898a30b1b5d12dda8e09a96e9ea17e80f4b2a050b8a8b4803fbd43"
-        "7162ed848f19740e53766ce01ac099523b099d593e0782ddbc5296eece50ec50"
-        "2be3cf0551cc6936d461e3dc43f3c4bf50cbee1bc091925254e879f4e7665e94"
-        "12db5262a5500d2516b8f82362d2a87278d20f712ff1fce2019d42ecba17241d"
-        "1a1a9265f869676c206824aa7bfc2fe8c7fe34691dddfb35797b6a321f977dfc"
-        "6e0bb8243e268be3d2fa3ce83234b2f850c85162bd0fced30e919e069bd52df7"
-        "0162892fa669b555682d4c5666f42c98f230e76406d646e6dbbcefb5d311e047"
-        "fd5593f0bfde08caa41745a8a6b2d5dcaea03a5867e8432a995bea3a1fd4df56"
-        "7bbcd27ae0b8f5d7c013dc6d13a2e586b58f83eac62aa62aa56f332288ad8bf4"
-        "d6c82f90e341cc36aa0fb5f8d03bbb3e6d5148eb56fcf79eb415574aee7fa99a"
-        "e2b649c4fa703c323fc2c929ad269dfdd150bde6862d9bcebe966244b983f20f"
-        "48c12a8dd675e9dcd3c63141fbfde6d11056c392b4379c3bbdc79a8511d0e65b"
-        "d83389ac9a207fb7dbdc492fbb56b9482f19170699e224be64694cc885a3a2a2"
-        "edcc91a8b4993170d5f55d71d4234fe9e59b7c00434012cd023f3cba860ae033"
-        "fee8622eba4d639bf3e13854a77a783506089ef2c48b84d6ef7ad254fc955c4a"
-        "e2d111ccb9aa33b2a11b8ad27f2652231310c032e8725ceebbd41c481ae4cbe7"
-        "10d6c4230824825e7296a4297b43de9bb3df9f42b4b9cd650a39b44fabb22afb"
-        "2868f47336780e9cc8046ed4c330cf79fb0c619712208f67c02e48388141e2ed"
-        "584db9263738b0d0956515ae3081f295e994dfc6e7a7e7a4d2d1c1b54d60c22f"
-        "b9548f3a287dbf425ba32df7080928edc19b1be182eb60ba26257e530071e422"
-        "8d6446d4c64ee7ebb1221fed67e95b054036fa2076e31142638b7348e875adc7"
-        "703df52a6f4f70dfc70fda8c1f183d5e30c0f2c1930649e8c39314a1b7207eba"
-        "9e47ce5eae7fc0685dc458135842c782ab79ec2faf4b44f52d83cb274c805d03"
-        "f897013deb772ba3cb7780c0002c38026724bfb236e15e44e2db925f14fe5dbb"
-        "2b9eaa148146f83dce634b361d5f5fd9215b48eb98f10cd6f1e022bd9e0a7f07"
-        "de3d631c00478d7efa3ae5f05fd92efba8db8c94c7521bf2334d6ec821254311"
-        "49f6b68c071995f76408fc063a07173188c4269cf377c6ae2ebb6ffa944c4da6"
-        "c802422af536d1fba84e02a6a8f5693778de790f8bcb51dfe220c2820c11279f"
-        "a5dfa832364e6e75e05fd480f7561e49e5935eb85736cdd869dd19ebab11b912"
-        "1f07df56447be060014f88aebfbf223f81451d2bc7685889acbce997b609e788"
-        "545ef2e7c33b35c29cdb17f6793c0ae5c5261bf75c765160c94863f24ff11691"
-        "c190017e7a1a58d07bc29a614b60bcf50c456e419e2040402270a75a32293d38"
-        "9eebc70a804b6010d61267724a919b9bcc67b7ae8f2e258428d569b987d87605"
-        "09bbf2baf387d7f63ed02ff572c91f97dde80cdfcea312a83a2c2c84c28e2c0f"
-        "e9120affb610f432b9c99776c6ec40630c7b0580c62444f333689f32487f4f00"
-        "fe9a71250d2ddc7e8c5790ef99acef23a8ac7201164e9db46bc8214740df3ed1"
-        "c81e6237577496cb0bed049576f0e3e68fa1e2ee61cd396695f48c243d53a15c"
-        "367e0f410599fe8aafcde9a4ea9388ce436ddc07bd8670c5b7d8ef37394eccf5"
-        "1309b41802c032c7c8877348ea64316544adf55561deb29dcb94145e50892e00"
-        "38997c4ee56f891a69233c598c095fe9feafa97576813e69838796a64eeeb2bf"
-        "4cbb3f614eaa9ffa44571a74f533082cba654e5fe73905c95a8afbe5c5dc05cd"
-        "cb9ba928b1ec4880cf00119d52610e28ad92734d9f972df51d2d0f8a5eb2b9b6"
-        "1560da124b100fec4d430bd8264e580d11a6fbb9c01e3e75fc49c86c56c808f9"
-        "c5b2e77ea63083407300c1e71bf19d8b84a65bf48879f12440ab05d296b464b7"
-        "c268bae2aefe1c818d0bfd533edcb8a217f7466722ad1ab6809e7eaed6ecd529"
-        "ac118efae070bbacde8e7badb95642bd7d1268ff272c7e55ca8cce66717e3863"
-        "7be150cbed20c3320cceef97bd248a7491b596f5f9c8c52a696cc6bb8c011ceb"
-        "179a84258c46051d91aa9c205e718c8bc74d4e1d7ebeb85b88bb657c926c1799"
-        "f626273c1abeaa629383a66ef35f21341f51df8bd54cec5d8efebdd5038e3042"
-        "96ea4b6920af1ec454a036999d8ca67d730cbc4fbac7a7f8f90227812a90d898"
-        "9a40564d2c9b087955dd3aa38e2921f2c78f0ac2ce9d435d96ade6e0f48f9a49"
-        "f047b0ed771c9a96abbe42edf2387172ddc87f888f9f038511ef574726173d7f"
-        "33dd5ca767b164b9858acf244827a81681306d87533a1472d79b2b874936a99a"
-        "626c2d88d3f85d86ff1c8daa1700692206d7eb8e0d8368cd4479fdb7552b2f76"
-        "028619a2b9fab6f75eaa59c59554901260e8c20f2812a09fd494f2dfa1975f3c"
-        "ac93083c85607e5b70f7e7ff8f186d8ca96ce4335437c609ff4e6c6706367933"
-        "1427d95992261f3300dafe74d2a15b2db5eec0b85ec9b1ee8b44fe240f0f196e"
-        "2021fe6240918b3c9363c089179c5a10651a65ad6dc2383065aaec6e7a0f3a7b"
-        "caf4a28529582ca02c4bd212b18b84f60c24d1ab0ff870627d06ab6b517f8121"
-        "c9e8fbff1c491590322411d4dd2901c884f6a46e29f4dfb4f3d811e565c96757");
-    BOOST_REQUIRE_EQUAL(expected_siblings.size(),
-                        usdd::WITHDRAWAL_ACCUMULATOR_DEPTH * 32U);
-    for (size_t level = 0; level < usdd::WITHDRAWAL_ACCUMULATOR_DEPTH; ++level) {
-        BOOST_CHECK(std::equal(
-            proof.siblings[level].begin(), proof.siblings[level].end(),
-            expected_siblings.begin() + level * 32));
-    }
-}
-
-BOOST_AUTO_TEST_CASE(usdd_withdrawal_extraction_is_exact_ordered_and_unblinded)
-{
-    const uint256 genesis = uint256S(
-        "3336884b616fb495e5faedc77be45bf2951b9d7d0887aaafd2f54873a8ddb1d6");
-    const CAsset asset(uint256S(
-        "0000000000000000000000000000000000000000000000000000000000003003"));
-    const std::vector<unsigned char> vault = ParseHex(
-        "101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f");
-    const std::vector<unsigned char> recipient = ParseHex(
-        "000000000000000000000000000000000000beef");
-    const auto burn_script = [&](const uint64_t amount) {
-        std::vector<unsigned char> payload{'U', 'S', 'D', 'D', 1};
-        payload.insert(payload.end(), vault.begin(), vault.end());
-        payload.insert(payload.end(), recipient.begin(), recipient.end());
-        for (int shift = 56; shift >= 0; shift -= 8) {
-            payload.push_back(static_cast<unsigned char>(amount >> shift));
-        }
-        BOOST_REQUIRE_EQUAL(payload.size(), 65U);
-        return CScript() << OP_RETURN << payload;
-    };
-
-    CMutableTransaction transaction;
-    transaction.vout.emplace_back(asset, 777000 * usdd::USDD_UNITS_PER_USDT_MICRO,
-                                   burn_script(777000));
-    transaction.vout.emplace_back(asset, 888000 * usdd::USDD_UNITS_PER_USDT_MICRO,
-                                   burn_script(888000));
-    transaction.vout.emplace_back(asset, 1, burn_script(999000));
-    transaction.vout.emplace_back(asset, 777000 * usdd::USDD_UNITS_PER_USDT_MICRO,
-                                   CScript() << OP_RETURN << std::vector<unsigned char>{'U', 'S', 'D', 'D'});
-    CBlock block;
-    block.vtx.push_back(MakeTransactionRef(transaction));
-
-    std::vector<usdd::EthereumWithdrawalClaim> claims;
-    std::string error;
-    BOOST_REQUIRE(usdd::ExtractEthereumWithdrawals(block, genesis, 9, claims, &error));
-    BOOST_REQUIRE_EQUAL(claims.size(), 2U);
-    BOOST_CHECK_EQUAL(claims[0].claim_index, 9U);
-    BOOST_CHECK_EQUAL(claims[0].burn_vout, 0U);
-    BOOST_CHECK_EQUAL(claims[0].amount_usdt_micro, 777000U);
-    BOOST_CHECK_EQUAL(claims[1].claim_index, 10U);
-    BOOST_CHECK_EQUAL(claims[1].burn_vout, 1U);
-
-    // Extraction publishes its successful prefix; Apply publishes nothing if
-    // extraction fails. A zero genesis wins over a later null transaction.
-    const auto expected_claims = claims;
-    CBlock interrupted = block;
-    interrupted.vtx.emplace_back();
-    BOOST_CHECK(!usdd::ExtractEthereumWithdrawals(interrupted, uint256{}, 9, claims, &error));
-    BOOST_CHECK_EQUAL(error, "zero Elements genesis in withdrawal accumulator");
-    BOOST_CHECK(claims.empty());
-    BOOST_CHECK(!usdd::ExtractEthereumWithdrawals(interrupted, genesis, 9, claims, &error));
-    BOOST_CHECK_EQUAL(error, "null transaction in Elements block");
-    BOOST_REQUIRE_EQUAL(claims.size(), expected_claims.size());
-    for (size_t i = 0; i < claims.size(); ++i) {
-        BOOST_CHECK(claims[i].leaf == expected_claims[i].leaf);
-        BOOST_CHECK(claims[i].burn_id == expected_claims[i].burn_id);
-        BOOST_CHECK_EQUAL(claims[i].claim_index, expected_claims[i].claim_index);
-    }
-    auto untouched = usdd::WithdrawalAccumulatorState::Empty();
-    BOOST_REQUIRE(untouched.Append(expected_claims[0].leaf));
-    const auto saved = untouched;
-    auto published = expected_claims;
-    const auto empty = usdd::WithdrawalAccumulatorState::Empty();
-    BOOST_CHECK(!usdd::ApplyEthereumWithdrawals(interrupted, genesis, empty,
-        untouched, &published, &error));
-    BOOST_CHECK_EQUAL(error, "null transaction in Elements block");
-    BOOST_CHECK_EQUAL(untouched.count, saved.count);
-    BOOST_CHECK(untouched.root == saved.root);
-    BOOST_CHECK(untouched.frontier == saved.frontier);
-    BOOST_REQUIRE_EQUAL(published.size(), expected_claims.size());
-    BOOST_CHECK(published[0].leaf == expected_claims[0].leaf);
-    auto malformed = empty;
-    malformed.root[0] ^= 1;
-    BOOST_CHECK(!usdd::ApplyEthereumWithdrawals(interrupted, uint256{}, malformed,
-        untouched, &published, &error));
-    BOOST_CHECK_EQUAL(error, "malformed prior USDD withdrawal accumulator state");
-    BOOST_CHECK(untouched.root == saved.root);
-    BOOST_CHECK_EQUAL(published[0].claim_index, expected_claims[0].claim_index);
-
-    CBlock no_transactions;
-    error = "preserved";
-    BOOST_REQUIRE(usdd::ExtractEthereumWithdrawals(no_transactions, genesis, UINT64_MAX, claims, &error));
-    BOOST_CHECK(claims.empty());
-    BOOST_CHECK_EQUAL(error, "preserved");
-
-    CMutableTransaction blinded_nonce = transaction;
-    blinded_nonce.vout[0].nNonce.vchCommitment.assign(33, 0);
-    blinded_nonce.vout[0].nNonce.vchCommitment[0] = 2;
-    CBlock nonce_block;
-    nonce_block.vtx.push_back(MakeTransactionRef(std::move(blinded_nonce)));
-    BOOST_REQUIRE(usdd::ExtractEthereumWithdrawals(nonce_block, genesis, 0, claims, &error));
-    BOOST_REQUIRE_EQUAL(claims.size(), 1U);
-    BOOST_CHECK_EQUAL(claims[0].burn_vout, 1U);
-
-    for (unsigned mask=0; mask<16; ++mask) {
-        struct ScopedElementsSerialization {
-            const bool previous{g_con_elementsmode};
-            ScopedElementsSerialization() { g_con_elementsmode = true; }
-            ~ScopedElementsSerialization() { g_con_elementsmode = previous; }
-        } elements_serialization;
-        CMutableTransaction candidate = transaction;
-        candidate.vout.resize(1);
-        auto& output = candidate.vout[0];
-        if (mask&1) { output.nAsset.vchCommitment.assign(33,1); output.nAsset.vchCommitment[0]=10; }
-        else if (mask&8) output.nAsset.SetToAsset(CAsset{});
-        if (mask&2) { output.nValue.vchCommitment.assign(33,1); output.nValue.vchCommitment[0]=8; }
-        if (mask&4) { output.nNonce.vchCommitment.assign(33,1); output.nNonce.vchCommitment[0]=2; }
-        CBlock candidate_block;
-        candidate_block.vtx.push_back(MakeTransactionRef(candidate));
-        std::vector<usdd::EthereumWithdrawalClaim> candidate_claims;
-        BOOST_REQUIRE(usdd::ExtractEthereumWithdrawals(candidate_block,genesis,0,candidate_claims,&error));
-        BOOST_CHECK_EQUAL(candidate_claims.size(),mask==0 ? 1U : 0U);
-    }
-
-    auto parent = usdd::WithdrawalAccumulatorState::Empty();
-    usdd::WithdrawalAccumulatorState branch_a = parent;
-    usdd::WithdrawalAccumulatorState branch_b = parent;
-    BOOST_REQUIRE(branch_a.Append(claims[0].leaf));
-    usdd::WithdrawalHash alternate = claims[0].leaf;
-    alternate[0] ^= 1;
-    BOOST_REQUIRE(branch_b.Append(alternate));
-    BOOST_CHECK(branch_a.root != branch_b.root);
-    BOOST_CHECK_EQUAL(parent.count, 0U);
-
-    // Index overflow precedes empty destination rejection, but follows amount checks.
-    CMutableTransaction overflow_tx;
-    overflow_tx.vout.push_back(transaction.vout[0]);
-    overflow_tx.vout.push_back(transaction.vout[0]);
-    std::fill(overflow_tx.vout[1].scriptPubKey.begin() + 7,
-              overflow_tx.vout[1].scriptPubKey.begin() + 39, 0);
-    CBlock overflow_block;
-    overflow_block.vtx.push_back(MakeTransactionRef(overflow_tx));
-    BOOST_CHECK(!usdd::ExtractEthereumWithdrawals(overflow_block, genesis,
-        std::numeric_limits<uint64_t>::max(), claims, &error));
-    BOOST_CHECK_EQUAL(error, "USDD withdrawal claim index overflow");
-    BOOST_REQUIRE_EQUAL(claims.size(), 1U);
-    overflow_tx.vout[1].nValue.SetToAmount(1);
-    overflow_block.vtx[0] = MakeTransactionRef(overflow_tx);
-    error = "preserved";
-    BOOST_REQUIRE(usdd::ExtractEthereumWithdrawals(overflow_block, genesis,
-        std::numeric_limits<uint64_t>::max(), claims, &error));
-    BOOST_CHECK_EQUAL(error, "preserved");
-    BOOST_CHECK_EQUAL(claims.size(), 1U);
-
-    auto almost_full = usdd::WithdrawalAccumulatorState::Empty();
-    almost_full.count = UINT64_MAX - 1;
-    for (auto& node : almost_full.frontier) node.fill(1);
-    almost_full.frontier[0].fill(0);
-    almost_full.root = usdd::ComputeWithdrawalAccumulatorRoot(almost_full);
-    BOOST_REQUIRE(almost_full.IsSane());
-    BOOST_REQUIRE(usdd::ExtractEthereumWithdrawals(block, genesis, almost_full.count, claims, &error));
-    auto expected_prefix = almost_full;
-    BOOST_REQUIRE(expected_prefix.Append(claims[0].leaf));
-    auto batch_result = usdd::WithdrawalAccumulatorState::Empty();
-    std::vector<usdd::EthereumWithdrawalClaim> preserved_claims(1);
-    preserved_claims[0].claim_index = 42;
-    BOOST_CHECK(!usdd::ApplyEthereumWithdrawals(block, genesis, almost_full,
-        batch_result, &preserved_claims, &error));
-    BOOST_CHECK_EQUAL(error, "USDD withdrawal accumulator count overflow");
-    BOOST_CHECK_EQUAL(batch_result.count, expected_prefix.count);
-    BOOST_CHECK(batch_result.root == expected_prefix.root);
-    BOOST_CHECK(batch_result.frontier == expected_prefix.frontier);
-    BOOST_REQUIRE_EQUAL(preserved_claims.size(), 1U);
-    BOOST_CHECK_EQUAL(preserved_claims[0].claim_index, 42U);
-
-    // Callers may apply in place; extraction must finish before changing state.
-    auto in_place = usdd::WithdrawalAccumulatorState::Empty();
-    auto sequential = in_place;
-    BOOST_REQUIRE(usdd::ExtractEthereumWithdrawals(block,genesis,0,claims,&error));
-    for (const auto& claim : claims) BOOST_REQUIRE(sequential.Append(claim.leaf));
-    error = "preserved";
-    BOOST_REQUIRE(usdd::ApplyEthereumWithdrawals(block,genesis,in_place,in_place,&preserved_claims,&error));
-    BOOST_CHECK_EQUAL(error,"preserved");
-    BOOST_CHECK_EQUAL(in_place.count,sequential.count);
-    BOOST_CHECK(in_place.root == sequential.root);
-    BOOST_CHECK(in_place.frontier == sequential.frontier);
-    BOOST_REQUIRE_EQUAL(preserved_claims.size(),claims.size());
-    for (size_t i=0;i<claims.size();++i) {
-        BOOST_CHECK_EQUAL(preserved_claims[i].claim_index,claims[i].claim_index);
-        BOOST_CHECK(preserved_claims[i].leaf == claims[i].leaf);
-    }
-    BOOST_CHECK(!usdd::ApplyEthereumWithdrawals(block,uint256{},in_place,in_place,&preserved_claims,&error));
-    BOOST_CHECK_EQUAL(error,"zero Elements genesis in withdrawal accumulator");
-    BOOST_CHECK_EQUAL(in_place.count,sequential.count);
-    BOOST_CHECK(in_place.root == sequential.root);
-    BOOST_CHECK(in_place.frontier == sequential.frontier);
-    BOOST_CHECK_EQUAL(preserved_claims.size(),claims.size());
-    error = "preserved";
-    BOOST_REQUIRE(usdd::ApplyEthereumWithdrawals(no_transactions,genesis,in_place,in_place,&preserved_claims,&error));
-    BOOST_CHECK_EQUAL(error,"preserved");
-    BOOST_CHECK(preserved_claims.empty());
-    BOOST_CHECK_EQUAL(in_place.count,sequential.count);
-    BOOST_CHECK(in_place.root == sequential.root);
-    BOOST_CHECK(in_place.frontier == sequential.frontier);
-    auto alias_overflow = almost_full;
-    BOOST_CHECK(!usdd::ApplyEthereumWithdrawals(block,genesis,alias_overflow,alias_overflow,nullptr,&error));
-    BOOST_CHECK_EQUAL(error,"USDD withdrawal accumulator count overflow");
-    BOOST_CHECK_EQUAL(alias_overflow.count,expected_prefix.count);
-    BOOST_CHECK(alias_overflow.root == expected_prefix.root);
-    BOOST_CHECK(alias_overflow.frontier == expected_prefix.frontier);
-
-    auto derived = usdd::WithdrawalAccumulatorState::Empty();
-    const auto derivation_prior = derived;
-    uint256 separate_hash, aliased_hash, aliased_expected;
-    BOOST_REQUIRE(usdd::DeriveWithdrawalBip301CriticalHash(block,genesis,24,derivation_prior,derived,separate_hash,&error));
-    auto aliased = derivation_prior;
-    BOOST_REQUIRE(usdd::DeriveWithdrawalBip301CriticalHash(block,genesis,24,aliased,aliased,aliased_hash,&error));
-    BOOST_CHECK_EQUAL(aliased.count,derived.count);
-    BOOST_CHECK(aliased.root == derived.root);
-    BOOST_CHECK(aliased.frontier == derived.frontier);
-    // Preserve the existing API's alias semantics: checkpoint reads the now-
-    // updated prior reference. Production callers use distinct state objects.
-    BOOST_REQUIRE(usdd::ComputeWithdrawalBip301CriticalHash(genesis,24,block.GetHash(),derived,derived,aliased_expected,&error));
-    BOOST_CHECK(aliased_hash == aliased_expected);
-    BOOST_CHECK(aliased_hash != separate_hash);
-}
-
-BOOST_AUTO_TEST_CASE(usdd_block_extraction_callback_exceptions)
-{
-    std::array<unsigned char,69> profile{};
-    profile.fill(1);
-    std::array<unsigned char,216> request{};
-    WriteLE64(request.data()+16,10);
-    WriteLE64(request.data()+24,10);
-    WriteLE64(request.data()+32,100);
-    WriteLE32(request.data()+40,1);
-    const std::array<unsigned char,5> magic{85,83,68,68,65};
-    std::copy(magic.begin(),magic.end(),request.begin()+44);
-    const std::array<unsigned char,7> script{106,65,85,83,68,68,1};
-    std::copy(script.begin(),script.end(),request.begin()+49);
-    request[56]=1;
-    request[88]=1;
-    request[115]=1;
-    for (size_t fail=0; fail<=9; ++fail) {
-        size_t calls=0, published=0;
-        const auto run = [&] {
-            return drivechain::haskell::UsddExtractBlock(false,profile,
-                [&](uint32_t action,uint64_t,uint64_t,uint64_t count,unsigned char* bytes) -> int64_t {
-                    if (calls++ == fail) throw std::logic_error("claim adapter failure");
-                    if (action==0 || action==1) return 2;
-                    if (action==2) { bytes[0]=15; bytes[1]=106; return 67; }
-                    if (action==4) {
-                        std::copy(request.begin(),request.end(),bytes);
-                        WriteLE64(bytes+8,count);
-                        return 1;
-                    }
-                    BOOST_REQUIRE_EQUAL(action,3U);
-                    BOOST_CHECK_EQUAL(ReadLE64(bytes),1U);
-                    ++published;
-                    return 0;
-                });
-        };
-        if (fail<9) BOOST_CHECK_EXCEPTION(run(),std::logic_error,
-            [](const auto& e) { return std::string{e.what()}=="claim adapter failure"; });
-        else BOOST_CHECK_EQUAL(run(),0);
-        BOOST_CHECK_EQUAL(calls,std::min<size_t>(fail+1,9));
-        BOOST_CHECK_EQUAL(published,fail>8 ? 2U : fail>4 ? 1U : 0U);
-    }
-}
-
-BOOST_AUTO_TEST_CASE(usdd_checkpoint_identity_rejection_precedes_state_validation)
-{
-    for (unsigned absent=1; absent<4; ++absent) for (bool malformed : {false,true}) {
-        auto prior = usdd::WithdrawalAccumulatorState::Empty();
-        auto next = prior;
-        if (malformed) { prior.count = 1; next.count = 2; }
-        const uint256 genesis = absent & 1 ? uint256{} : uint256::ONE;
-        const uint256 block = absent & 2 ? uint256{} : uint256::ONE;
-        uint256 output = uint256::ONE;
-        std::string error{"stale"};
-        BOOST_CHECK(!usdd::ComputeWithdrawalBip301CriticalHash(genesis,24,block,prior,next,output,&error));
-        BOOST_CHECK(output.IsNull());
-        BOOST_CHECK_EQUAL(error,"USDD BIP301 checkpoint has a null network or block hash");
-        output = uint256::ONE;
-        BOOST_CHECK(!usdd::ComputeWithdrawalBip301CriticalHash(genesis,24,block,prior,next,output));
-        BOOST_CHECK(output.IsNull());
-    }
-}
-
-BOOST_AUTO_TEST_CASE(usdd_bip301_critical_hash_commits_exact_candidate_and_transition)
-{
-    const uint256 genesis = uint256S(
-        "3336884b616fb495e5faedc77be45bf2951b9d7d0887aaafd2f54873a8ddb1d6");
-    const uint256 candidate_a = uint256S(
-        "f86aedd06a22c86b5883df2f3cae7a5c5389f135e378dfbedd6d39922e5e1ab2");
-    const uint256 candidate_b = uint256S(
-        "f86aedd06a22c86b5883df2f3cae7a5c5389f135e378dfbedd6d39922e5e1ab3");
-    constexpr uint8_t slot{24};
-
-    const auto hash32 = [](const std::string& hex) {
-        const std::vector<unsigned char> bytes = ParseHex(hex);
-        BOOST_REQUIRE_EQUAL(bytes.size(), 32U);
-        usdd::WithdrawalHash result{};
-        std::copy(bytes.begin(), bytes.end(), result.begin());
-        return result;
-    };
-
-    const auto previous = usdd::WithdrawalAccumulatorState::Empty();
-    auto next = previous;
-    BOOST_REQUIRE(next.Append(hash32(
-        "8a4be6c5cc7da678d45e2b6beea0f2cd65bb6afc4d0ef7542ab2ccf12110c13f")));
-    BOOST_REQUIRE(next.Append(hash32(
-        "411d36323ee653bda6c17167e4321e2437ae288a42e7786bed84832ba7baa7ec")));
-
-    uint256 critical_a;
-    uint256 critical_b;
-    std::string error;
-    BOOST_REQUIRE(usdd::ComputeWithdrawalBip301CriticalHash(
-        genesis, slot, candidate_a, previous, next, critical_a, &error));
-    BOOST_REQUIRE(usdd::ComputeWithdrawalBip301CriticalHash(
-        genesis, slot, candidate_b, previous, next, critical_b, &error));
-    BOOST_CHECK_EQUAL(
-        critical_a.GetHex(),
-        "6b9c9c485cce8a07a5d6d78c81b5566f269f5df03fa38cd29d5c3de7cb985161");
-    BOOST_CHECK(critical_a != critical_b);
-
-    uint256 wrong_slot;
-    uint256 wrong_genesis;
-    BOOST_REQUIRE(usdd::ComputeWithdrawalBip301CriticalHash(
-        genesis, slot - 1, candidate_a, previous, next, wrong_slot, &error));
-    BOOST_REQUIRE(usdd::ComputeWithdrawalBip301CriticalHash(
-        uint256S("01"), slot, candidate_a, previous, next, wrong_genesis,
-        &error));
-    BOOST_CHECK(critical_a != wrong_slot);
-    BOOST_CHECK(critical_a != wrong_genesis);
-
-    // The cross-language checkpoint codec fails closed if only one accumulator
-    // identity field changes. A count-only mutation is necessarily an invalid
-    // Merkle state absent a hash collision, while two valid same-count states
-    // provide the root-only transition case.
-    auto count_only = previous;
-    count_only.count = 1;
-    uint256 rejected;
-    error.clear();
-    BOOST_CHECK(!usdd::ComputeWithdrawalBip301CriticalHash(
-        genesis, slot, candidate_a, previous, count_only, rejected, &error));
-    BOOST_CHECK(rejected.IsNull());
-    BOOST_CHECK_EQUAL(
-        error, "USDD BIP301 checkpoint has a malformed accumulator transition");
-
-    auto alternate_next = previous;
-    BOOST_REQUIRE(alternate_next.Append(hash32(
-        "8a4be6c5cc7da678d45e2b6beea0f2cd65bb6afc4d0ef7542ab2ccf12110c13f")));
-    BOOST_REQUIRE(alternate_next.Append(hash32(
-        "6dc1c216030073b6d27bc55cc559a2fad953c9dbcd4cdaf83204f85c1fd3355d")));
-    BOOST_REQUIRE(alternate_next.IsSane());
-    BOOST_REQUIRE(next.IsSane());
-    BOOST_REQUIRE_EQUAL(alternate_next.count, next.count);
-    BOOST_REQUIRE(alternate_next.root != next.root);
-    error.clear();
-    BOOST_CHECK(!usdd::ComputeWithdrawalBip301CriticalHash(
-        genesis, slot, candidate_a, next, alternate_next, rejected, &error));
-    BOOST_CHECK(rejected.IsNull());
-    BOOST_CHECK_EQUAL(
-        error, "USDD BIP301 checkpoint has a malformed accumulator transition");
-
-    const auto make_m7 = [slot](const uint256& critical_hash) {
-        std::vector<unsigned char> payload = ParseHex("d1617368");
-        payload.push_back(slot);
-        const std::vector<unsigned char> display_hash =
-            ParseHex(critical_hash.GetHex());
-        payload.insert(payload.end(), display_hash.begin(), display_hash.end());
-        return CScript() << OP_RETURN << payload;
-    };
-    const auto make_parent_block = [](const CScript& m7) {
-        Bitcoin::CMutableTransaction coinbase;
-        coinbase.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0, 0);
-        coinbase.vout.emplace_back(0, m7);
-        Bitcoin::CBlock block;
-        block.vtx.push_back(Bitcoin::MakeTransactionRef(std::move(coinbase)));
-        return block;
-    };
-
-    const Bitcoin::CBlock parent_a = make_parent_block(make_m7(critical_a));
-    const Bitcoin::CBlock parent_b = make_parent_block(make_m7(critical_b));
-    BOOST_CHECK(MatchDrivechainBmmCommitmentInBlock(
-        parent_a, slot, critical_a, nullptr, &error));
-    BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(
-        parent_a, slot, critical_b, nullptr, &error));
-    BOOST_CHECK(MatchDrivechainBmmCommitmentInBlock(
-        parent_b, slot, critical_b, nullptr, &error));
-    BOOST_CHECK(!MatchDrivechainBmmCommitmentInBlock(
-        parent_b, slot, critical_a, nullptr, &error));
-
-    // A malformed BIP301 lookalike is not an M7 under the enforcer grammar.
-    // It must be ignored when the block also carries one exact slot-24 M7.
-    std::vector<unsigned char> malformed_payload = ParseHex("d1617368");
-    malformed_payload.push_back(slot);
-    malformed_payload.insert(malformed_payload.end(), 31, 0x42);
-    Bitcoin::CMutableTransaction coinbase;
-    coinbase.vin.emplace_back(Bitcoin::COutPoint(), CScript() << OP_0, 0);
-    coinbase.vout.emplace_back(
-        0, CScript() << OP_RETURN << malformed_payload);
-    coinbase.vout.emplace_back(0, make_m7(critical_a));
-    Bitcoin::CBlock parent_with_unrelated_invalid_message;
-    parent_with_unrelated_invalid_message.vtx.push_back(
-        Bitcoin::MakeTransactionRef(std::move(coinbase)));
-    BOOST_CHECK(MatchDrivechainBmmCommitmentInBlock(
-        parent_with_unrelated_invalid_message, slot, critical_a, nullptr,
-        &error));
-}
 
 BOOST_AUTO_TEST_CASE(canonical_m7_admission_and_output_reset)
 {
@@ -3008,204 +1807,9 @@ BOOST_AUTO_TEST_CASE(canonical_m7_admission_and_output_reset)
     }
 }
 
-BOOST_AUTO_TEST_CASE(usdd_checkpoint_derivation_publication)
-{
-    const auto genesis = uint256S("01");
-    const auto prior = usdd::WithdrawalAccumulatorState::Empty();
-    auto sentinel = prior;
-    usdd::WithdrawalHash leaf{};
-    leaf[0]=7;
-    BOOST_REQUIRE(sentinel.Append(leaf));
-    CBlock empty_block;
-    auto next = sentinel;
-    auto critical = uint256S("02");
-    std::string error{"preserved"};
-    BOOST_REQUIRE(usdd::DeriveWithdrawalBip301CriticalHash(empty_block,genesis,24,prior,next,critical,&error));
-    uint256 expected;
-    BOOST_REQUIRE(usdd::ComputeWithdrawalBip301CriticalHash(genesis,24,empty_block.GetHash(),prior,prior,expected));
-    BOOST_CHECK(critical == expected);
-    BOOST_CHECK_EQUAL(error,"preserved");
-    BOOST_CHECK_EQUAL(next.count,prior.count);
-    BOOST_CHECK(next.root == prior.root);
-    BOOST_CHECK(next.frontier == prior.frontier);
 
-    auto malformed = prior;
-    malformed.count=1;
-    CBlock null_transaction;
-    null_transaction.vtx.emplace_back();
-    for (unsigned failure=0;failure<3;++failure) {
-        next=sentinel;
-        critical=uint256S("02");
-        const auto& input = failure==0 ? malformed : prior;
-        BOOST_CHECK(!usdd::DeriveWithdrawalBip301CriticalHash(null_transaction,
-            failure==2 ? genesis : uint256{},24,input,next,critical,&error));
-        static constexpr const char* errors[]{"malformed prior USDD withdrawal accumulator state",
-            "zero Elements genesis in withdrawal accumulator", "null transaction in Elements block"};
-        BOOST_CHECK_EQUAL(error,errors[failure]);
-        BOOST_CHECK(critical.IsNull());
-        BOOST_CHECK_EQUAL(next.count,sentinel.count);
-        BOOST_CHECK(next.root == sentinel.root);
-        BOOST_CHECK(next.frontier == sentinel.frontier);
-    }
-}
 
-BOOST_AUTO_TEST_CASE(explicit_block_screening_defers_only_aggregate)
-{
-    Consensus::Params consensus = Params().GetConsensus();
-    consensus.signet_blocks = false;
-    const auto make_block = [](CAmount amount, bool duplicate) {
-        CMutableTransaction coinbase;
-        coinbase.vin.resize(1);
-        coinbase.vin[0].prevout.SetNull();
-        coinbase.vin[0].scriptSig = CScript() << OP_0 << OP_0;
-        coinbase.vout.emplace_back(CAsset(uint256::ONE), 0, CScript() << OP_TRUE);
-        CMutableTransaction tx;
-        tx.vin.emplace_back(COutPoint(Txid::FromUint256(uint256::ONE), 0));
-        if (duplicate) tx.vin.push_back(tx.vin.front());
-        tx.vout.emplace_back(CAsset(uint256::ONE), amount, CScript() << OP_TRUE);
-        tx.vout.emplace_back(CAsset(uint256S("02")), MAX_MONEY, CScript() << OP_TRUE);
-        CBlock block;
-        block.vtx = {MakeTransactionRef(std::move(coinbase)), MakeTransactionRef(std::move(tx))};
-        return block;
-    };
-    // Use fresh blocks/states so cached validation cannot mask a failure.
-    consensus.explicit_only_height = -1;
-    BlockValidationState legacy;
-    BOOST_CHECK(!CheckBlock(make_block(MAX_MONEY, false), legacy, consensus, false, false));
-    BOOST_CHECK_EQUAL(legacy.GetRejectReason(), "bad-txns-txouttotal-toolarge");
-    consensus.explicit_only_height = 100;
-    BlockValidationState deferred;
-    BOOST_CHECK(CheckBlock(make_block(MAX_MONEY, false), deferred, consensus, false, false));
-    BlockValidationState oversized;
-    BOOST_CHECK(!CheckBlock(make_block(MAX_MONEY + 1, false), oversized, consensus, false, false));
-    BOOST_CHECK_EQUAL(oversized.GetRejectReason(), "bad-txns-vout-toolarge");
-    BlockValidationState duplicate;
-    BOOST_CHECK(!CheckBlock(make_block(1, true), duplicate, consensus, false, false));
-    BOOST_CHECK_EQUAL(duplicate.GetRejectReason(), "bad-txns-inputs-duplicate");
-    // Passing context-free screening does not establish contextual validity,
-    // input conservation, script validity, or acceptance into a chain.
-}
 
-BOOST_AUTO_TEST_CASE(explicit_contextual_passes_preserve_failure_precedence)
-{
-    for (unsigned mask = 0; mask < 16; ++mask) for (int activation : {-1, 0, 100}) {
-        Consensus::Params params = Params().GetConsensus();
-        params.explicit_only_height = activation;
-        std::vector<CTransactionRef> transactions;
-        for (unsigned i = 0; i < 2; ++i) {
-            CMutableTransaction tx;
-            tx.vin.emplace_back(COutPoint(Txid::FromUint256(uint256::ONE), i));
-            const CAmount amount = mask & (1U << i) ? MAX_MONEY : 1;
-            tx.vout.emplace_back(CAsset(uint256::ONE), amount, CScript() << OP_TRUE);
-            tx.vout.emplace_back(CAsset(uint256::ONE), amount, CScript() << OP_TRUE);
-            if (mask & (4U << i)) {
-                tx.witness.vtxoutwit.resize(2);
-                tx.witness.vtxoutwit[0].vchRangeproof = {1};
-            }
-            transactions.push_back(MakeTransactionRef(tx));
-        }
-        std::array<BlockValidationState, 2> states;
-        std::array<std::vector<unsigned>, 2> traces;
-        std::array<bool, 2> accepted{};
-        for (unsigned migrated = 0; migrated < 2; ++migrated) {
-            const auto totals = [&](const CTransactionRef& tx) {
-                traces[migrated].push_back(tx->vin[0].prevout.n);
-                TxValidationState state;
-                if (!CheckTransaction(*tx, state, params.ExplicitOnlyActive(1)))
-                    return states[migrated].Invalid(BlockValidationResult::BLOCK_CONSENSUS,
-                        state.GetRejectReason(), state.GetDebugMessage());
-                return true;
-            };
-            const auto creations = [&](const CTransactionRef& tx) {
-                traces[migrated].push_back(2 + tx->vin[0].prevout.n);
-                if (!Consensus::HasOnlyExplicitCreations(*tx))
-                    return states[migrated].Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-txns-confidential-disabled");
-                return true;
-            };
-            const auto each = [&](const auto& action) {
-                if (migrated) return drivechain::haskell::ParentReplayEach(transactions, action);
-                for (const auto& tx : transactions) if (!action(tx)) return false;
-                return true;
-            };
-            accepted[migrated] = (!params.ExplicitOnlyConfigured() || each(totals)) &&
-                (!params.ExplicitOnlyActive(1) || each(creations));
-        }
-        BOOST_CHECK_EQUAL(accepted[0], accepted[1]);
-        BOOST_CHECK(traces[0] == traces[1]);
-        BOOST_CHECK_EQUAL(states[0].GetRejectReason(), states[1].GetRejectReason());
-        BOOST_CHECK_EQUAL(states[0].GetDebugMessage(), states[1].GetDebugMessage());
-        if (activation >= 0 && (mask & 3))
-            BOOST_CHECK_EQUAL(states[1].GetRejectReason(), "bad-txns-txouttotal-toolarge");
-        else if (activation == 0 && (mask & 12))
-            BOOST_CHECK_EQUAL(states[1].GetRejectReason(), "bad-txns-confidential-disabled");
-        else BOOST_CHECK(accepted[1]);
-    }
-}
-
-BOOST_AUTO_TEST_CASE(explicit_contextual_and_connection_paths_keep_distinct_order)
-{
-    LOCK(cs_main);
-    auto& chainman = *m_node.chainman;
-    auto& chainstate = chainman.ActiveChainstate();
-    const auto& params = chainman.GetParams();
-    auto& consensus = const_cast<Consensus::Params&>(params.GetConsensus());
-    BOOST_REQUIRE(!consensus.elements_mode);
-    BOOST_REQUIRE(!consensus.drivechain_slot.has_value());
-    struct RestoreHeight {
-        Consensus::Params& params;
-        int height;
-        ~RestoreHeight() { params.explicit_only_height = height; }
-    } restore{consensus, consensus.explicit_only_height};
-    consensus.explicit_only_height = 0;
-    auto* previous = chainstate.m_chain.Tip();
-    BOOST_REQUIRE(previous);
-    const auto best = chainstate.CoinsTip().GetBestBlock();
-    CMutableTransaction coinbase;
-    coinbase.vin.resize(1);
-    coinbase.vin[0].scriptSig = CScript() << OP_0 << OP_0;
-    coinbase.vout.emplace_back(CAsset(uint256::ONE), 0, CScript() << OP_TRUE);
-    CMutableTransaction confidential;
-    confidential.vin.emplace_back(COutPoint(Txid::FromUint256(uint256::ONE), 0));
-    confidential.vout.emplace_back(CAsset(uint256::ONE), 1, CScript() << OP_TRUE);
-    confidential.witness.vtxoutwit.resize(1);
-    confidential.witness.vtxoutwit[0].vchRangeproof = {1};
-    CMutableTransaction excessive;
-    excessive.vin.emplace_back(COutPoint(Txid::FromUint256(uint256::ONE), 1));
-    for (unsigned i = 0; i < 2; ++i)
-        excessive.vout.emplace_back(CAsset(uint256::ONE), MAX_MONEY, CScript() << OP_TRUE);
-    const auto make_block = [&](bool reversed, bool cached) {
-        CBlock block;
-        block.nVersion = 4;
-        block.hashPrevBlock = previous->GetBlockHash();
-        block.nBits = previous->nBits;
-        block.nTime = previous->GetBlockTime() + 1;
-        block.block_height = previous->nHeight + 1;
-        block.vtx = {MakeTransactionRef(coinbase), MakeTransactionRef(confidential), MakeTransactionRef(excessive)};
-        if (reversed) std::swap(block.vtx[1], block.vtx[2]);
-        block.fChecked = cached;
-        return block;
-    };
-    for (bool reversed : {false, true}) for (bool cached : {false, true}) {
-        // Contextual checks must run even when context-free screening was cached.
-        BlockValidationState contextual;
-        BOOST_CHECK(!TestBlockValidity(contextual, params, chainstate, make_block(reversed, cached), previous, false, false));
-        BOOST_CHECK_EQUAL(contextual.GetRejectReason(), "bad-txns-txouttotal-toolarge");
-        const auto block = make_block(reversed, cached);
-        const auto hash = block.GetHash();
-        CBlockIndex index(block);
-        index.phashBlock = &hash;
-        index.pprev = previous;
-        index.nHeight = previous->nHeight + 1;
-        CCoinsViewCache view(&chainstate.CoinsTip());
-        BlockValidationState connection;
-        BOOST_CHECK(!chainstate.ConnectBlock(block, connection, &index, view, nullptr, /*fJustCheck=*/true));
-        BOOST_CHECK_EQUAL(connection.GetRejectReason(), reversed ? "bad-txns-txouttotal-toolarge" : "bad-txns-confidential-disabled");
-        BOOST_CHECK(view.GetBestBlock() == best);
-        BOOST_CHECK(chainstate.CoinsTip().GetBestBlock() == best);
-        BOOST_CHECK(chainstate.m_chain.Tip() == previous);
-        BOOST_CHECK(!index.m_usdd_withdrawal_accumulator.has_value());
-    }
-}
 
 BOOST_AUTO_TEST_CASE(drivechain_native_deposit_block_cap)
 {
@@ -3279,548 +1883,11 @@ BOOST_AUTO_TEST_CASE(drivechain_native_deposit_block_cap)
         [](uint32_t,uint64_t,uint64_t) -> uint64_t { throw std::logic_error("read failed"); }),std::logic_error);
 }
 
-BOOST_AUTO_TEST_CASE(usdd_sp1_annex_block_resource_gate)
-{
-    Consensus::Params consensus = Params().GetConsensus();
-    consensus.enable_usdd_sp1_annex = true;
 
-    const auto make_block = [](const std::vector<std::vector<unsigned char>>& annexes,
-                               const bool tapsimplicity_shape = true,
-                               const bool correct_controller_cmr = true) {
-        CMutableTransaction transaction;
-        transaction.vin.resize(annexes.size());
-        transaction.witness.vtxinwit.resize(annexes.size());
-        for (size_t i = 0; i < annexes.size(); ++i) {
-            if (tapsimplicity_shape) {
-                std::vector<unsigned char> control(33, 0);
-                control[0] = usdd::SP1_TAPSIMPLICITY_LEAF_VERSION;
-                std::vector<unsigned char> controller_cmr(32, 0x21);
-                if (!correct_controller_cmr) controller_cmr[0] ^= 1;
-                transaction.witness.vtxinwit[i].scriptWitness.stack = {
-                    std::vector<unsigned char>{0x01},
-                    std::vector<unsigned char>{0x01},
-                    std::move(controller_cmr),
-                    std::move(control),
-                    annexes[i]};
-            } else {
-                transaction.witness.vtxinwit[i].scriptWitness.stack = {
-                    std::vector<unsigned char>(64, 0x11), annexes[i]};
-            }
-        }
-        CBlock block;
-        block.vtx.push_back(MakeTransactionRef(std::move(transaction)));
-        return block;
-    };
 
-    const auto canonical_annex = [](const size_t total_size) {
-        static constexpr uint32_t PUBLIC_VALUES_SIZE{32};
-        BOOST_REQUIRE(total_size >=
-                      usdd::SP1_ANNEX_HEADER_SIZE + PUBLIC_VALUES_SIZE + 1);
-        std::vector<unsigned char> annex(total_size, 0);
-        annex[0] = usdd::SP1_ANNEX_TAG;
-        std::copy(usdd::SP1_ANNEX_MAGIC.begin(), usdd::SP1_ANNEX_MAGIC.end(),
-                  annex.begin() + 1);
-        annex[9] = 1;
-        annex[10] = 1;
-        annex[11] = static_cast<uint8_t>(
-            usdd::Sp1StatementKind::CONTROLLER_STRONG_EXECUTION_V2);
-        annex[12] = 1;
-        annex[17] = static_cast<unsigned char>(PUBLIC_VALUES_SIZE >> 8);
-        annex[18] = static_cast<unsigned char>(PUBLIC_VALUES_SIZE);
-        const uint32_t proof_size =
-            total_size - usdd::SP1_ANNEX_HEADER_SIZE - PUBLIC_VALUES_SIZE;
-        annex[19] = static_cast<unsigned char>(proof_size >> 24);
-        annex[20] = static_cast<unsigned char>(proof_size >> 16);
-        annex[21] = static_cast<unsigned char>(proof_size >> 8);
-        annex[22] = static_cast<unsigned char>(proof_size);
-        std::copy(
-            ElementsDrivechainIdentity::USDD_SP1_GUEST_PROGRAM_ID.begin(),
-            ElementsDrivechainIdentity::USDD_SP1_GUEST_PROGRAM_ID.end(),
-            annex.begin() + 23);
-        std::fill(annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE,
-                  annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE +
-                      PUBLIC_VALUES_SIZE,
-                  0x42);
-        annex.back() = 1;
-        return annex;
-    };
 
-    const std::vector<unsigned char> canonical =
-        canonical_annex(usdd::SP1_ANNEX_HEADER_SIZE + 32 + 1);
-    const std::vector<unsigned char> malformed_namespace{
-        usdd::SP1_ANNEX_TAG, 'U', 'S', 'D', 'D'};
-    const std::vector<unsigned char> unrelated_annex{
-        usdd::SP1_ANNEX_TAG, 'U', 'S', 'D', 'X'};
 
-    BlockValidationState unrelated_state;
-    BOOST_CHECK(CheckUsddSp1AnnexBlockResources(
-        make_block({unrelated_annex, unrelated_annex}), unrelated_state,
-        consensus));
 
-    BlockValidationState one_state;
-    BOOST_CHECK(CheckUsddSp1AnnexBlockResources(
-        make_block({canonical}), one_state, consensus));
-
-    BlockValidationState wrong_controller_state;
-    BOOST_CHECK(CheckUsddSp1AnnexBlockResources(
-        make_block({canonical}, /*tapsimplicity_shape=*/true,
-                   /*correct_controller_cmr=*/false),
-        wrong_controller_state, consensus));
-
-    std::vector<unsigned char> wrong_guest = canonical;
-    wrong_guest[23] ^= 1;
-    BlockValidationState wrong_guest_state;
-    BOOST_CHECK(CheckUsddSp1AnnexBlockResources(
-        make_block({wrong_guest}), wrong_guest_state, consensus));
-
-    std::vector<unsigned char> malformed_public_values = canonical;
-    std::fill(malformed_public_values.begin() + usdd::SP1_ANNEX_HEADER_SIZE,
-              malformed_public_values.begin() +
-                  usdd::SP1_ANNEX_HEADER_SIZE + 32,
-              0);
-    BlockValidationState malformed_public_values_state;
-    BOOST_CHECK(!CheckUsddSp1AnnexBlockResources(
-        make_block({malformed_public_values}),
-        malformed_public_values_state, consensus));
-    BOOST_CHECK_EQUAL(malformed_public_values_state.GetRejectReason(),
-                      "bad-usdd-sp1-annex-envelope");
-
-    const auto annex_with_public_values_size = [](const uint32_t public_values_size) {
-        const uint32_t proof_size{1};
-        std::vector<unsigned char> annex(
-            usdd::SP1_ANNEX_HEADER_SIZE + public_values_size + proof_size, 0);
-        annex[0] = usdd::SP1_ANNEX_TAG;
-        std::copy(usdd::SP1_ANNEX_MAGIC.begin(), usdd::SP1_ANNEX_MAGIC.end(),
-                  annex.begin() + 1);
-        annex[9] = 1;
-        annex[10] = 1;
-        annex[11] = static_cast<uint8_t>(
-            usdd::Sp1StatementKind::CONTROLLER_STRONG_EXECUTION_V2);
-        annex[12] = 1;
-        annex[15] = static_cast<unsigned char>(public_values_size >> 24);
-        annex[16] = static_cast<unsigned char>(public_values_size >> 16);
-        annex[17] = static_cast<unsigned char>(public_values_size >> 8);
-        annex[18] = static_cast<unsigned char>(public_values_size);
-        annex[22] = proof_size;
-        std::copy(
-            ElementsDrivechainIdentity::USDD_SP1_GUEST_PROGRAM_ID.begin(),
-            ElementsDrivechainIdentity::USDD_SP1_GUEST_PROGRAM_ID.end(),
-            annex.begin() + 23);
-        std::fill(annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE,
-                  annex.begin() + usdd::SP1_ANNEX_HEADER_SIZE + public_values_size,
-                  0x42);
-        annex.back() = 1;
-        return annex;
-    };
-
-    const std::vector<unsigned char> oversized_public_values =
-        annex_with_public_values_size(usdd::SP1_PUBLIC_VALUES_MAX_SIZE + 1);
-    BlockValidationState oversized_public_values_state;
-    BOOST_CHECK(!CheckUsddSp1AnnexBlockResources(
-        make_block({oversized_public_values}), oversized_public_values_state,
-        consensus));
-    BOOST_CHECK_EQUAL(oversized_public_values_state.GetRejectReason(),
-                      "bad-usdd-sp1-annex-public-values");
-
-    const std::vector<unsigned char> wrong_width_public_values =
-        annex_with_public_values_size(31);
-    BlockValidationState wrong_width_public_values_state;
-    BOOST_CHECK(!CheckUsddSp1AnnexBlockResources(
-        make_block({wrong_width_public_values}), wrong_width_public_values_state,
-        consensus));
-    BOOST_CHECK_EQUAL(wrong_width_public_values_state.GetRejectReason(),
-                      "bad-usdd-sp1-annex-envelope");
-
-    std::vector<unsigned char> wrong_statement_kind = canonical;
-    wrong_statement_kind[11] = 0xff;
-    BlockValidationState wrong_statement_kind_state;
-    BOOST_CHECK(!CheckUsddSp1AnnexBlockResources(
-        make_block({wrong_statement_kind}), wrong_statement_kind_state,
-        consensus));
-    BOOST_CHECK_EQUAL(wrong_statement_kind_state.GetRejectReason(),
-                      "bad-usdd-sp1-annex-envelope");
-
-    std::vector<unsigned char> legacy_v8_statement = canonical;
-    legacy_v8_statement[11] =
-        static_cast<uint8_t>(usdd::Sp1StatementKind::ETH_STATE_V1);
-    BlockValidationState legacy_v8_statement_state;
-    BOOST_CHECK(!CheckUsddSp1AnnexBlockResources(
-        make_block({legacy_v8_statement}), legacy_v8_statement_state,
-        consensus));
-    BOOST_CHECK_EQUAL(legacy_v8_statement_state.GetRejectReason(),
-                      "bad-usdd-sp1-annex-envelope");
-
-    BlockValidationState two_state;
-    BOOST_CHECK(!CheckUsddSp1AnnexBlockResources(
-        make_block({canonical, canonical}), two_state,
-        consensus));
-    BOOST_CHECK_EQUAL(two_state.GetRejectReason(),
-                      "bad-usdd-sp1-annex-count");
-
-    BlockValidationState malformed_state;
-    BOOST_CHECK(!CheckUsddSp1AnnexBlockResources(
-        make_block({malformed_namespace}), malformed_state, consensus));
-    BOOST_CHECK_EQUAL(malformed_state.GetRejectReason(),
-                      "bad-usdd-sp1-annex-envelope");
-
-    BlockValidationState wrong_shape_state;
-    BOOST_CHECK(!CheckUsddSp1AnnexBlockResources(
-        make_block({canonical}, /*tapsimplicity_shape=*/false),
-        wrong_shape_state, consensus));
-    BOOST_CHECK_EQUAL(wrong_shape_state.GetRejectReason(),
-                      "bad-usdd-sp1-annex-spend-shape");
-
-    std::vector<unsigned char> at_size_limit =
-        canonical_annex(usdd::SP1_ANNEX_MAX_SIZE);
-    BlockValidationState at_size_state;
-    BOOST_CHECK(CheckUsddSp1AnnexBlockResources(
-        make_block({at_size_limit}), at_size_state, consensus));
-
-    // The reserved transaction is independently capped at one quarter of the
-    // repriced block after the generic controller-bound lane is active.
-    CBlock overweight_block = make_block({at_size_limit});
-    CMutableTransaction overweight_tx{*overweight_block.vtx.front()};
-    overweight_tx.witness.vtxinwit[0].scriptWitness.stack[0].resize(
-        ElementsDrivechainIdentity::USDD_SP1_MAX_NON_ANNEX_TX_WEIGHT +
-            4'096U,
-        0x55);
-    overweight_block.vtx.front() = MakeTransactionRef(std::move(overweight_tx));
-    BOOST_REQUIRE(GetTransactionWeight(*overweight_block.vtx.front()) >
-                  static_cast<int64_t>(usdd::SP1_PROOF_TX_MAX_WEIGHT));
-    BlockValidationState overweight_state;
-    BOOST_CHECK(!CheckUsddSp1AnnexBlockResources(
-        overweight_block, overweight_state, consensus));
-    BOOST_CHECK_EQUAL(overweight_state.GetRejectReason(),
-                      "bad-usdd-sp1-tx-weight");
-
-    at_size_limit.push_back(0);
-    BlockValidationState oversized_state;
-    BOOST_CHECK(!CheckUsddSp1AnnexBlockResources(
-        make_block({at_size_limit}), oversized_state, consensus));
-    BOOST_CHECK_EQUAL(oversized_state.GetRejectReason(),
-                      "bad-usdd-sp1-annex-size");
-
-    // Freeze caller-level precedence independently of the resource classifier.
-    // Early structural/weight errors precede the cumulative lane check, while
-    // public-value admission follows it. Earlier transactions always win.
-    struct ResourceCase {
-        CTransactionRef tx;
-        size_t count;
-        const char* early_error;
-        const char* late_error;
-    };
-    const std::vector<ResourceCase> cases{
-        {make_block({unrelated_annex}).vtx.front(), 0, "", ""},
-        {make_block({canonical}).vtx.front(), 1, "", ""},
-        {make_block({at_size_limit}).vtx.front(), 1, "bad-usdd-sp1-annex-size", ""},
-        {make_block({malformed_namespace}).vtx.front(), 1, "bad-usdd-sp1-annex-envelope", ""},
-        {make_block({canonical}, false).vtx.front(), 1, "bad-usdd-sp1-annex-spend-shape", ""},
-        {overweight_block.vtx.front(), 1, "bad-usdd-sp1-tx-weight", ""},
-        {make_block({canonical, canonical}).vtx.front(), 2, "", ""},
-        {make_block({oversized_public_values}).vtx.front(), 1, "", "bad-usdd-sp1-annex-public-values"},
-    };
-    for (size_t first = 0; first < cases.size(); ++first) {
-        for (size_t second = 0; second < cases.size(); ++second) {
-            BOOST_TEST_CONTEXT("resource order " << first << "," << second) {
-                CBlock block;
-                block.vtx = {cases[first].tx, cases[second].tx};
-                size_t count{0};
-                std::string expected;
-                for (const size_t index : {first, second}) {
-                    const auto& candidate = cases[index];
-                    if (*candidate.early_error) expected = candidate.early_error;
-                    else if (count + candidate.count > 1) expected = "bad-usdd-sp1-annex-count";
-                    else expected = candidate.late_error;
-                    if (!expected.empty()) break;
-                    count += candidate.count;
-                }
-                BlockValidationState ordered_state;
-                BOOST_CHECK_EQUAL(CheckUsddSp1AnnexBlockResources(block, ordered_state, consensus), expected.empty());
-                BOOST_CHECK_EQUAL(ordered_state.GetRejectReason(), expected);
-                auto disabled = consensus;
-                disabled.enable_usdd_sp1_annex = false;
-                BlockValidationState bypass_state;
-                BOOST_CHECK(CheckUsddSp1AnnexBlockResources(block, bypass_state, disabled));
-                BOOST_CHECK(bypass_state.IsValid());
-            }
-        }
-    }
-
-    consensus.enable_usdd_sp1_annex = false;
-    BlockValidationState disabled_state;
-    BOOST_CHECK(CheckUsddSp1AnnexBlockResources(
-        make_block({malformed_namespace, malformed_namespace}), disabled_state,
-        consensus));
-    CBlock unreadable;
-    unreadable.vtx.push_back(nullptr);
-    BOOST_CHECK(CheckUsddSp1AnnexBlockResources(unreadable, disabled_state, consensus));
-    BOOST_CHECK(disabled_state.IsValid());
-}
-
-BOOST_AUTO_TEST_CASE(usdd_resource_admission_composition)
-{
-    namespace hs = drivechain::haskell;
-    const auto caller = std::this_thread::get_id();
-    for (bool package : {false,true}) for (uint32_t flags=0; flags<8; ++flags)
-    for (uint32_t pattern=0; pattern<8; ++pattern) {
-        std::vector<CTransactionRef> transactions;
-        for (size_t i=0; i<3; ++i) {
-            CMutableTransaction tx;
-            tx.vin.resize(2);
-            tx.witness.vtxinwit.resize(2);
-            tx.witness.vtxinwit[1].scriptWitness.stack = {{1}, {80,85,83,68,static_cast<unsigned char>((pattern>>i)&1 ? 68 : 69)}};
-            transactions.push_back(MakeTransactionRef(std::move(tx)));
-        }
-        const auto run = [&](bool composed,size_t fault) {
-            std::vector<std::pair<uint32_t,uint64_t>> trace;
-            size_t advanced{0};
-            usdd::ResourceReader reader;
-            auto source = reader.Source();
-            auto witness = source.read;
-            const auto touch = [&](uint32_t step,uint64_t index) {
-                BOOST_CHECK(std::this_thread::get_id()==caller);
-                trace.emplace_back(step,index);
-                if (fault && trace.size()==fault) throw std::runtime_error("resource admission fault");
-            };
-            source.read = [&](uint64_t index) { touch(6,index); return witness(index); };
-            uint32_t cached{0};
-            const auto action = [&](uint32_t step,uint64_t index) -> uint64_t {
-                if (step==(package ? 4U : 1U)) {
-                    BOOST_CHECK(!composed);
-                    return cached;
-                }
-                touch(step,index);
-                if (step==(package ? 3U : 0U)) {
-                    const auto count = reader.Select(*transactions.at(index));
-                    if (composed) return count;
-                    const auto usage = hs::UsddResources(count,source.fields,source.profile,
-                        source.limit,source.parameterized,source.read);
-                    cached=usage.first;
-                    return usage.second;
-                }
-                if (!package) return GetTransactionWeight(*transactions.at(index));
-                if (step==5) { ++advanced; return 1; }
-                return step==0 ? 0 : 1;
-            };
-            int result;
-            try {
-                result = package ? hs::UsddPackageResources(flags,transactions.size(),0,2,action,composed ? &source : nullptr) :
-                    hs::UsddBlockResources(transactions.size(),2,100000,action,composed ? &source : nullptr);
-            } catch (const std::runtime_error& error) {
-                BOOST_REQUIRE_EQUAL(error.what(),"resource admission fault");
-                result=-1;
-            }
-            return std::make_tuple(result,trace,advanced);
-        };
-        const auto expected = run(false,0);
-        for (size_t fault=0; fault<=std::get<1>(expected).size(); ++fault) {
-            BOOST_CHECK(run(true,fault)==run(false,fault));
-        }
-    }
-}
-
-BOOST_AUTO_TEST_CASE(usdd_policy_composition_parity)
-{
-    namespace hs = drivechain::haskell;
-    const auto caller = std::this_thread::get_id();
-    for (uint32_t mask = 0; mask < (1U << 14); ++mask) {
-        std::vector<uint32_t> expected;
-        const auto run = [&](bool expanded, size_t fault, std::vector<uint32_t>& trace,
-                             unsigned& published, unsigned& nested) {
-            const auto facts = [&](uint32_t step) -> uint64_t {
-                BOOST_CHECK(std::this_thread::get_id() == caller);
-                trace.push_back(step);
-                if (fault != 0 && trace.size() == fault) throw std::runtime_error("composed policy read failure");
-                if (step >= 17 && step <= 30) return (mask >> (step-17)) & 1;
-                switch (step) {
-                case 0: return 1;
-                case 2: return (mask >> 1) & 1;
-                case 3: return mask & 1;
-                case 4: ++published; return 1;
-                default: BOOST_FAIL("unexpected composed policy read"); return 0;
-                }
-            };
-            return hs::UsddPolicyWeight(0,1,[&](uint32_t step,uint64_t index) -> uint64_t {
-                BOOST_CHECK_EQUAL(index,0);
-                if (step != 1) return facts(step);
-                BOOST_CHECK(!expanded);
-                ++nested;
-                return hs::ParentReplayStore(hs::ReplayStoreFlow::ACTIVATION_POLICY,
-                    [&](uint32_t phase) { return static_cast<uint32_t>(facts(phase+16)); }) == 0;
-            },expanded);
-        };
-        unsigned original_published{0}, original_nested{0};
-        const auto result = run(false,0,expected,original_published,original_nested);
-        BOOST_CHECK_EQUAL(original_nested,1);
-        for (size_t fault = 0; fault <= expected.size(); ++fault) {
-            std::vector<uint32_t> trace;
-            unsigned published{0}, nested{0};
-            if (fault == 0) {
-                BOOST_CHECK_EQUAL(run(true,0,trace,published,nested),result);
-                BOOST_CHECK_EQUAL(published,original_published);
-            } else {
-                BOOST_CHECK_EXCEPTION(run(true,fault,trace,published,nested), std::runtime_error,
-                    [](const auto& error) { return std::string{error.what()} == "composed policy read failure"; });
-                BOOST_CHECK_EQUAL(published,0);
-            }
-            BOOST_CHECK_EQUAL(nested,0);
-            const auto end = expected.begin() + (fault == 0 ? expected.size() : fault);
-            BOOST_CHECK_EQUAL_COLLECTIONS(trace.begin(),trace.end(),expected.begin(),end);
-        }
-    }
-    BOOST_CHECK_THROW(hs::UsddPolicyWeight(0,1,[](uint32_t step,uint64_t) -> uint64_t {
-        return step == 0 ? 1 : UINT64_MAX;
-    },true), std::runtime_error);
-}
-
-BOOST_AUTO_TEST_CASE(activation_policy_flow_order)
-{
-    namespace hs = drivechain::haskell;
-    const auto caller = std::this_thread::get_id();
-    for (uint32_t mask = 0; mask < (1U << 14); ++mask) {
-        std::vector<uint32_t> expected;
-        for (uint32_t step = 1; step <= 14; ++step) {
-            expected.push_back(step);
-            if (!(mask & (1U << (step-1)))) break;
-        }
-        for (size_t fault = 0; fault <= expected.size(); ++fault) {
-            std::vector<uint32_t> trace;
-            const auto run = [&] {
-                return hs::ParentReplayStore(hs::ReplayStoreFlow::ACTIVATION_POLICY,
-                    [&](uint32_t step) -> uint32_t {
-                        BOOST_CHECK(std::this_thread::get_id() == caller);
-                        BOOST_REQUIRE(step >= 1 && step <= 14);
-                        trace.push_back(step);
-                        if (fault != 0 && trace.size() == fault) throw std::runtime_error("activation read failure");
-                        return (mask >> (step-1)) & 1;
-                    });
-            };
-            if (fault == 0) BOOST_CHECK_EQUAL(run(), mask == (1U << 14)-1 ? 0 : 1);
-            else BOOST_CHECK_EXCEPTION(run(), std::runtime_error, [](const auto& error) {
-                return std::string{error.what()} == "activation read failure";
-            });
-            const auto end = expected.begin() + (fault == 0 ? expected.size() : fault);
-            BOOST_CHECK_EQUAL_COLLECTIONS(trace.begin(),trace.end(),expected.begin(),end);
-        }
-    }
-}
-
-BOOST_AUTO_TEST_CASE(usdd_policy_weight_flow_order)
-{
-    using drivechain::haskell::UsddPolicyWeight;
-    for (uint32_t flags = 0; flags < 512; ++flags) {
-        uint32_t expected{0};
-        if (flags & 6) expected = 1;
-        else if (flags & 8) expected = 2;
-        else if (flags & 16) expected = 3;
-        else if (flags & 32) expected = 4;
-        else if (flags & 64) expected = 5;
-        else if (flags & 128) expected = 6;
-        else if (flags & 256) expected = 7;
-        BOOST_CHECK_EQUAL(UsddPolicyWeight(flags,0,[](uint32_t,uint64_t) -> uint64_t {
-            BOOST_FAIL("resource rejection/empty witnesses must not read"); return 0;
-        }), expected);
-    }
-    const auto caller = std::this_thread::get_id();
-    for (uint32_t mask = 0; mask < 16; ++mask) {
-        using Read = std::pair<uint32_t,uint64_t>;
-        std::vector<Read> expected{{0,0},{1,0},{2,0},{3,0},{4,0},{0,1}};
-        uint32_t code{0};
-        if (mask & 1) {
-            expected.emplace_back(1,1);
-            if (!(mask & 2)) {
-                expected.emplace_back(2,1);
-                code = 1;
-                if (mask & 4) {
-                    expected.emplace_back(3,1);
-                    if (mask & 8) code = 8;
-                }
-            }
-        }
-        for (size_t fault = 0; fault <= expected.size(); ++fault) {
-            std::vector<Read> trace;
-            uint64_t weight{99};
-            const auto run = [&] {
-                return UsddPolicyWeight(0,2,[&](uint32_t step,uint64_t index) -> uint64_t {
-                    BOOST_CHECK(std::this_thread::get_id() == caller);
-                    trace.emplace_back(step,index);
-                    if (fault != 0 && trace.size() == fault) throw std::runtime_error("policy read failure");
-                    if (step == 4) { BOOST_CHECK_EQUAL(index,0); weight = 100; return 1; }
-                    BOOST_REQUIRE(step < 4 && index < 2);
-                    return index == 0 ? step != 1 : (mask >> step) & 1;
-                });
-            };
-            if (fault == 0) BOOST_CHECK_EQUAL(run(), code);
-            else BOOST_CHECK_EXCEPTION(run(), std::runtime_error, [](const auto& error) {
-                return std::string{error.what()} == "policy read failure";
-            });
-            const auto length = fault == 0 ? expected.size() : fault;
-            BOOST_CHECK(trace == std::vector<Read>(expected.begin(),expected.begin()+length));
-            BOOST_CHECK_EQUAL(weight, fault == 0 || fault > 5 ? 100 : 99);
-        }
-    }
-    BOOST_CHECK_THROW(UsddPolicyWeight(512,0,[](uint32_t,uint64_t) -> uint64_t {
-        BOOST_FAIL("unknown flags must not read"); return 0;
-    }), std::runtime_error);
-    BOOST_CHECK_THROW(UsddPolicyWeight(0,1,[](uint32_t,uint64_t) -> uint64_t { return 2; }), std::runtime_error);
-}
-
-BOOST_AUTO_TEST_CASE(usdd_package_resource_flow_order)
-{
-    using drivechain::haskell::UsddPackageResources;
-    const auto caller = std::this_thread::get_id();
-    for (uint32_t config = 0; config < 8; ++config) {
-        for (uint32_t mask = 0; mask < 64; ++mask) {
-            const bool pegin = mask & 1, final = mask & 2, scripts = mask & 4;
-            const uint64_t count = mask & 8 ? 2 : 1;
-            const uint64_t initial = mask & 16 ? UINT64_MAX : 0;
-            const uint64_t flags = mask & 32 ? 64 : 0;
-            std::vector<uint32_t> expected;
-            bool accepted{true};
-            if (!(config & 1)) { expected.push_back(0); accepted = !pegin; }
-            if (accepted) { expected.push_back(1); accepted = final; }
-            if (accepted && (config & 2)) { expected.push_back(2); accepted = scripts; }
-            if (accepted && (config & 4)) {
-                expected.insert(expected.end(), {3,4});
-                accepted = flags == 0 && initial == 0 && count == 1;
-            }
-            if (accepted) expected.push_back(5);
-            for (size_t fault = 0; fault <= expected.size(); ++fault) {
-                std::vector<uint32_t> trace;
-                const auto run = [&] {
-                    return UsddPackageResources(config,1,initial,1,[&](uint32_t step,uint64_t index) -> uint64_t {
-                        BOOST_CHECK(std::this_thread::get_id() == caller);
-                        BOOST_CHECK_EQUAL(index, 0);
-                        trace.push_back(step);
-                        if (fault != 0 && trace.size() == fault) throw std::runtime_error("package read failure");
-                        switch (step) {
-                        case 0: return pegin;
-                        case 1: return final;
-                        case 2: return scripts;
-                        case 3: return count;
-                        case 4: return flags;
-                        case 5: return 1;
-                        default: BOOST_FAIL("unexpected package read"); return 0;
-                        }
-                    });
-                };
-                if (fault == 0) BOOST_CHECK_EQUAL(run(), accepted);
-                else BOOST_CHECK_EXCEPTION(run(), std::runtime_error, [](const auto& error) {
-                    return std::string{error.what()} == "package read failure";
-                });
-                const auto end = expected.begin() + (fault == 0 ? expected.size() : fault);
-                BOOST_CHECK_EQUAL_COLLECTIONS(trace.begin(), trace.end(), expected.begin(), end);
-            }
-        }
-    }
-    BOOST_CHECK(UsddPackageResources(7,0,UINT64_MAX,1,[](uint32_t,uint64_t) -> uint64_t {
-        BOOST_FAIL("empty package must not read"); return 0;
-    }));
-    BOOST_CHECK_THROW(UsddPackageResources(8,0,0,1,[](uint32_t,uint64_t) -> uint64_t {
-        BOOST_FAIL("invalid config must not read"); return 0;
-    }), std::runtime_error);
-    BOOST_CHECK_THROW(UsddPackageResources(0,1,0,1,[](uint32_t,uint64_t) -> uint64_t { return 2; }), std::runtime_error);
-}
 
 BOOST_AUTO_TEST_CASE(explicit_m4_publication_preserves_state)
 {
@@ -3862,59 +1929,6 @@ BOOST_AUTO_TEST_CASE(explicit_m4_publication_preserves_state)
     }
 }
 
-BOOST_AUTO_TEST_CASE(usdd_block_resource_flow_order)
-{
-    using drivechain::haskell::UsddBlockResources;
-    for (uint32_t flags = 0; flags < 512; flags += 2) {
-        for (const uint64_t count : {uint64_t{0}, uint64_t{1}, uint64_t{2}, UINT64_MAX}) {
-            for (const bool overweight : {false, true}) {
-                std::vector<uint32_t> expected{0,1};
-                uint32_t code{0};
-                if (flags & 2) code = 1;
-                else if (flags & 4) code = 2;
-                else if (flags & 8) code = 3;
-                else {
-                    if (count != 0) expected.push_back(2);
-                    if (count != 0 && overweight) code = 4;
-                    else if (count > 1) code = 5;
-                    else if (flags & 16) code = 6;
-                    else if (flags & 32) code = 7;
-                    else if (flags & 64) code = 8;
-                    else if (flags & 128) code = 9;
-                    else if (flags & 256) code = 10;
-                }
-                for (size_t fault = 0; fault <= expected.size(); ++fault) {
-                    std::vector<uint32_t> trace;
-                    const auto run = [&] {
-                        return UsddBlockResources(1,1,10,[&](uint32_t step,uint64_t index) -> uint64_t {
-                            BOOST_CHECK_EQUAL(index, 0);
-                            trace.push_back(step);
-                            if (fault != 0 && trace.size() == fault) throw std::runtime_error("resource read failure");
-                            switch (step) {
-                            case 0: return count;
-                            case 1: return flags;
-                            case 2: return overweight ? 11 : 10;
-                            default: BOOST_FAIL("unexpected resource read"); return 0;
-                            }
-                        });
-                    };
-                    if (fault == 0) BOOST_CHECK_EQUAL(run(), code);
-                    else BOOST_CHECK_EXCEPTION(run(), std::runtime_error, [](const auto& error) {
-                        return std::string{error.what()} == "resource read failure";
-                    });
-                    const auto end = expected.begin() + (fault == 0 ? expected.size() : fault);
-                    BOOST_CHECK_EQUAL_COLLECTIONS(trace.begin(), trace.end(), expected.begin(), end);
-                }
-            }
-        }
-    }
-    BOOST_CHECK_EQUAL(UsddBlockResources(0,1,10,[](uint32_t,uint64_t) -> uint64_t {
-        BOOST_FAIL("empty block must not read resources"); return 0;
-    }), 0);
-    BOOST_CHECK_THROW(UsddBlockResources(1,1,10,[](uint32_t step,uint64_t) -> uint64_t {
-        return step == 0 ? 1 : 512;
-    }), std::runtime_error);
-}
 
 BOOST_AUTO_TEST_CASE(full_block_admission_preserves_native_effect_order)
 {
@@ -4889,104 +2903,8 @@ BOOST_AUTO_TEST_CASE(drivechain_peer_dispatch_order)
     }
 }
 
-BOOST_AUTO_TEST_CASE(drivechain_source_package_publication)
-{
-    using namespace drivechain::haskell;
-    const std::array<uint64_t,3> counts{0,1,UINT64_MAX};
-    for (bool modified : {false,true}) for (bool enabled : {false,true}) for (bool parsed : {false,true})
-    for (uint64_t forced : counts) for (uint64_t deposit : counts)
-    for (uint64_t initial : counts) for (uint64_t budget : counts) {
-        bool valid=true;
-        uint64_t total{0};
-        std::vector<uint32_t> expected;
-        if (enabled) {
-            expected.push_back(0);
-            if (!parsed) valid=false;
-            else {
-                expected.insert(expected.end(),{1,2});
-                valid=forced<=UINT64_MAX-deposit;
-                if (valid) total=forced+deposit;
-            }
-        }
-        if (valid) {
-            expected.insert(expected.end(),{3,4});
-            valid=initial<=budget && total<=budget-initial;
-            if (valid) expected.insert(expected.end(),{5,6});
-        }
-        if (!valid && modified) expected.insert(expected.end(),{7,8});
-        uint64_t selected;
-        std::vector<uint32_t> trace;
-        const auto run = [&](size_t fault) {
-            selected=initial;
-            trace.clear();
-            return ExchangeSourcePackage(enabled,1,[&](uint32_t step,uint64_t index) -> uint64_t {
-                BOOST_CHECK_EQUAL(index,0U);
-                trace.push_back(step);
-                if (trace.size()==fault) throw std::runtime_error("source package callback failure");
-                switch (step) {
-                case 0: return parsed;
-                case 1: return forced;
-                case 2: return deposit;
-                case 3: return selected;
-                case 4: return budget;
-                default: return 1;
-                }
-            },selected,modified);
-        };
-        BOOST_CHECK_EQUAL(run(0),valid);
-        BOOST_CHECK_EQUAL(selected,valid ? initial+total : initial);
-        BOOST_CHECK(trace==expected);
-        for (size_t fault=1; fault<=expected.size(); ++fault) {
-            BOOST_CHECK_THROW(run(fault),std::runtime_error);
-            BOOST_CHECK_EQUAL(selected,initial);
-            BOOST_CHECK(trace==std::vector<uint32_t>(expected.begin(),expected.begin()+fault));
-        }
-    }
-}
 
-BOOST_AUTO_TEST_CASE(drivechain_source_package_partial_failure)
-{
-    using namespace drivechain::haskell;
-    const std::vector<std::pair<uint32_t,uint64_t>> expected{
-        {0,0},{1,0},{2,0},{0,1},{1,1},{2,1},{3,0},{4,0},{5,0},{6,0},{5,1},{6,1}};
-    for (size_t fault=0; fault<=expected.size(); ++fault) {
-        uint64_t selected{7};
-        std::vector<std::pair<uint32_t,uint64_t>> trace;
-        const auto run = [&] {
-            return ExchangeSourcePackage(true,2,[&](uint32_t step,uint64_t index) -> uint64_t {
-                trace.emplace_back(step,index);
-                if (trace.size()==fault) throw std::runtime_error("partial package failure");
-                if (step==1) return index==0 ? 1 : 3;
-                if (step==2) return index==0 ? 2 : 4;
-                if (step==3) return selected;
-                if (step==4) return 20;
-                return 1;
-            },selected,true);
-        };
-        if (fault==0) BOOST_CHECK(run());
-        else BOOST_CHECK_THROW(run(),std::runtime_error);
-        BOOST_CHECK_EQUAL(selected,fault==0 ? 17U : 7U);
-        BOOST_CHECK(trace==std::vector(expected.begin(),expected.begin()+(fault==0 ? expected.size() : fault)));
-    }
-}
 
-BOOST_AUTO_TEST_CASE(drivechain_source_package_cleanup_failure)
-{
-    for (uint32_t failed : {7,8}) for (uint64_t reply : {uint64_t{0},uint64_t{2},UINT64_MAX}) {
-        uint64_t selected{11};
-        std::vector<uint32_t> trace;
-        BOOST_CHECK_THROW(drivechain::haskell::ExchangeSourcePackage(true,1,
-            [&](uint32_t step,uint64_t index) -> uint64_t {
-                BOOST_CHECK_EQUAL(index,0U);
-                trace.push_back(step);
-                if (step==0) return 0;
-                BOOST_CHECK_EQUAL(drivechain::haskell::BmmSelectedBid(1,0),1);
-                return step==failed ? reply : 1;
-            },selected,true),std::runtime_error);
-        BOOST_CHECK(trace==(failed==7 ? std::vector<uint32_t>{0,7} : std::vector<uint32_t>{0,7,8}));
-        BOOST_CHECK_EQUAL(selected,11U);
-    }
-}
 
 BOOST_AUTO_TEST_CASE(drivechain_index_derived_load_order)
 {
@@ -5145,61 +3063,6 @@ BOOST_AUTO_TEST_CASE(drivechain_header_admission_order)
     }
 }
 
-BOOST_AUTO_TEST_CASE(drivechain_index_capital_order)
-{
-    using namespace drivechain::haskell;
-    std::vector<std::vector<unsigned>> samples{{},{63}};
-    for (unsigned mask=0; mask<64; ++mask) {
-        samples.push_back({mask});
-        samples.push_back({63,mask,63});
-    }
-    for (const auto& rows : samples) {
-        std::vector<uint32_t> expected{1,2};
-        bool rejected{false};
-        for (unsigned mask : rows) {
-            expected.push_back(3);
-            if (!(mask&1)) break;
-            expected.push_back(4);
-            if (!(mask&2)) break;
-            expected.push_back(5);
-            if (!(mask&4)) { expected.push_back(6); rejected=true; break; }
-            expected.push_back(7);
-            if (mask&8) expected.push_back(8);
-            if ((mask&24)==24) expected.push_back(9);
-            if ((mask&56)!=56) { expected.push_back(10); rejected=true; break; }
-            expected.insert(expected.end(),{11,2});
-        }
-        if (!rejected) expected.push_back(12);
-        std::vector<uint32_t> trace;
-        size_t published{0};
-        const auto run=[&](size_t fault) {
-            trace.clear(); published=0;
-            size_t index{0};
-            return ParentReplayStore(ReplayStoreFlow::INDEX_CAPITAL,[&](uint32_t step) -> uint32_t {
-                trace.push_back(step);
-                if (trace.size()==fault) throw std::runtime_error("capital callback failure");
-                switch (step) {
-                case 1: case 6: case 10: case 12: return 1;
-                case 2: return index<rows.size();
-                case 3: return rows.at(index)&1;
-                case 4: return (rows.at(index)&2)!=0;
-                case 5: return (rows.at(index)&4)!=0;
-                case 7: return (rows.at(index)&8)!=0;
-                case 8: return (rows.at(index)&16)!=0;
-                case 9: return (rows.at(index)&32)!=0;
-                case 11: ++published; ++index; return 1;
-                default: throw std::logic_error("unknown capital action");
-                }
-            });
-        };
-        for (size_t fault=0; fault<=expected.size(); ++fault) {
-            if (fault==0) BOOST_CHECK_EQUAL(run(0),rejected);
-            else BOOST_CHECK_THROW(run(fault),std::runtime_error);
-            BOOST_CHECK(trace==std::vector(expected.begin(),expected.begin()+(fault==0 ? expected.size() : fault)));
-            BOOST_CHECK_EQUAL(published,std::count(expected.begin(),expected.begin()+(fault==0 ? expected.size() : fault-1),11U));
-        }
-    }
-}
 
 BOOST_AUTO_TEST_CASE(drivechain_bmm_bid_selection)
 {
@@ -5744,11 +3607,11 @@ BOOST_AUTO_TEST_CASE(drivechain_production_stages)
     for (const bool ecx : {false,true}) {
     const std::vector<uint32_t> stages = ecx ?
         std::vector<uint32_t>{1,19,2,20,3,15,4,5,6,16,7,8,9,17,10,18,11,12,13,14} :
-        std::vector<uint32_t>{1,2,13,3,4,5,6,11,12,7,8,9,10};
+        std::vector<uint32_t>{1,2,13,3,4,5,6,7,8,9,10};
     const std::map<uint32_t,uint32_t> reports = ecx ?
         std::map<uint32_t,uint32_t>{{1,101},{19,101},{2,102},{20,102},{3,103},{15,115},{4,104},
             {6,106},{16,116},{7,107},{9,109},{10,110},{12,112}} :
-        std::map<uint32_t,uint32_t>{{1,101},{2,102},{13,102},{3,103},{6,106},{11,111},{12,112},{7,107}};
+        std::map<uint32_t,uint32_t>{{1,101},{2,102},{13,102},{3,103},{6,106},{7,107}};
     for (size_t position=0; position<=stages.size(); ++position) {
         const uint32_t failure = position == stages.size() ? 0 : stages[position];
         std::vector<uint32_t> trace;
@@ -7066,36 +4929,6 @@ BOOST_AUTO_TEST_CASE(mined_commitment_preflight_order)
     }
 }
 
-BOOST_AUTO_TEST_CASE(bond_context_admission_order)
-{
-    namespace hs = drivechain::haskell;
-    for (unsigned identities=0; identities<4; ++identities) for (unsigned rejected=0; rejected<=16; ++rejected) {
-        const auto reply = [&](uint32_t step) { return step==3 ? identities : unsigned(step!=rejected); };
-        std::vector<uint32_t> expected;
-        bool admitted{true};
-        for (uint32_t step=1; step<=16; ++step) {
-            expected.push_back(step);
-            if (!reply(step)) { expected.push_back(17); admitted=false; break; }
-        }
-        for (size_t fault=0; fault<=expected.size(); ++fault) {
-            std::vector<uint32_t> trace;
-            const auto invoke = [&] {
-                return hs::ParentReplayStore(hs::ReplayStoreFlow::BOND_CONTEXT_ADMISSION,
-                    [&](uint32_t step) -> uint32_t {
-                    trace.push_back(step);
-                    if (trace.size()==fault+1) throw std::runtime_error("bond context fault");
-                    return step==17 ? 0 : reply(step);
-                });
-            };
-            if (fault==expected.size()) BOOST_CHECK_EQUAL(invoke(),admitted);
-            else BOOST_CHECK_THROW(invoke(),std::runtime_error);
-            const std::vector<uint32_t> prefix(expected.begin(),expected.begin()+std::min(fault+1,expected.size()));
-            BOOST_CHECK(trace==prefix);
-        }
-    }
-    BOOST_CHECK_THROW(hs::ParentReplayStore(hs::ReplayStoreFlow::BOND_CONTEXT_ADMISSION,
-        [](uint32_t step) -> uint32_t { return step==3 ? 4 : 1; }),std::runtime_error);
-}
 
 BOOST_AUTO_TEST_CASE(required_proposal_and_snapshot_reply_order)
 {
@@ -7165,67 +4998,6 @@ BOOST_AUTO_TEST_CASE(bmm_rpc_authentication_presence_gate)
     }}));
 }
 
-BOOST_AUTO_TEST_CASE(activation_anchor_order_and_clearing)
-{
-    namespace hs = drivechain::haskell;
-    for (uint32_t rejected : {0U,1U,2U,3U,4U,5U,6U,7U,8U,9U,10U,11U,12U,13U,14U,
-                             15U,16U,17U,18U,19U,20U,23U,24U,26U,27U}) {
-        const bool eligible = rejected == 0 || rejected > 17;
-        const bool copied = rejected < 18 || rejected > 20;
-        std::vector<uint32_t> expected;
-        for (uint32_t step = 1; step <= 17; ++step) {
-            expected.push_back(step);
-            if (step == rejected) break;
-        }
-        if (eligible) {
-            for (uint32_t step = 18; step <= 20; ++step) {
-                expected.push_back(step);
-                if (step == rejected) break;
-            }
-            if (copied) expected.push_back(21);
-            expected.insert(expected.end(), {22,23});
-            if (rejected != 23) {
-                expected.push_back(24);
-                if (copied && rejected != 24) {
-                    expected.insert(expected.end(), {25,26});
-                    if (rejected != 26) {
-                        expected.push_back(27);
-                        if (rejected != 27) expected.push_back(28);
-                    }
-                }
-            }
-        }
-        for (size_t fault = 0; fault <= expected.size(); ++fault) {
-            std::vector<uint32_t> trace;
-            bool captured{false}, cleared{false}, published{false};
-            const auto invoke = [&] {
-                return hs::ParentReplayStore(hs::ReplayStoreFlow::ACTIVATION_ANCHOR,
-                    [&](uint32_t step) -> uint32_t {
-                    trace.push_back(step);
-                    if (trace.size() == fault + 1) throw std::runtime_error("anchor fault");
-                    if (step == 21) captured = true;
-                    if (step == 22) cleared = true;
-                    if (step == 26) BOOST_CHECK(cleared);
-                    if (step == 28) { BOOST_CHECK(cleared); published = true; }
-                    return step != rejected && (step != 24 || captured);
-                });
-            };
-            if (fault == expected.size()) BOOST_CHECK_EQUAL(invoke(), rejected == 0);
-            else BOOST_CHECK_EXCEPTION(invoke(), std::runtime_error, [](const std::runtime_error& error) {
-                return std::string(error.what()) == "anchor fault";
-            });
-            const std::vector<uint32_t> prefix(expected.begin(), expected.begin() + std::min(fault + 1, expected.size()));
-            BOOST_CHECK(trace == prefix);
-            const auto completed = [&](uint32_t step) {
-                const auto end = expected.begin() + std::min(fault, expected.size());
-                return std::find(expected.begin(), end, step) != end;
-            };
-            BOOST_CHECK_EQUAL(captured, completed(21));
-            BOOST_CHECK_EQUAL(cleared, completed(22));
-            BOOST_CHECK_EQUAL(published, completed(28));
-        }
-    }
-}
 
 BOOST_AUTO_TEST_CASE(credential_record_preserves_rejection_boundary)
 {
@@ -7692,22 +5464,21 @@ BOOST_AUTO_TEST_CASE(elements_production_identity_mutation_matrix)
         {"Elements M1 proposal identity", [](auto& p) { p.drivechain_proposal_hash.reset(); }},
         {"Elements M1 proposal identity", [](auto& p) { p.drivechain_protocol_manifest_hash.SetNull(); }},
         {"Elements M1 proposal identity", [](auto& p) { p.drivechain_proposal_description.clear(); }},
-        {"historical parent proposal milestones", [](auto& p) { p.drivechain_parent_state_active_proposal_hash.reset(); }},
+        {"historical parent proposal milestones", [](auto& p) { p.drivechain_parent_state_active_proposal_hash = uint256::ONE; }},
         {"historical parent proposal milestones", [](auto& p) { ++p.drivechain_parent_state_proposal_height; }},
         {"historical parent proposal milestones", [](auto& p) { ++p.drivechain_parent_state_activation_height; }},
         {"parent replay checkpoint assertions", [](auto& p) { ++p.drivechain_parent_state_height; }},
         {"parent replay checkpoint assertions", [](auto& p) { ++p.drivechain_parent_state_ctip_vout; }},
         {"parent replay checkpoint assertions", [](auto& p) { ++p.drivechain_parent_state_ctip_value; }},
-        {"replay/annex identity", [](auto& p) { ++p.drivechain_unused_slot_proposal_max_age; }},
-        {"replay/annex identity", [](auto& p) { ++p.drivechain_unused_slot_activation_threshold; }},
-        {"replay/annex identity", [](auto& p) { ++p.drivechain_used_slot_proposal_max_age; }},
-        {"replay/annex identity", [](auto& p) { ++p.drivechain_used_slot_activation_threshold; }},
-        {"replay/annex identity", [](auto& p) { ++p.drivechain_withdrawal_bundle_max_age; }},
-        {"replay/annex identity", [](auto& p) { ++p.drivechain_withdrawal_bundle_inclusion_threshold; }},
-        {"replay/annex identity", [](auto& p) { ++p.drivechain_parent_state_replay_version; }},
-        {"replay/annex identity", [](auto& p) { ++p.drivechain_annex_feature_version; }},
-        {"replay/annex identity", [](auto& p) { p.enable_usdd_sp1_annex = false; }},
-        {"replay/annex identity", [](auto& p) { p.drivechain_m6_withdrawal_validation = false; }},
+        {"parent replay identity", [](auto& p) { ++p.drivechain_unused_slot_proposal_max_age; }},
+        {"parent replay identity", [](auto& p) { ++p.drivechain_unused_slot_activation_threshold; }},
+        {"parent replay identity", [](auto& p) { ++p.drivechain_used_slot_proposal_max_age; }},
+        {"parent replay identity", [](auto& p) { ++p.drivechain_used_slot_activation_threshold; }},
+        {"parent replay identity", [](auto& p) { ++p.drivechain_withdrawal_bundle_max_age; }},
+        {"parent replay identity", [](auto& p) { ++p.drivechain_withdrawal_bundle_inclusion_threshold; }},
+        {"parent replay identity", [](auto& p) { ++p.drivechain_parent_state_replay_version; }},
+        {"parent replay identity", [](auto& p) { ++p.drivechain_annex_feature_version; }},
+        {"parent replay identity", [](auto& p) { p.drivechain_m6_withdrawal_validation = false; }},
         {"Taproot/Simplicity activation", [](auto& p) { ++p.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit; }},
         {"Taproot/Simplicity activation", [](auto& p) { ++p.vDeployments[Consensus::DEPLOYMENT_SIMPLICITY].nStartTime; }},
     };
@@ -8168,61 +5939,6 @@ BOOST_FIXTURE_TEST_CASE(candidate_self_check_preserves_state_and_precedence, Reg
     }
 }
 
-BOOST_AUTO_TEST_CASE(haskell_validation_selection_order)
-{
-    namespace hs = drivechain::haskell;
-    const std::array stages{hs::ReplayStoreFlow::BRANCH_CHOICE,
-        hs::ReplayStoreFlow::STARTUP_RECONCILE, hs::ReplayStoreFlow::EXCHANGE_PARENT};
-    const auto caller=std::this_thread::get_id();
-    for (unsigned stage=0; stage<stages.size(); ++stage)
-    for (unsigned mask=0; mask<32; ++mask) for (uint32_t fault=0; fault<=6; ++fault) {
-        const auto yes=[&](unsigned bit) { return (mask & (1U<<bit))!=0; };
-        std::vector<uint32_t> expected;
-        const auto fact=[&](uint32_t step,unsigned bit) { expected.push_back(step); return yes(bit); };
-        bool valid{false};
-        if (stage==0) valid=fact(1,0) ? fact(2,1) : fact(3,2);
-        else if (stage==1) {
-            if (!fact(1,0)) expected.push_back(2);
-            else {
-                expected.push_back(3);
-                if (fact(4,1)) {
-                    valid=!fact(5,2);
-                    if (!valid) expected.push_back(6);
-                }
-            }
-        } else if (fact(1,0) && (fact(2,1) || fact(3,2)) && fact(4,3) && fact(5,4)) expected.push_back(6);
-        const auto stop=std::find(expected.begin(),expected.end(),fault);
-        const bool throws=stop!=expected.end();
-        if (throws) expected.erase(stop+1,expected.end());
-        std::vector<uint32_t> trace;
-        bool threw{false};
-        unsigned selected{0},published{0};
-        try {
-            const auto result=hs::ParentReplayStore(stages[stage],[&](uint32_t step) -> uint32_t {
-                BOOST_CHECK(std::this_thread::get_id()==caller);
-                trace.push_back(step);
-                if (step==fault) throw std::runtime_error("selection callback failure");
-                if (stage==0) return yes(step-1);
-                if (stage==1) {
-                    if (step==2 || step==6) return 0;
-                    if (step==3) return 1;
-                    return yes(step==1 ? 0 : step-3);
-                }
-                if (step==2 || step==3) selected=yes(step-1) ? step-1 : 0;
-                if (step==6) { published=selected; return 1; }
-                return yes(step-1);
-            });
-            BOOST_CHECK_EQUAL(result,valid ? 1U : 0U);
-        } catch (const std::runtime_error& error) {
-            threw=true;
-            BOOST_CHECK_EQUAL(error.what(),"selection callback failure");
-        }
-        BOOST_CHECK_EQUAL(threw,throws);
-        BOOST_CHECK(trace==expected);
-        if (stage==2 && !throws)
-            BOOST_CHECK_EQUAL(published,yes(0) && (yes(1) || yes(2)) && yes(3) && yes(4) ? (yes(1) ? 1U : 2U) : 0U);
-    }
-}
 
 BOOST_AUTO_TEST_CASE(haskell_final_bmm_admission_order)
 {
@@ -9222,17 +6938,16 @@ BOOST_AUTO_TEST_CASE(elements_chain_has_frozen_drivechain_identity)
     const auto base_params = CreateBaseChainParams(CBaseChainParams::ELEMENTS);
 
     BOOST_CHECK_EQUAL(params->NetworkIDString(), "elements");
-    BOOST_CHECK_EQUAL(base_params->DataDir(), "elements-betanet-slot24-v1");
-    BOOST_CHECK_EQUAL(base_params->RPCPort(), 7065);
+    BOOST_CHECK_EQUAL(base_params->DataDir(), "elements-native-v1");
+    BOOST_CHECK_EQUAL(base_params->RPCPort(), 7071);
     BOOST_CHECK_EQUAL(base_params->MainchainRPCPort(), 28532);
-    BOOST_CHECK_EQUAL(base_params->OnionServiceTargetPort(), 37066);
-    BOOST_CHECK_EQUAL(params->GetDefaultPort(), 7066);
+    BOOST_CHECK_EQUAL(base_params->OnionServiceTargetPort(), 37072);
+    BOOST_CHECK_EQUAL(params->GetDefaultPort(), 7072);
 
     BOOST_CHECK(consensus.elements_mode);
     BOOST_CHECK(consensus.has_parent_chain);
     BOOST_REQUIRE(consensus.drivechain_slot.has_value());
     BOOST_CHECK_EQUAL(*consensus.drivechain_slot, 24);
-    BOOST_CHECK(consensus.enable_usdd_sp1_annex);
     BOOST_CHECK_EQUAL(
         params->ParentGenesisBlockHash(),
         uint256S("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f"));
@@ -9246,27 +6961,25 @@ BOOST_AUTO_TEST_CASE(elements_chain_has_frozen_drivechain_identity)
     BOOST_CHECK(consensus.signblockscript == CScript() << OP_TRUE);
     BOOST_CHECK_EQUAL(
         params->HashGenesisBlock(),
-        uint256S("a7754ce0debc40baddbd8c47e79d19209685f22c63edaaf8b69cf54116374d7f"));
+        uint256S("fe05f7c76cfb50ef4f5594c761df25581e95a9946a64bc9d8f567235ffa485c9"));
     BOOST_CHECK_EQUAL(
         params->GenesisBlock().hashMerkleRoot,
-        uint256S("4dfba0f3ac9d10a3dd44eb16f2925693b47787c4060bdf5b5bab2dd97f99505f"));
+        uint256S("d5a55d8261a4baaceca67e2c6b21bdeb4f3d56d579d05c188516be02b96b90d6"));
     BOOST_CHECK_EQUAL(
         consensus.pegged_asset.GetHex(),
-        "5836dcc06130dcf6a65b6ac493813fd65559955283e44cc3f07966294eccb2c8");
+        "2e69819685c22252a706f69ce67ab9ab36a633b91e61f6ee69216d6e1c7e90d3");
     BOOST_CHECK_EQUAL(params->GenesisBlock().nTime, 1784334600U);
     BOOST_CHECK(params->HashGenesisBlock() != params->ParentGenesisBlockHash());
     BOOST_CHECK(consensus.subsidy_asset == consensus.pegged_asset);
 
     BOOST_CHECK_EQUAL(
         consensus.drivechain_protocol_manifest_hash,
-        uint256S("5c3d0dab899b95e05a47691bed1a0bdca87938faca69ab04985a4c43a970a673"));
-    BOOST_CHECK_EQUAL(
-        HexStr(consensus.drivechain_proposal_description),
-        ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_PROPOSAL_HEX);
+        uint256S("94831880cee118fe5266ebf3945528b370b1a0f668fb76cf2c3ca756b8d1068c"));
+    BOOST_CHECK(!ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_TEST_PROFILE);
     BOOST_REQUIRE(consensus.drivechain_proposal_hash.has_value());
     BOOST_CHECK_EQUAL(
         *consensus.drivechain_proposal_hash,
-        uint256S("866e33f1e4c854fadea9f9792064708ced3633bc963b000a03d4d4ac2e1a2400"));
+        uint256S("a9980eaa8bb6893d4baea100f484000b4f72e4640fc0d9f3ebf8a2f29ae63460"));
     BOOST_REQUIRE(consensus.drivechain_parent_state_active_proposal_hash.has_value());
     BOOST_CHECK_EQUAL(
         *consensus.drivechain_parent_state_active_proposal_hash,
@@ -9307,18 +7020,9 @@ BOOST_AUTO_TEST_CASE(elements_chain_has_frozen_drivechain_identity)
     BOOST_CHECK_EQUAL(params->Bech32HRP(), "elements");
     BOOST_CHECK_EQUAL(params->Blech32HRP(), "elementsl");
     BOOST_CHECK_EQUAL(params->ParentBech32HRP(), "bc");
-    BOOST_CHECK_EQUAL(HexStr(params->MessageStart()), "3b5ff18b");
-    BOOST_CHECK_EQUAL(MAX_BLOCK_WEIGHT, 6'000'000U);
-    BOOST_CHECK_EQUAL(MAX_BLOCK_SERIALIZED_SIZE, 6'000'000U);
-    BOOST_CHECK_EQUAL(usdd::SP1_ANNEX_MAX_SIZE, 1'310'720U);
-    BOOST_CHECK_EQUAL(usdd::SP1_PROOF_TX_MAX_WEIGHT, 1'500'000U);
-    BOOST_CHECK(ElementsDrivechainIdentity::USDD_SP1_VERIFIER_ACTIVATION_CONFIGURED);
-    BOOST_CHECK_EQUAL(
-        ElementsDrivechainIdentity::USDD_SP1_DEPLOYMENT_BINDING_VERSION, 2U);
-    BOOST_CHECK(std::all_of(
-        ElementsDrivechainIdentity::USDD_SP1_INBOUND_MINT_DOMAIN_ID.begin(),
-        ElementsDrivechainIdentity::USDD_SP1_INBOUND_MINT_DOMAIN_ID.end(),
-        [](const uint8_t byte) { return byte == 0; }));
+    BOOST_CHECK_EQUAL(HexStr(params->MessageStart()), "97b20d51");
+    BOOST_CHECK_EQUAL(MAX_BLOCK_WEIGHT, 4'000'000U);
+    BOOST_CHECK_EQUAL(MAX_BLOCK_SERIALIZED_SIZE, 4'000'000U);
     BOOST_CHECK_EQUAL(HexStr(params->Base58Prefix(CChainParams::SECRET_KEY)), "37");
     BOOST_CHECK_EQUAL(HexStr(params->Base58Prefix(CChainParams::EXT_PUBLIC_KEY)), "18717df5");
     BOOST_CHECK_EQUAL(HexStr(params->Base58Prefix(CChainParams::EXT_SECRET_KEY)), "b263bd77");
@@ -9351,7 +7055,7 @@ BOOST_AUTO_TEST_CASE(betanet_pegin_requires_six_confirmations_without_changing_i
     BOOST_CHECK(!HasAlphaPeginOneConfirmationUpgrade(*beta));
     BOOST_CHECK_EQUAL(beta->GetConsensus().pegin_min_depth, 100U);
     BOOST_CHECK_EQUAL(beta->GetConsensus().hashGenesisBlock.GetHex(),
-        "a7754ce0debc40baddbd8c47e79d19209685f22c63edaaf8b69cf54116374d7f");
+        "fe05f7c76cfb50ef4f5594c761df25581e95a9946a64bc9d8f567235ffa485c9");
     for (const int height : {-1, 0, 63, 64, 65, std::numeric_limits<int>::max()}) {
         const auto depth = GetDrivechainPeginConfirmationDepth(*beta, height);
         BOOST_CHECK_EQUAL(depth, 6U);
@@ -9494,17 +7198,14 @@ BOOST_AUTO_TEST_CASE(elements_height_one_uses_simplicity_consensus_flags)
         &first_block_index, params->GetConsensus());
     BOOST_CHECK(flags & SCRIPT_VERIFY_TAPROOT);
     BOOST_CHECK(flags & SCRIPT_VERIFY_SIMPLICITY);
-    BOOST_CHECK(flags & SCRIPT_VERIFY_USDD_SP1_ANNEX);
     BOOST_CHECK(!(flags & SCRIPT_VERIFY_CHECKTEMPLATEVERIFY));
-    BOOST_CHECK(STANDARD_SCRIPT_VERIFY_FLAGS & SCRIPT_VERIFY_USDD_SP1_ANNEX);
     const unsigned int elements_flags = SCRIPT_SIGHASH_RANGEPROOF | SCRIPT_VERIFY_SIMPLICITY;
-    const unsigned int fork_flags = elements_flags | SCRIPT_VERIFY_USDD_SP1_ANNEX;
-    for (bool elements : {false,true}) for (bool annex : {false,true}) {
+    const unsigned int fork_flags = elements_flags;
+    for (bool elements : {false,true}) {
         auto consensus = params->GetConsensus();
         consensus.elements_mode = elements;
-        consensus.enable_usdd_sp1_annex = annex;
         const unsigned int expected = (flags & ~fork_flags) |
-            (elements ? flags & elements_flags : 0U) | (annex ? SCRIPT_VERIFY_USDD_SP1_ANNEX : 0U);
+            (elements ? flags & elements_flags : 0U);
         BOOST_CHECK_EQUAL(GetBlockScriptFlagsForTesting(&first_block_index,consensus),expected);
     }
 }
@@ -9722,7 +7423,6 @@ BOOST_AUTO_TEST_CASE(drivechain_slot_is_not_enabled_on_other_builtin_networks)
     for (const auto& network : ordinary_networks) {
         const auto params = CreateChainParams(args, network);
         BOOST_CHECK_MESSAGE(!params->GetConsensus().drivechain_slot.has_value(), network);
-        BOOST_CHECK_MESSAGE(!params->GetConsensus().enable_usdd_sp1_annex, network);
 
         CBlockIndex genesis_index{params->GenesisBlock()};
         genesis_index.nHeight = 0;
@@ -9731,7 +7431,6 @@ BOOST_AUTO_TEST_CASE(drivechain_slot_is_not_enabled_on_other_builtin_networks)
         first_block_index.nHeight = 1;
         const unsigned int flags = GetBlockScriptFlagsForTesting(
             &first_block_index, params->GetConsensus());
-        BOOST_CHECK_MESSAGE(!(flags & SCRIPT_VERIFY_USDD_SP1_ANNEX), network);
         BOOST_CHECK_MESSAGE(!(flags & SCRIPT_VERIFY_CHECKTEMPLATEVERIFY), network);
     }
 }
@@ -11204,195 +8903,6 @@ BOOST_AUTO_TEST_CASE(drivechain_anchor_replacement_requires_proven_orphan)
     }
 }
 
-BOOST_AUTO_TEST_CASE(drivechain_replacement_anchor_survives_block_index_reload)
-{
-    DrivechainAnchor old_anchor;
-    old_anchor.parent_block_hash = uint256S("01");
-    old_anchor.bmm_block_hash = uint256S("02");
-    old_anchor.parent_chainwork = uint256S("10");
-    old_anchor.bmm_chainwork = uint256S("20");
-    old_anchor.parent_height = 100;
-    old_anchor.bmm_height = 101;
-    old_anchor.parent_median_time_past = 1'700'000'000;
-    BOOST_REQUIRE(old_anchor.IsSane());
-
-    DrivechainAnchor replacement = old_anchor;
-    replacement.bmm_block_hash = uint256S("03");
-    replacement.bmm_chainwork = uint256S("21");
-    BOOST_REQUIRE(replacement.IsSane());
-
-    CBlockHeader header = Params().GenesisBlock().GetBlockHeader();
-    ++header.nNonce;
-    const uint256 block_hash = header.GetHash();
-    LOCK(cs_main);
-    CBlockIndex index(header);
-    index.phashBlock = &block_hash;
-    index.nHeight = 1;
-    index.nStatus = BLOCK_VALID_TRANSACTIONS;
-    index.nTx = 1;
-    index.m_drivechain_anchor = old_anchor;
-
-    kernel::BlockTreeDB block_tree_db({.path = {}, .cache_bytes = 1 << 20,
-                                      .memory_only = true, .wipe_data = true});
-    const std::vector<std::pair<int, const CBlockFileInfo*>> no_files;
-    const std::vector<const CBlockIndex*> blocks{&index};
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files, 0, blocks));
-
-    // This is the same synchronous batch overwrite used by reconciliation
-    // before it makes the stored block reconnectable.
-    index.m_drivechain_anchor = replacement;
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files, 0, blocks));
-
-    std::map<uint256, std::unique_ptr<CBlockIndex>> loaded;
-    const auto insert = [&](const uint256& hash) -> CBlockIndex* {
-        if (hash.IsNull()) return nullptr;
-        auto [it, inserted] = loaded.try_emplace(hash);
-        if (inserted) {
-            it->second = std::make_unique<CBlockIndex>();
-            it->second->phashBlock = &it->first;
-        }
-        return it->second.get();
-    };
-    BOOST_REQUIRE(block_tree_db.LoadBlockIndexGuts(
-        Params().GetConsensus(), insert, *m_node.shutdown_signal, /*trimBelowHeight=*/0));
-    BOOST_REQUIRE_EQUAL(loaded.count(block_hash), 1U);
-    BOOST_REQUIRE(loaded.at(block_hash)->m_drivechain_anchor.has_value());
-    BOOST_CHECK(*loaded.at(block_hash)->m_drivechain_anchor == replacement);
-
-    index.ecxBondV2Capital.emplace();
-    index.m_usdd_withdrawal_accumulator=usdd::WithdrawalAccumulatorState::Empty();
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files,0,blocks));
-    for (uint8_t prefix : {'E','D','U'}) BOOST_CHECK(block_tree_db.Exists(std::make_pair(prefix,block_hash)));
-    index.ecxBondV2Capital.reset();
-    index.m_drivechain_anchor.reset();
-    index.m_usdd_withdrawal_accumulator.reset();
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files,0,blocks));
-    for (uint8_t prefix : {'E','D','U'}) BOOST_CHECK(!block_tree_db.Exists(std::make_pair(prefix,block_hash)));
-    index.m_drivechain_anchor=replacement;
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files,0,blocks));
-
-    auto consensus=Params().GetConsensus();
-    const auto reload = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
-        loaded.clear();
-        return block_tree_db.LoadBlockIndexGuts(consensus,insert,*m_node.shutdown_signal,0);
-    };
-    // Frozen database namespace keys; deliberately bypass the writer's sanity
-    // assertions to exercise loader rejection and partial publication.
-    const auto anchor_key=std::make_pair(uint8_t{'D'},block_hash);
-    const auto accumulator_key=std::make_pair(uint8_t{'U'},block_hash);
-    index.nStatus=BLOCK_VALID_SCRIPTS;
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files,0,blocks));
-    BOOST_CHECK(!reload());
-    BOOST_CHECK(loaded.at(block_hash)->m_drivechain_anchor==replacement);
-    BOOST_CHECK(!loaded.at(block_hash)->m_usdd_withdrawal_accumulator.has_value());
-
-    index.nStatus=BLOCK_VALID_TRANSACTIONS;
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files,0,blocks));
-    auto malformed_anchor=replacement;
-    malformed_anchor.version=0;
-    BOOST_REQUIRE(block_tree_db.Write(anchor_key,malformed_anchor));
-    BOOST_CHECK(!reload());
-    BOOST_CHECK(!loaded.at(block_hash)->m_drivechain_anchor.has_value());
-
-    BOOST_REQUIRE(block_tree_db.Write(anchor_key,replacement));
-    usdd::WithdrawalAccumulatorState malformed_accumulator;
-    BOOST_REQUIRE(!malformed_accumulator.IsSane());
-    BOOST_REQUIRE(block_tree_db.Write(accumulator_key,malformed_accumulator));
-    BOOST_CHECK(!reload());
-    BOOST_CHECK(loaded.at(block_hash)->m_drivechain_anchor==replacement);
-    BOOST_CHECK(!loaded.at(block_hash)->m_usdd_withdrawal_accumulator.has_value());
-    BOOST_REQUIRE(block_tree_db.Write(accumulator_key,uint8_t{255}));
-    BOOST_CHECK(!reload());
-    BOOST_REQUIRE(block_tree_db.Erase(accumulator_key));
-    BOOST_CHECK(reload());
-
-    consensus.hashGenesisBlock=block_hash;
-    BOOST_REQUIRE(reload());
-    BOOST_REQUIRE(loaded.at(block_hash)->m_usdd_withdrawal_accumulator.has_value());
-    BOOST_CHECK(*loaded.at(block_hash)->m_usdd_withdrawal_accumulator==usdd::WithdrawalAccumulatorState::Empty());
-
-    auto child_header=header;
-    child_header.hashPrevBlock=block_hash;
-    ++child_header.nNonce;
-    const uint256 child_hash=child_header.GetHash();
-    CBlockIndex child(child_header);
-    child.phashBlock=&child_hash;
-    child.pprev=&index;
-    child.nHeight=2;
-    child.nStatus=BLOCK_VALID_SCRIPTS;
-    child.nTx=1;
-    const std::vector<const CBlockIndex*> pair{&index,&child};
-    const auto empty=usdd::WithdrawalAccumulatorState::Empty();
-    index.m_usdd_withdrawal_accumulator=empty;
-    child.m_usdd_withdrawal_accumulator=empty;
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files,0,pair));
-    BOOST_CHECK(reload());
-    auto first=empty, second=empty;
-    usdd::WithdrawalHash leaf{};
-    leaf[0]=1;
-    BOOST_REQUIRE(first.Append(leaf));
-    leaf[0]=2;
-    BOOST_REQUIRE(second.Append(leaf));
-    child.m_usdd_withdrawal_accumulator=first;
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files,0,pair));
-    BOOST_CHECK(reload());
-    // Same count, different state is invalid even when both states are sane.
-    auto grandchild_header=child_header;
-    grandchild_header.hashPrevBlock=child_hash;
-    ++grandchild_header.nNonce;
-    const uint256 grandchild_hash=grandchild_header.GetHash();
-    CBlockIndex grandchild(grandchild_header);
-    grandchild.phashBlock=&grandchild_hash;
-    grandchild.pprev=&child;
-    grandchild.nHeight=3;
-    grandchild.nStatus=BLOCK_VALID_SCRIPTS;
-    grandchild.nTx=1;
-    const std::vector<const CBlockIndex*> triple{&index,&child,&grandchild};
-    grandchild.m_usdd_withdrawal_accumulator=first;
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files,0,triple));
-    BOOST_CHECK(reload());
-    grandchild.m_usdd_withdrawal_accumulator=second;
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files,0,triple));
-    BOOST_CHECK(!reload());
-    grandchild.m_usdd_withdrawal_accumulator=empty;
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files,0,triple));
-    BOOST_CHECK(!reload());
-    // A non-validated predecessor may lack state, but its child cannot use it.
-    child.m_usdd_withdrawal_accumulator.reset();
-    child.nStatus=BLOCK_VALID_TRANSACTIONS;
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files,0,triple));
-    BOOST_CHECK(!reload());
-
-    child.nStatus=BLOCK_VALID_SCRIPTS;
-    child.m_usdd_withdrawal_accumulator=first;
-    grandchild.m_usdd_withdrawal_accumulator=first;
-    ecx::BondV2CapitalSnapshot capital;
-    capital.exchange_state_root=index.hashExchangeStateRoot;
-    capital.issued_share_atoms=123;
-    index.ecxBondV2Capital=capital;
-    BOOST_REQUIRE(block_tree_db.WriteBatchSync(no_files,0,triple));
-    BOOST_REQUIRE(reload());
-    BOOST_REQUIRE(loaded.at(block_hash)->ecxBondV2Capital.has_value());
-    BOOST_CHECK_EQUAL(loaded.at(block_hash)->ecxBondV2Capital->issued_share_atoms,123U);
-    const auto capital_key=std::make_pair(uint8_t{'E'},block_hash);
-    auto mismatched=capital;
-    mismatched.exchange_state_root=uint256S("ff");
-    BOOST_REQUIRE(block_tree_db.Write(capital_key,mismatched));
-    BOOST_CHECK(!reload());
-    BOOST_CHECK(!loaded.at(block_hash)->ecxBondV2Capital.has_value());
-    BOOST_REQUIRE(block_tree_db.Write(capital_key,uint8_t{255}));
-    BOOST_CHECK(!reload());
-    BOOST_REQUIRE(block_tree_db.Write(capital_key,capital));
-    const uint256 orphan_hash=uint256S("abcdef");
-    const auto orphan_key=std::make_pair(uint8_t{'E'},orphan_hash);
-    BOOST_REQUIRE(block_tree_db.Write(orphan_key,capital));
-    loaded.clear();
-    BOOST_CHECK(!block_tree_db.LoadBlockIndexGuts(consensus,[&](const uint256& hash) {
-        return hash==orphan_hash ? nullptr : insert(hash);
-    },*m_node.shutdown_signal,0));
-    BOOST_REQUIRE(block_tree_db.Erase(orphan_key));
-    BOOST_CHECK(reload());
-}
 
 BOOST_AUTO_TEST_CASE(drivechain_best_header_requires_admitted_full_block)
 {
@@ -12543,75 +10053,6 @@ BOOST_AUTO_TEST_CASE(mempool_parent_context_clears_on_authentication_error)
     BOOST_CHECK_EQUAL(context.parent_median_time_past, 0U);
 }
 
-BOOST_AUTO_TEST_CASE(native_context_from_preserved_replay)
-{
-    const char* path = std::getenv("ECX_REPLAY_INSPECTION_COPY");
-    if (!path) {
-        BOOST_TEST_MESSAGE("No isolated replay copy supplied; inspection not performed");
-        return;
-    }
-    const fs::path copy{path};
-    const char* credential_file = std::getenv("ECX_REPLAY_INSPECTION_CREDENTIAL_FILE");
-    BOOST_REQUIRE_MESSAGE(credential_file && *credential_file,
-        "ECX_REPLAY_INSPECTION_CREDENTIAL_FILE is required for replay inspection");
-    BOOST_REQUIRE(copy.filename() == "replay-copy");
-    const auto destination = gArgs.GetDataDirNet() / "parent-replay";
-    fs::create_directories(destination.parent_path());
-    fs::copy(copy, destination, fs::copy_options::recursive);
-    gArgs.ForceSetArg("-mainchainrpchost", "127.0.0.1");
-    gArgs.ForceSetArg("-mainchainrpcport", "8532");
-    gArgs.ForceSetArg("-mainchainrpccredentialfile", credential_file);
-    gArgs.ForceSetArg("-mainchainrpctimeout", "15");
-    const uint256 parent = uint256S("00000000000000003ca6e8ca1c504080e0e70e8982790553e23b6b6fc65ae222");
-    const auto& tag = ElementsDrivechainIdentity::PARENT_COMMITMENT_TAG;
-    std::vector<unsigned char> payload(tag.begin(), tag.end());
-    payload.insert(payload.end(), parent.begin(), parent.end());
-    CMutableTransaction coinbase;
-    coinbase.vin.resize(1);
-    coinbase.vin[0].prevout.SetNull();
-    coinbase.vout.resize(1);
-    coinbase.vout[0].scriptPubKey = CScript() << OP_RETURN << payload;
-    CBlock block;
-    block.vtx.push_back(MakeTransactionRef(coinbase));
-    DrivechainParentBlockContext context;
-    std::string error;
-    BOOST_REQUIRE_MESSAGE(GetDrivechainParentBlockContext(block, 24, context, &error), error);
-    BOOST_CHECK_EQUAL(context.parent_hash.GetHex(), parent.GetHex());
-    BOOST_CHECK_EQUAL(context.parent_height, 996913U);
-    BOOST_CHECK_EQUAL(context.parent_median_time_past, 1788790347U);
-    BOOST_TEST_MESSAGE("NATIVE_ALPHA_CONTEXT height=" << context.parent_height
-        << " mtp=" << context.parent_median_time_past);
-    BOOST_CHECK(!GetDrivechainParentBlockContext(block, 23, context, &error));
-    std::ifstream input(copy.parent_path() / "alpha-block-82.hex");
-    std::string hex;
-    BOOST_REQUIRE(bool(input >> hex));
-    CBlock actual;
-    BOOST_REQUIRE(DecodeHexBlk(actual, hex));
-    BOOST_REQUIRE_EQUAL(actual.GetHash().GetHex(),
-        "b1117286fc95abdffc88726a76dad7b45c68207f482df3d4529771a1345f4a92");
-    const auto previous = usdd::WithdrawalAccumulatorState::Empty();
-    usdd::WithdrawalAccumulatorState next;
-    uint256 critical;
-    BOOST_REQUIRE_MESSAGE(usdd::DeriveWithdrawalBip301CriticalHash(actual,
-        Params().HashGenesisBlock(), 24, previous, next, critical, &error), error);
-    BOOST_REQUIRE(next == previous);
-    DrivechainBmmBlockContext finalized;
-    BOOST_REQUIRE_MESSAGE(GetDrivechainBmmBlockContext(actual, critical, 24,
-        finalized, &error), error);
-    BOOST_TEST_MESSAGE("NATIVE_FINALIZED_CONTEXT P=" << finalized.parent_hash.GetHex()
-        << " Q=" << finalized.bmm_block_hash.GetHex()
-        << " critical=" << critical.GetHex());
-    uint256 substituted = critical;
-    substituted.begin()[0] ^= 1;
-    const auto rejected = GetDrivechainBmmBlockStatus(actual, substituted, 24,
-        finalized, &error);
-    BOOST_CHECK(rejected == DrivechainBmmStatus::UNAVAILABLE);
-    BOOST_CHECK(error.find("does not match the cached enforcer-recognized M7") != std::string::npos);
-    BOOST_CHECK(finalized.parent_hash.IsNull());
-    BOOST_CHECK(finalized.bmm_block_hash.IsNull());
-    BOOST_REQUIRE_MESSAGE(GetDrivechainBmmBlockContext(actual, critical, 24,
-        finalized, &error), error);
-}
 BOOST_AUTO_TEST_SUITE_END()
 
 struct ElementsTestingSetup : public TestingSetup {

@@ -4810,7 +4810,7 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_replay_accepts_exact_native_elwd_m6)
     BOOST_CHECK(successful[0].m6id == blinded.m6id);
 }
 
-BOOST_AUTO_TEST_CASE(drivechain_parent_replay_sequences_usdd_root_and_native_elwd_m6)
+BOOST_AUTO_TEST_CASE(drivechain_parent_replay_sequences_data_output_and_native_elwd_m6)
 {
     constexpr int slot{24};
     constexpr uint16_t max_age{10};
@@ -4826,8 +4826,8 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_replay_sequences_usdd_root_and_native_elw
     const CScript treasury_script = CScript()
         << OP_NOP5 << std::vector<unsigned char>{slot} << OP_TRUE;
 
-    // Canonical two-output USDD accumulator M6 fixed across Elements, Rust,
-    // Solidity, and the enforcer. Its CTIP successor is always vout zero.
+    // Fixed two-output M6 vector with an opaque data output. Parent replay
+    // does not interpret its payload; the CTIP successor is vout zero.
     const std::vector<unsigned char> root_raw = ParseHex(
         "02000000011f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090807060504"
         "030201000700000000ffffffff02272300000000000004b401185101000000000000"
@@ -4931,7 +4931,7 @@ BOOST_AUTO_TEST_CASE(drivechain_parent_replay_sequences_usdd_root_and_native_elw
     BOOST_CHECK(state.pending_withdrawals.empty());
 }
 
-BOOST_AUTO_TEST_CASE(drivechain_m6id_matches_usdd_and_enforcer_vector)
+BOOST_AUTO_TEST_CASE(drivechain_m6id_matches_fixed_data_output_vector)
 {
     const std::vector<unsigned char> raw = ParseHex(
         "02000000011f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090807060504"

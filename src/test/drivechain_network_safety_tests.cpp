@@ -32,19 +32,18 @@ BOOST_AUTO_TEST_CASE(bidding_requires_independent_explicit_opt_in)
     BOOST_CHECK(!IsDrivechainAutomaticBiddingEnabled(args));
 }
 
-BOOST_AUTO_TEST_CASE(test_profile_requires_acknowledgement)
+BOOST_AUTO_TEST_CASE(fresh_profile_does_not_reuse_the_existing_proposal_exception)
 {
-    BOOST_REQUIRE(ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_TEST_PROFILE);
+    BOOST_REQUIRE(!ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_TEST_PROFILE);
     ArgsManager args;
     std::string error;
-    BOOST_CHECK(!CheckDrivechainTestProfileOptIn(args, &error));
-    BOOST_CHECK(error.find("does not commit") != std::string::npos);
-    args.ForceSetArg("-drivechainl1blocksync", "1");
-    BOOST_CHECK(!CheckDrivechainTestProfileOptIn(args, nullptr));
+    BOOST_CHECK(CheckDrivechainTestProfileOptIn(args, &error));
+    BOOST_CHECK(error.empty());
     args.ForceSetArg("-acceptbetanettestprofile", "0");
-    BOOST_CHECK(!CheckDrivechainTestProfileOptIn(args, nullptr));
+    BOOST_CHECK(CheckDrivechainTestProfileOptIn(args, nullptr));
     args.ForceSetArg("-acceptbetanettestprofile", "1");
     BOOST_CHECK(CheckDrivechainTestProfileOptIn(args, nullptr));
+    BOOST_CHECK(!IsDrivechainAutomaticBiddingEnabled(args));
 }
 
 BOOST_AUTO_TEST_CASE(parent_network_rejects_shared_ancestry_and_malformed_replies)

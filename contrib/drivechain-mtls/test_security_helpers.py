@@ -3,7 +3,6 @@
 
 import hashlib
 import concurrent.futures
-import itertools
 import os
 from pathlib import Path
 import shutil
@@ -353,18 +352,12 @@ class RepositoryTests(unittest.TestCase):
                 child.datadir_path = None
 
     @unittest.skipUnless(shutil.which("c++"), "C++ preprocessor required")
-    def test_identity_headers_cannot_be_mixed(self):
-        headers = ("elements_drivechain_identity.h", "elements_drivechain_identity.alphanet.h",
-                   "elements_drivechain_identity.alphanet.v2.h")
-        for first, second in itertools.product(headers, repeat=2):
-            with self.subTest(first=first, second=second):
-                result = run("c++", "-std=c++17", "-E", "-x", "c++", "-I", str(ROOT / "src"), "-",
-                             input=f'#include <{first}>\n#include <{second}>\n')
-                if first == second:
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                else:
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn("Multiple frozen Elements network identities", result.stderr)
+    def test_only_current_identity_header_is_available(self):
+        result = run("c++", "-std=c++17", "-E", "-x", "c++", "-I", str(ROOT / "src"), "-",
+                     input='#include <elements_drivechain_identity.h>\n' * 2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for retired in ("elements_drivechain_identity.alphanet.h", "elements_drivechain_identity.alphanet.v2.h"):
+            self.assertFalse((ROOT / "src" / retired).exists())
 
 
 if __name__ == "__main__":

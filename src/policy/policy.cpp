@@ -7,10 +7,8 @@
 
 #include <policy/policy.h>
 #include <haskell/bridge.h>
-#include <script/ecx_activation_annex.h>
 
 #include <coins.h>
-#include <ecx_exchange_state.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <consensus/validation.h>
@@ -19,134 +17,18 @@
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
 #include <script/pegins.h>
-#include <script/usdd_sp1_annex.h>
-#include <usdd_sp1_resources.h>
 #include <script/script.h>
 #include <script/solver.h>
 #include <serialize.h>
 #include <span.h>
 #include <chainparams.h> // Peg-out enforcement
-#include <chainparamsbase.h>
-
-#include <limits>
 
 // ELEMENTS:
 CAsset policyAsset;
 
 #include <algorithm>
 #include <cstddef>
-#include <optional>
 #include <vector>
-
-namespace {
-
-static_assert(OP_RETURN == 106 && OP_PUSHDATA2 == 77);
-
-bool HasSp1Annex(const auto& stack)
-{
-    return drivechain::haskell::ParentReplayAll<3>({
-        [&] { return stack.size() >= 2; },
-        [&] { return !stack.back().empty(); },
-        [&] { return stack.back()[0] == usdd::SP1_ANNEX_TAG; },
-    });
-}
-
-struct ActivationPolicyReads {
-    const CTransaction& tx;
-    size_t input;
-    const ecx::ExchangeConsensus* consensus;
-    std::array<unsigned char, 32> program{};
-    std::array<unsigned char, 364> values{};
-    uint32_t operator()(uint32_t step)
-    {
-        const auto* frozen = consensus ? &consensus->bond_v2 : nullptr;
-        switch (step) {
-        case 1: return frozen != nullptr;
-        case 2: return input == 0;
-        case 3: return !tx.witness.vtxinwit.empty();
-        case 4: return frozen->activation_enabled;
-        case 5: return frozen->identities_frozen;
-        case 6: return ecx::ParseActivationAnnex(tx.witness.vtxinwit.at(input).scriptWitness.stack, program, values);
-        case 7: return !frozen->incremental_activation_cmr.IsNull();
-        case 8: {
-            const auto& cmr = tx.witness.vtxinwit.at(input).scriptWitness.stack[2];
-            return std::equal(cmr.begin(), cmr.end(), frozen->incremental_activation_cmr.begin());
-        }
-        case 9: return std::equal(program.begin(), program.end(), frozen->incremental_activation_program_id.begin());
-        case 10: return std::equal(values.begin()+4, values.begin()+36, frozen->incremental_activation_configuration_hash.begin());
-        case 11: return std::equal(values.begin()+36, values.begin()+68, frozen->configuration_hash.begin());
-        case 12: return std::equal(values.begin()+100, values.begin()+132, frozen->incremental_successor_configuration_hash.begin());
-        case 13: return std::equal(values.begin()+164, values.begin()+196, tx.GetHash().begin(),
-            [](unsigned char a, std::byte b) { return a == std::to_integer<unsigned char>(b); });
-        case 14: return std::equal(values.begin()+228, values.begin()+260, consensus->chain_id.begin());
-        default: throw std::runtime_error("Unknown activation policy read");
-        }
-    }
-};
-
-bool IsFrozenActivationAnnex(const CTransaction& tx, size_t input,
-    const ecx::ExchangeConsensus* consensus)
-{
-    ActivationPolicyReads facts{tx,input,consensus};
-    return drivechain::haskell::ParentReplayStore(
-        drivechain::haskell::ReplayStoreFlow::ACTIVATION_POLICY,std::ref(facts)) == 0;
-}
-
-bool UsddSp1AnnexPolicyEnabled()
-{
-    const CChainParams& params = Params();
-    return drivechain::haskell::AdmitStandardness(drivechain::haskell::StandardnessGate::ANNEX_NETWORK,
-        (params.NetworkIDString() == CBaseChainParams::ELEMENTS) |
-        (params.GetConsensus().drivechain_slot.has_value() << 1) |
-        (params.GetConsensus().enable_usdd_sp1_annex << 2));
-}
-
-/**
- * Classify BIP341-shaped annex items before UTXO lookup and return the exact
- * witness weight attributable to one canonical USDD proof annex. The caller
- * can subtract only this amount from total transaction weight; all other
- * witness bytes remain subject to the ordinary standardness cap.
- */
-bool GetUsddSp1AnnexPolicyWeight(const CTransaction& tx,
-                                 uint64_t& annex_weight,
-                                 std::string& reason,
-                                 const ecx::ExchangeConsensus* consensus)
-{
-    annex_weight = 0;
-    usdd::ResourceReader resources;
-    const auto source = resources.Source();
-    std::optional<ActivationPolicyReads> activation;
-    const auto result = drivechain::haskell::UsddPolicyWeight(0,
-        tx.witness.vtxinwit.size(), [&](uint32_t step, uint64_t input) -> uint64_t {
-            if (step==7) return resources.Select(tx);
-            if (step >= 17) {
-                if (step == 17) activation.emplace(ActivationPolicyReads{tx,input,consensus});
-                auto& facts = activation.value();
-                if (facts.input != input) throw std::logic_error("Activation policy input changed");
-                return facts(step-16);
-            }
-            const auto& stack = tx.witness.vtxinwit.at(input).scriptWitness.stack;
-            switch (step) {
-            case 0: return HasSp1Annex(stack);
-            case 2: return UsddSp1AnnexPolicyEnabled();
-            case 3: return usdd::IsUsddSp1ProofAnnex(stack.back());
-            case 4:
-                // Keep CompactSize accounting native, including stack-count shrinkage.
-                annex_weight = GetSizeOfCompactSize(stack.back().size()) + stack.back().size() +
-                    GetSizeOfCompactSize(stack.size()) - GetSizeOfCompactSize(stack.size() - 1);
-                return 1;
-            default: throw std::runtime_error("Unknown USDD policy read");
-            }
-        }, /*expanded_activation=*/true,&source);
-    static constexpr const char* errors[]{
-        "usdd-sp1-annex", "usdd-sp1-annex-shape", "usdd-sp1-annex-controller-cmr",
-        "usdd-sp1-annex-guest-program-id", "usdd-sp1-annex-public-values",
-        "usdd-sp1-deployment-unconfigured", "usdd-sp1-annex-inbound-domain", "usdd-sp1-annex-multiple"};
-    if (result != 0) reason = errors[result-1];
-    return result == 0;
-}
-
-} // namespace
 
 CAmount GetDustThreshold(const CTxOut& txout, const CFeeRate& dustRelayFeeIn)
 {
@@ -239,13 +121,7 @@ bool IsStandard(const CScript& scriptPubKey, const std::optional<unsigned>& max_
     return true;
 }
 
-bool IsStandardTx(
-    const CTransaction& tx,
-    const std::optional<unsigned>& max_datacarrier_bytes,
-    bool permit_bare_multisig,
-    const CFeeRate& dust_relay_fee,
-    std::string& reason,
-    const ecx::ExchangeConsensus* ecx_consensus)
+bool IsStandardTx(const CTransaction& tx, const std::optional<unsigned>& max_datacarrier_bytes, bool permit_bare_multisig, const CFeeRate& dust_relay_fee, std::string& reason)
 {
     if (tx.version > TX_MAX_STANDARD_VERSION || tx.version < 1) {
         reason = "version";
@@ -256,30 +132,8 @@ bool IsStandardTx(
     // almost as much to process as they cost the sender in fees, because
     // computing signature hashes is O(ninputs*txsize). Limiting transactions
     // to MAX_STANDARD_TX_WEIGHT mitigates CPU exhaustion attacks.
-    std::string bond_inbox_error;
-    const bool canonical_bond_inbox_source = drivechain::haskell::ParentReplayAll<3>({
-        [&] { return ecx_consensus != nullptr; },
-        [&] {
-            std::optional<uint64_t> unused;
-            // Non-unique scan rejects at the first marker, equivalent to any_of.
-            return !drivechain::haskell::ExchangeSpendScan(false, 0, tx.vout.size(), [&](uint64_t index) {
-                return drivechain::haskell::BondMarkerPolicy(false, tx.vout[index].scriptPubKey);
-            }, unused);
-        },
-        [&] { return ecx::IsCanonicalBondInboxSourceTransaction(tx, bond_inbox_error, *ecx_consensus); },
-    });
-    const uint64_t total_weight = GetTransactionWeight(tx);
-    uint64_t usdd_annex_weight{0};
-    if (drivechain::haskell::ParentReplayAll<2>({
-        [&] { return Params().GetConsensus().drivechain_slot.has_value(); },
-        [&] { return !GetUsddSp1AnnexPolicyWeight(tx, usdd_annex_weight, reason, ecx_consensus); },
-    })) {
-        return false;
-    }
-    // Exceptions are independently bounded and cannot be combined to bypass
-    // either application's cap. Ordinary non-annex bytes retain their limit.
-    if (!drivechain::haskell::TransactionWeight(canonical_bond_inbox_source,
-            total_weight, usdd_annex_weight, MAX_STANDARD_TX_WEIGHT, usdd::SP1_PROOF_TX_MAX_WEIGHT)) {
+    unsigned int sz = GetTransactionWeight(tx);
+    if (sz > MAX_STANDARD_TX_WEIGHT) {
         reason = "tx-size";
         return false;
     }
@@ -307,24 +161,10 @@ bool IsStandardTx(
     const CChainParams& params = Params();
     unsigned int nDataOut = 0;
     TxoutType whichType;
-    for (size_t output_index = 0; output_index < tx.vout.size(); ++output_index) {
-        const CTxOut& txout = tx.vout[output_index];
+    for (const CTxOut& txout : tx.vout) {
         if (!::IsStandard(txout.scriptPubKey, max_datacarrier_bytes, whichType)) {
-            std::string ecx_error;
-            const bool drivechain_pegout = drivechain::haskell::ParentReplayAll<2>({
-                [&] { return ecx_consensus != nullptr; },
-                [&] { return txout.scriptPubKey.IsPegoutScript(Params().ParentGenesisBlockHash()); },
-            });
-            const bool forced_action = drivechain::haskell::ParentReplayAll<2>({
-                [&] { return ecx_consensus != nullptr; },
-                [&] { return ecx::IsCanonicalForcedActionOutput(tx, output_index, ecx_error, *ecx_consensus); },
-            });
-            const bool bond_inbox_marker = drivechain::haskell::ParentReplayAll<2>({
-                [&] { return canonical_bond_inbox_source; },
-                [&] { return drivechain::haskell::BondMarkerPolicy(true, txout.scriptPubKey); },
-            });
-            if (!drivechain::haskell::AdmitStandardness(drivechain::haskell::StandardnessGate::OUTPUT_EXCEPTIONS,
-                    drivechain_pegout | (forced_action << 1) | (bond_inbox_marker << 2))) {
+            if (!params.GetConsensus().drivechain_slot.has_value() ||
+                !txout.scriptPubKey.IsPegoutScript(params.ParentGenesisBlockHash())) {
                 reason = "scriptpubkey";
                 return false;
             }
@@ -411,28 +251,11 @@ bool AreInputsStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
     return true;
 }
 
-bool IsWitnessStandard(
-    const CTransaction& tx,
-    const CCoinsViewCache& mapInputs,
-    const ecx::ExchangeConsensus* ecx_consensus)
+bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
 {
     if (tx.IsCoinBase())
         return true; // Coinbases are skipped
 
-    std::string bond_inbox_error;
-    const bool canonical_bond_inbox_source = drivechain::haskell::ParentReplayAll<2>({
-        [&] { return ecx_consensus != nullptr; },
-        [&] { return ecx::IsCanonicalBondInboxSourceTransaction(tx, bond_inbox_error, *ecx_consensus); },
-    });
-
-    const usdd::Sp1AnnexResourceUsage resource_usage =
-        usdd::GetUsddSp1AnnexResourceUsage(tx);
-    if (!drivechain::haskell::AdmitStandardness(drivechain::haskell::StandardnessGate::WITNESS_RESOURCES,
-            resource_usage.Flags(), resource_usage.namespace_annexes, usdd::SP1_ANNEXES_PER_BLOCK)) {
-        return false;
-    }
-
-    bool found_usdd_sp1_annex{false};
     for (unsigned int i = 0; i < tx.vin.size(); i++)
     {
         // We don't care if witness for this input is empty, since it must not be bloated.
@@ -472,29 +295,6 @@ bool IsWitnessStandard(
         if (!prevScript.IsWitnessProgram(witnessversion, witnessprogram))
             return false;
 
-        Span stack{tx.witness.vtxinwit[i].scriptWitness.stack};
-        const bool has_annex = HasSp1Annex(stack);
-        const bool is_native_taproot = witnessversion == 1 &&
-            witnessprogram.size() == WITNESS_V1_TAPROOT_SIZE && !p2sh;
-        using namespace drivechain::haskell;
-        switch (ParentReplayStore(ReplayStoreFlow::WITNESS_ANNEX, [&](uint32_t step) -> uint32_t {
-            switch (step) {
-            case 1: return has_annex;
-            case 2: case 5: return is_native_taproot;
-            case 3: return IsFrozenActivationAnnex(tx, i, ecx_consensus);
-            case 4: return Params().GetConsensus().drivechain_slot.has_value();
-            case 6: return UsddSp1AnnexPolicyEnabled();
-            case 7: return found_usdd_sp1_annex;
-            case 8: return usdd::IsUsddSp1ProofAnnex(stack.back());
-            default: throw std::logic_error("invalid witness annex policy read");
-            }
-        })) {
-        case 0: break;
-        case 1: return false;
-        case 3: found_usdd_sp1_annex = true; [[fallthrough]];
-        case 2: SpanPopBack(stack); break;
-        }
-
         // Check P2WSH standard limits
         if (witnessversion == 0 && witnessprogram.size() == WITNESS_V0_SCRIPTHASH_SIZE) {
             const CScriptWitness& scriptWitness = tx.witness.vtxinwit[i].scriptWitness;
@@ -509,27 +309,37 @@ bool IsWitnessStandard(
             }
         }
 
-        if (is_native_taproot) {
-            static_assert(TAPROOT_LEAF_MASK == 0xfe && TAPROOT_LEAF_TAPSCRIPT == 0xc4 &&
-                TAPROOT_LEAF_TAPSIMPLICITY == 0xbe);
-            // Inherited witness checks stay native; only fork extensions cross the ABI.
-            if (stack.empty()) return false;
-            const auto count = stack.size();
-            uint32_t leaf{0};
-            size_t script_size{0};
-            if (count >= 2) {
-                const auto& control = SpanPopBack(stack);
-                const auto& script = SpanPopBack(stack);
-                if (control.empty()) return false;
-                leaf = control[0] & TAPROOT_LEAF_MASK;
-                script_size = script.size();
+        // Check policy limits for Taproot spends:
+        // - MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE limit for stack item size
+        // - No annexes
+        if (witnessversion == 1 && witnessprogram.size() == WITNESS_V1_TAPROOT_SIZE && !p2sh) {
+            // Missing witness; invalid by consensus rules
+            if (i >= tx.witness.vtxinwit.size()) {
+                return false;
             }
-            if (!TaprootWitnessPolicy(has_annex, canonical_bond_inbox_source,
-                    count, leaf, script_size, i)) return false;
-            if (count >= 2 && leaf == TAPROOT_LEAF_TAPSCRIPT) {
-                for (const auto& item : stack) {
-                    if (item.size() > MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE) return false;
+            // Taproot spend (non-P2SH-wrapped, version 1, witness program size 32; see BIP 341)
+            Span stack{tx.witness.vtxinwit[i].scriptWitness.stack};
+            if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
+                // Annexes are nonstandard as long as no semantics are defined for them.
+                return false;
+            }
+            if (stack.size() >= 2) {
+                // Script path spend (2 or more stack elements after removing optional annex)
+                const auto& control_block = SpanPopBack(stack);
+                SpanPopBack(stack); // Ignore script
+                if (control_block.empty()) return false; // Empty control block is invalid
+                if ((control_block[0] & TAPROOT_LEAF_MASK) == TAPROOT_LEAF_TAPSCRIPT) {
+                    // Leaf version 0xc0 (aka Tapscript, see BIP 342)
+                    for (const auto& item : stack) {
+                        if (item.size() > MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE) return false;
+                    }
                 }
+            } else if (stack.size() == 1) {
+                // Key path spend (1 stack element after removing optional annex)
+                // (no policy rules apply)
+            } else {
+                // 0 stack elements; this is already invalid by consensus rules
+                return false;
             }
         }
     }

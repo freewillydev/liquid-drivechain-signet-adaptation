@@ -36,8 +36,6 @@ ChildCheckpointSources PrepareChildCheckpointSources(ChainstateManager& chainman
             case 2: return tip->IsValid(BLOCK_VALID_SCRIPTS);
             case 3: return chainman.IsSnapshotActive();
             case 4: return chainman.IsSnapshotValidated();
-            case 5: return tip->m_usdd_withdrawal_accumulator.has_value();
-            case 6: return tip->m_usdd_withdrawal_accumulator->IsSane();
             case 7: expected = tip->GetBlockHash(); return 1;
             case 8: return chainstate.CoinsTip().GetBestBlock() == expected;
             case 9: chainstate.ForceFlushStateToDisk(); return 1;
@@ -51,14 +49,13 @@ ChildCheckpointSources PrepareChildCheckpointSources(ChainstateManager& chainman
             case 14: return coins->GetBestBlock() == expected;
             case 15: return chainstate.CoinsDB().GetHeadBlocks().empty();
             case 16: throw std::runtime_error("Child checkpoint requires a validated active chain");
-            case 17: throw std::runtime_error("Child checkpoint withdrawal frontier unavailable or malformed");
             case 18: throw std::runtime_error("Child checkpoint cache/active tip mismatch");
             case 19: throw std::runtime_error("Child checkpoint database/active tip mismatch");
             default: throw std::logic_error("Unknown child checkpoint action");
             }
         });
     return {chainstate.m_chain.Genesis()->GetBlockHash(), expected, tip->nHeight,
-        *tip->m_usdd_withdrawal_accumulator, std::move(coins), std::move(claims)};
+        std::move(coins), std::move(claims)};
 }
 
 bool WriteSnapshotBaseBlockhash(Chainstate& snapshot_chainstate)

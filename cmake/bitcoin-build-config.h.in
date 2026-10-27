@@ -49,8 +49,6 @@
 #cmakedefine ENABLE_WALLET 1
 
 /* Authenticated proof verifier archives validated at configure time. */
-#cmakedefine HAVE_USDD_SP1_VERIFIER 1
-#cmakedefine ECX_ENABLE_SP1_GROTH16_VERIFIER 1
 
 /* Define this symbol for Liquid builds */
 #cmakedefine LIQUID 1

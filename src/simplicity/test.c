@@ -23,7 +23,6 @@
 #include "elements/checkSigHashAllTx1.h"
 #include "elements/elementsJets.h"
 #include "elements/primitive.h"
-#include "elements/primitiveJetCost.inc"
 #include "elements/txEnv.h"
 
 _Static_assert(CHAR_BIT == 8, "Buffers passed to fmemopen presume 8 bit chars");
@@ -514,153 +513,6 @@ static void test_elements(void) {
   simplicity_elements_freeTapEnv(taproot);
 }
 
-static void test_elements_full_annex(void) {
-  unsigned char txid[32] = {0};
-  unsigned char prevTxid[32] = {0};
-  rawElementsInput input = (rawElementsInput)
-    { .prevTxid = prevTxid
-    , .sequence = 0xffffffff
-    };
-  rawElementsTransaction rawTx = (rawElementsTransaction)
-    { .txid = txid
-    , .input = &input
-    , .numInputs = 1
-    };
-
-  printf("Test Elements owned full annex\n");
-
-  /* The transaction must own its copy rather than borrow witness memory. */
-  {
-    unsigned char fullBytes[] = {0x50, 0xaa, 0xbb, 0xcc};
-    const unsigned char expected[] = {0x50, 0xaa, 0xbb, 0xcc};
-    rawElementsBuffer annex = { .buf = fullBytes + 1, .len = sizeof(fullBytes) - 1 };
-    rawElementsBuffer fullAnnex = { .buf = fullBytes, .len = sizeof(fullBytes) };
-    rawElementsBuffer owned = {0};
-    input.annex = &annex;
-    input.fullAnnex = &fullAnnex;
-
-    elementsTransaction* tx = simplicity_elements_mallocTransaction(&rawTx);
-    input.fullAnnex = NULL;
-    elementsTransaction* legacyTx = simplicity_elements_mallocTransaction(&rawTx);
-    input.fullAnnex = &fullAnnex;
-    if (tx && legacyTx &&
-        0 == memcmp(&tx->input[0].annexHash, &legacyTx->input[0].annexHash, sizeof(tx->input[0].annexHash)) &&
-        0 == memcmp(&tx->inputAnnexesHash, &legacyTx->inputAnnexesHash, sizeof(tx->inputAnnexesHash)) &&
-        0 == memcmp(&tx->txHash, &legacyTx->txHash, sizeof(tx->txHash))) {
-      successes++;
-    } else {
-      failures++;
-      printf("Owning a full annex changed legacy transaction hashes\n");
-    }
-    simplicity_elements_freeTransaction(legacyTx);
-
-    memset(fullBytes, 0, sizeof(fullBytes));
-    if (tx && simplicity_elements_getInputFullAnnex(tx, 0, &owned) &&
-        owned.len == sizeof(expected) && 0 == memcmp(owned.buf, expected, sizeof(expected))) {
-      successes++;
-    } else {
-      failures++;
-      printf("Full annex was not retained as an owned exact copy\n");
-    }
-
-    owned = (rawElementsBuffer){ .buf = expected, .len = sizeof(expected) };
-    if (tx && !simplicity_elements_getInputFullAnnex(tx, 1, &owned) && !owned.buf && 0 == owned.len) {
-      successes++;
-    } else {
-      failures++;
-      printf("Out-of-range full annex lookup did not fail closed\n");
-    }
-    simplicity_elements_freeTransaction(tx);
-  }
-
-  /* A tag-only annex is exact and remains distinguishable from no annex. */
-  {
-    const unsigned char fullBytes[] = {0x50};
-    rawElementsBuffer annex = { .buf = NULL, .len = 0 };
-    rawElementsBuffer fullAnnex = { .buf = fullBytes, .len = sizeof(fullBytes) };
-    rawElementsBuffer owned = {0};
-    input.annex = &annex;
-    input.fullAnnex = &fullAnnex;
-
-    elementsTransaction* tx = simplicity_elements_mallocTransaction(&rawTx);
-    if (tx && simplicity_elements_getInputFullAnnex(tx, 0, &owned) &&
-        1 == owned.len && 0x50 == owned.buf[0]) {
-      successes++;
-    } else {
-      failures++;
-      printf("Tag-only full annex was not retained\n");
-    }
-    simplicity_elements_freeTransaction(tx);
-  }
-
-  /* The exact 1.25 MiB V5 limit is retained; one byte more is not. */
-  {
-    unsigned char* fullBytes = malloc(SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE + 1U);
-    if (!fullBytes) {
-      failures++;
-      printf("Unable to allocate full annex boundary test buffer\n");
-    } else {
-      memset(fullBytes, 0x5a, SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE + 1U);
-      fullBytes[0] = 0x50;
-      rawElementsBuffer annex =
-        { .buf = fullBytes + 1
-        , .len = SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE - 1U
-        };
-      rawElementsBuffer fullAnnex =
-        { .buf = fullBytes
-        , .len = SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE
-        };
-      rawElementsBuffer owned = {0};
-      input.annex = &annex;
-      input.fullAnnex = &fullAnnex;
-
-      elementsTransaction* tx = simplicity_elements_mallocTransaction(&rawTx);
-      if (tx && simplicity_elements_getInputFullAnnex(tx, 0, &owned) &&
-          SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE == owned.len &&
-          0x50 == owned.buf[0] && 0x5a == owned.buf[owned.len - 1]) {
-        successes++;
-      } else {
-        failures++;
-        printf("Maximum-size full annex was not retained\n");
-      }
-      simplicity_elements_freeTransaction(tx);
-
-      annex.len = SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE;
-      fullAnnex.len = SIMPLICITY_ELEMENTS_MAX_OWNED_ANNEX_SIZE + 1U;
-      owned = (rawElementsBuffer){ .buf = fullBytes, .len = 1 };
-      tx = simplicity_elements_mallocTransaction(&rawTx);
-      if (tx && !simplicity_elements_getInputFullAnnex(tx, 0, &owned) && !owned.buf && 0 == owned.len) {
-        successes++;
-      } else {
-        failures++;
-        printf("Oversized full annex was unexpectedly retained\n");
-      }
-      simplicity_elements_freeTransaction(tx);
-      free(fullBytes);
-    }
-  }
-
-  /* Inconsistent optional bytes are ignored without breaking legacy annexes. */
-  {
-    const unsigned char annexBytes[] = {0x11, 0x22};
-    const unsigned char fullBytes[] = {0x50, 0x11, 0x23};
-    rawElementsBuffer annex = { .buf = annexBytes, .len = sizeof(annexBytes) };
-    rawElementsBuffer fullAnnex = { .buf = fullBytes, .len = sizeof(fullBytes) };
-    rawElementsBuffer owned = {0};
-    input.annex = &annex;
-    input.fullAnnex = &fullAnnex;
-
-    elementsTransaction* tx = simplicity_elements_mallocTransaction(&rawTx);
-    if (tx && !simplicity_elements_getInputFullAnnex(tx, 0, &owned) && !owned.buf && 0 == owned.len) {
-      successes++;
-    } else {
-      failures++;
-      printf("Inconsistent full annex was unexpectedly retained\n");
-    }
-    simplicity_elements_freeTransaction(tx);
-  }
-}
-
 static bool check_current_bmm_parent_mtp(bool present, uint_fast64_t value) {
   txEnv env =
     { .bmmParentMtp = value
@@ -681,7 +533,22 @@ static bool check_current_bmm_parent_mtp(bool present, uint_fast64_t value) {
   return !present || value == simplicity_read64(&result);
 }
 
+static void test_removed_proof_jet(void) {
+  static const unsigned char encoding[] = {0x7c, 0x38, 0xd0};
+  bitstream stream = initializeBitstream(encoding, sizeof(encoding));
+  dag_node* dag = NULL;
+  const int_fast32_t result = simplicity_decodeMallocDag(&dag, simplicity_elements_decodeJet, NULL, &stream);
+  if (result < 0) {
+    successes++;
+  } else {
+    failures++;
+    printf("Removed proof verifier encoding was accepted\n");
+  }
+  simplicity_free(dag);
+}
+
 static void test_current_bmm_parent_mtp(void) {
+
   static const unsigned char encodedProgram[] = {0x7c, 0x38, 0xcc};
   static const uint32_t expectedCmr[8] =
     { 0x12dc3d4f, 0x22466873, 0xdaaf83b1, 0x0e1cfa1e
@@ -799,226 +666,6 @@ static void test_prior_active_bmm_parent_checkpoint_required(void) {
              "to the generated jet node\n");
     }
     simplicity_free(dag);
-  }
-}
-
-static bool check_verify_sp1_compressed_sha256_rejects(const elementsTransaction* tx,
-                                                       uint_fast32_t ix,
-                                                       const unsigned char programId[32],
-                                                       const unsigned char journalHash[32]) {
-  UWORD inputWords[ROUND_UWORD(512)] = {0};
-  UWORD outputWords[ROUND_UWORD(1)] = {0};
-  frameItem inputWriter = initWriteFrame(512, &inputWords[ROUND_UWORD(512)]);
-  frameItem src;
-  frameItem dst = initWriteFrame(1, &outputWords[ROUND_UWORD(1)]);
-  frameItem result;
-  txEnv env = { .tx = tx, .ix = ix };
-
-  write8s(&inputWriter, programId, 32);
-  write8s(&inputWriter, journalHash, 32);
-  if (0 != inputWriter.offset) return false;
-
-  src = initReadFrame(512, inputWords);
-  if (!simplicity_verify_sp1_compressed_sha256(&dst, src, &env) || 0 != dst.offset) {
-    return false;
-  }
-
-  result = initReadFrame(1, outputWords);
-  return !readBit(&result);
-}
-
-static void test_verify_sp1_compressed_sha256_identity(void) {
-  static const unsigned char encodedProgram[] = {0x7c, 0x38, 0xd0};
-  static const uint32_t expectedCmr[8] =
-    { 0x595cfa3a, 0xdbc83e61, 0x6918a6a5, 0x1441ba84
-    , 0x7f19faf7, 0xe77f3cb9, 0x7d21314e, 0x28928399
-    };
-  bitstream stream = initializeBitstream(encodedProgram, sizeof(encodedProgram));
-  dag_node* dag = NULL;
-  int_fast32_t len = simplicity_decodeMallocDag(&dag, simplicity_elements_decodeJet, NULL, &stream);
-  simplicity_err closeError = dag ? simplicity_closeBitstream(&stream) : SIMPLICITY_ERR_BITSTREAM_EOF;
-
-  printf("Test verify_sp1_compressed_sha256 generated identity\n");
-  if (1 == len && dag && IS_OK(closeError) && JET == dag[0].tag &&
-      simplicity_verify_sp1_compressed_sha256 == dag[0].jet &&
-      SIMPLICITY_VERIFY_SP1_COMPRESSED_SHA256_COST_MWU == dag[0].cost &&
-      0 == memcmp(expectedCmr, dag[0].cmr.s, sizeof(expectedCmr))) {
-    successes++;
-  } else {
-    failures++;
-    printf("Canonical verify_sp1_compressed_sha256 encoding did not decode to the generated "
-           "jet node (len=%jd, close=%d, tag=%d, jet=%d, cost=%ju, cmr=%d)\n",
-           (intmax_t)len, (int)closeError, dag ? (int)dag[0].tag : -1,
-           dag && simplicity_verify_sp1_compressed_sha256 == dag[0].jet,
-           dag ? (uintmax_t)dag[0].cost : 0,
-           dag ? memcmp(expectedCmr, dag[0].cmr.s, sizeof(expectedCmr)) : -1);
-  }
-  simplicity_free(dag);
-}
-
-/* A shared DAG node is still evaluated once per incoming PAIR edge. Preserve
- * this generic single-credit analysis test independently of the USDD host
- * lane. The host lane executes only the exact CMR-gated controller and grants
- * that complete program's pinned static cost; it does not use this synthetic
- * budget as its structural one-verifier invariant. */
-static void test_verify_sp1_shared_pair_exceeds_single_credit(void) {
-  static const unsigned char encodedJet[] = {0x7c, 0x38, 0xd0};
-  bitstream stream = initializeBitstream(encodedJet, sizeof(encodedJet));
-  combinator_counters census = {0};
-  dag_node* decoded = NULL;
-  int_fast32_t decodedLen = simplicity_decodeMallocDag(
-      &decoded, simplicity_elements_decodeJet, &census, &stream);
-  simplicity_err closeError = decoded
-      ? simplicity_closeBitstream(&stream)
-      : SIMPLICITY_ERR_BITSTREAM_EOF;
-  type* typeDag = NULL;
-  simplicity_err inferenceError = SIMPLICITY_ERR_DATA_OUT_OF_RANGE;
-  simplicity_err boundsError = SIMPLICITY_ERR_DATA_OUT_OF_RANGE;
-  ubounded cellsBound = 0;
-  ubounded uwordBound = 0;
-  ubounded frameBound = 0;
-  ubounded costBound = 0;
-  dag_node pairDag[2] = {{0}};
-
-  if (1 == decodedLen && decoded && IS_OK(closeError)) {
-    pairDag[0] = decoded[0];
-    pairDag[1] = (dag_node){ .child = {0, 0}, .tag = PAIR };
-    enumerator(&census, PAIR);
-    inferenceError = simplicity_mallocTypeInference(
-        &typeDag, simplicity_elements_mallocBoundVars, pairDag, 2, &census);
-    if (IS_OK(inferenceError)) {
-      const ubounded creditWu =
-          (SIMPLICITY_VERIFY_SP1_COMPRESSED_SHA256_COST_MWU + 999U) / 1000U;
-      const ubounded maxSingleCreditBudgetMwu =
-          (2U * creditWu - 1U) * 1000U;
-      boundsError = simplicity_analyseBounds(
-          &cellsBound, &uwordBound, &frameBound, &costBound,
-          UBOUNDED_MAX, 0, maxSingleCreditBudgetMwu,
-          pairDag, typeDag, 2);
-    }
-  }
-
-  printf("Test shared verifier PAIR exceeds generic single credit\n");
-  if (1 == decodedLen && IS_OK(closeError) && IS_OK(inferenceError) &&
-      SIMPLICITY_ERR_EXEC_BUDGET == boundsError &&
-      2U * SIMPLICITY_VERIFY_SP1_COMPRESSED_SHA256_COST_MWU + 3U * overhead ==
-          costBound) {
-    successes++;
-  } else {
-    failures++;
-    printf("Shared verifier PAIR was not rejected by static budget analysis "
-           "(len=%jd, close=%d, inference=%d, bounds=%d, cost=%ju)\n",
-           (intmax_t)decodedLen, (int)closeError, (int)inferenceError,
-           (int)boundsError, (uintmax_t)costBound);
-  }
-  simplicity_free(typeDag);
-  simplicity_free(decoded);
-}
-
-static void test_verify_sp1_compressed_sha256_fail_closed(void) {
-  unsigned char txid[32] = {0};
-  unsigned char prevTxid[32] = {0};
-  unsigned char programId[32];
-  unsigned char journalHash[32];
-  const unsigned char malformedFullAnnex[] = {0x50, 0x00};
-  const rawElementsBuffer annex = { .buf = malformedFullAnnex + 1, .len = 1 };
-  const rawElementsBuffer fullAnnex = { .buf = malformedFullAnnex, .len = sizeof(malformedFullAnnex) };
-  const rawElementsInput input =
-    { .annex = &annex
-    , .prevTxid = prevTxid
-    , .sequence = 0xffffffff
-    , .fullAnnex = &fullAnnex
-    };
-  const rawElementsTransaction rawTx =
-    { .txid = txid
-    , .input = &input
-    , .numInputs = 1
-    };
-  elementsTransaction* tx;
-
-  memset(programId, 0x11, sizeof(programId));
-  memset(journalHash, 0x22, sizeof(journalHash));
-  printf("Test verify_sp1_compressed_sha256 fail-closed ABI path\n");
-
-  if (check_verify_sp1_compressed_sha256_rejects(NULL, 0, programId, journalHash)) {
-    successes++;
-  } else {
-    failures++;
-    printf("Missing transaction environment did not return False\n");
-  }
-
-  tx = simplicity_elements_mallocTransaction(&rawTx);
-  if (tx && check_verify_sp1_compressed_sha256_rejects(tx, 1, programId, journalHash)) {
-    successes++;
-  } else {
-    failures++;
-    printf("Out-of-range current input did not return False\n");
-  }
-
-  if (tx && check_verify_sp1_compressed_sha256_rejects(tx, 0, programId, journalHash)) {
-    successes++;
-  } else {
-    failures++;
-    printf("Malformed exact annex crossed the verifier ABI as True\n");
-  }
-#if !defined(HAVE_USDD_SP1_VERIFIER)
-  if (tx && check_verify_sp1_compressed_sha256_rejects(tx, 0, programId, journalHash)) {
-    successes++;
-  } else {
-    failures++;
-    printf("Verifier-unavailable build did not fail closed\n");
-  }
-#endif
-  simplicity_elements_freeTransaction(tx);
-}
-
-static void test_usdd_inventory_htlc_compiler_vector(void) {
-  /* SimplicityHL f62adf11e16816dd8f33f16edb5ff9f4c4b45e36 (v0.6.0),
-   * paired with simplicity/inventory_htlc_v1.known-artifact.json in the USDD
-   * protocol repository.  This checks compiler/node catalogue agreement only;
-   * it is not a transaction-execution or deployment vector. */
-  static const unsigned char program[] = {
-    0xe5, 0x83, 0xa0, 0x50, 0x83, 0x10, 0x28, 0x41, 0x86, 0x20, 0xe3, 0x05,
-    0x81, 0x3a, 0xb2, 0x04, 0x09, 0xa9, 0x06, 0x1f, 0x68, 0xa3, 0x55, 0xc8,
-    0x10, 0x81, 0x41, 0xb4, 0x6a, 0xc4, 0x10, 0x0c, 0x00, 0xda, 0x07, 0x07,
-    0x09, 0xc3, 0x53, 0x69, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
-    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
-    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
-    0x04, 0x20, 0x50, 0x6e, 0x1e, 0x71, 0xb8, 0x84, 0x51, 0x9b, 0x74, 0x02,
-    0x30, 0x08, 0x4d, 0xa5, 0xe6, 0xf9, 0x99, 0xfb, 0xe7, 0x72, 0xee, 0xb1,
-    0x56, 0x81, 0x8a, 0x57, 0x3a, 0x1c, 0x2c, 0x1c, 0x0a, 0x6f, 0xf3, 0x6c,
-    0xb7, 0x38, 0xa3, 0x65, 0x67, 0xca, 0x05, 0x6c, 0x5b, 0xe0, 0x5e, 0x60,
-    0x10, 0x81, 0x41, 0xb8, 0xb0, 0xfc, 0x52, 0x71, 0xc2, 0xc0, 0x9e, 0x02,
-    0x04, 0xe3, 0x83, 0xf1, 0xa0, 0x9c, 0x1c, 0x4d, 0x5b, 0x18, 0x08, 0x13,
-    0x88, 0x0f, 0xc8, 0x10, 0x40, 0x34, 0x81, 0xb8, 0x91, 0x40, 0x19, 0x03,
-    0x83, 0x85, 0xc3, 0x40, 0x69, 0x07, 0x13, 0x81, 0xc5, 0xa0, 0x72, 0x04,
-    0x91, 0x40, 0x1b, 0xc1, 0xc8, 0xc1, 0xb9, 0x12, 0x9b, 0x27, 0x73, 0x59,
-    0x40, 0x00, 0x40, 0x9c, 0x8d, 0x41, 0x9e, 0x40, 0x42, 0x6d, 0x38, 0xc0,
-    0x8f, 0xf2, 0x88, 0x3d, 0xaf, 0xad, 0xa6, 0x08, 0xa8, 0x0d, 0xd2, 0xb8,
-    0x0f, 0x9b, 0x0b, 0x8e, 0xf1, 0xc9, 0x71, 0x9d, 0xe7, 0x94, 0xf5, 0x75,
-    0x81, 0x37, 0x2b, 0x8e, 0x13, 0xdc, 0xa0, 0x84, 0x0a, 0x0d, 0xc9, 0xa3,
-    0xf2, 0x60, 0xe1, 0x50, 0x1c, 0x42, 0x91, 0x40, 0x1c, 0x4c, 0x0d, 0x21,
-    0x6f, 0x01, 0xc5, 0x20, 0xe0, 0xa0, 0x70, 0xa0, 0x78, 0x60, 0x1c, 0xad,
-    0x00
-  };
-  static const unsigned char expectedCmr[32] = {
-    0xf7, 0x51, 0xa0, 0x30, 0x1f, 0x11, 0x04, 0x05,
-    0x94, 0x0c, 0xb1, 0x8c, 0xcc, 0x5c, 0xdd, 0x7b,
-    0x79, 0xc2, 0x36, 0x57, 0x36, 0x48, 0xae, 0xb2,
-    0xa3, 0x7d, 0xd8, 0x6e, 0xe9, 0xa3, 0x22, 0xec
-  };
-  unsigned char actualCmr[32];
-  simplicity_err error = SIMPLICITY_NO_ERROR;
-
-  printf("Test USDD inventory HTLC compiler/node CMR vector\n");
-  if (sizeof(program) == 253 &&
-      simplicity_elements_computeCmr(&error, actualCmr, program, sizeof(program)) &&
-      IS_OK(error) && 0 == memcmp(expectedCmr, actualCmr, sizeof(expectedCmr))) {
-    successes++;
-  } else {
-    failures++;
-    printf("USDD inventory HTLC compiler/node CMR vector failed (size=%zu, error=%d)\n",
-           sizeof(program), (int)error);
   }
 }
 
@@ -1276,13 +923,9 @@ int main(int argc, char **argv) {
   test_program("schnorr6", schnorr6, sizeof_schnorr6, schnorr6_witness, sizeof_schnorr6_witness, SIMPLICITY_ERR_EXEC_JET, schnorr6_cmr, schnorr6_ihr, schnorr6_amr, &schnorr0_cost);
   test_program("typeSkipTest", typeSkipTest, sizeof_typeSkipTest, typeSkipTest_witness, sizeof_typeSkipTest_witness, SIMPLICITY_NO_ERROR, NULL, NULL, NULL, NULL);
   test_elements();
-  test_elements_full_annex();
+  test_removed_proof_jet();
   test_current_bmm_parent_mtp();
   test_prior_active_bmm_parent_checkpoint_required();
-  test_verify_sp1_compressed_sha256_identity();
-  test_verify_sp1_shared_pair_exceeds_single_credit();
-  test_verify_sp1_compressed_sha256_fail_closed();
-  test_usdd_inventory_htlc_compiler_vector();
   exactBudget_test();
   regression_tests();
   iden8mebi_test();

@@ -8,7 +8,7 @@ import Control.Operation
 import Control.Operation.Validation (Check(..))
 import Control.Operation.Validation (Validation(..))
 import qualified Bmm
-import qualified Exchange
+import qualified NodeRules
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import Withdrawal (wordLE, readLE)
@@ -475,7 +475,7 @@ authRecord = forAll (oneof [B.pack <$> resize 120 (listOf (arbitrary :: Gen Word
           when (index/=0 || not (B.null request)) (error "invalid record request")
           modifyIORef' seen (++ [step])
           pure (if step==50 then bytes else wordLE 8 ack)
-        valid = validate (Exchange.ConfigurationField (if rotating then 7 else 8) bytes)==Right (B.singleton 1)
+        valid = validate (NodeRules.ConfigurationField (if rotating then 7 else 8) bytes)==Right (B.singleton 1)
         oversized = B.length bytes>4096
     status <- Bmm.validateCredentialRecord (Bmm.AuthFile action) rotating
     events <- readIORef seen

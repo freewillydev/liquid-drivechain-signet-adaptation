@@ -22,7 +22,7 @@ import Data.Word (Word8, Word32, Word64)
 import Deposit (ReadPegFields, readPegFields, constructionScalar, constructionWord)
 import ParentReplay (transition, commitmentBytes)
 import qualified ParentReplay as R
-import qualified Exchange
+import qualified NodeRules
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Withdrawal (readLE, wordLE)
 import Foreign.Marshal.Array (allocaArray, peekArray)
@@ -262,15 +262,12 @@ instance Validation AnchorCheckpoint where
     | otherwise = Right (big 1 32<>B.replicate 4 0<>big 129 4<>big 137 8<>big 65 32)
     where big offset width = B.reverse (B.take width (B.drop offset bytes))
 
--- Keep BMM marking and withdrawal-envelope reads in their original order.
-data TemplateCommitmentFlow = TemplateCommitmentFlow Bool Word32 Word32
+-- Keep BMM marking in its original order.
+data TemplateCommitmentFlow = TemplateCommitmentFlow Word32 Word32
 instance Validation TemplateCommitmentFlow where
   type ValidationResult TemplateCommitmentFlow = Int32
-  validate (TemplateCommitmentFlow envelope phase result) = transition phase result $
-    if envelope then
-      [(1,(4,2)),(2,(4,3)),(3,(-1,4)),(4,(-11,5)),(5,(-11,6)),
-       (6,(7,8)),(7,(8,-11)),(8,(11,9)),(9,(11,10)),(10,(-1,-11)),(11,(-1,-10))]
-    else [(1,(-11,2)),(2,(-11,3)),(3,(-1,-11))]
+  validate (TemplateCommitmentFlow phase result) = transition phase result
+    [(1,(-11,2)),(2,(-11,3)),(3,(-1,-11))]
 
 -- Clear a prior selection before checking whether this template needs a parent.
 data TemplateSelectionFlow = TemplateSelectionFlow Word32 Word32
@@ -288,7 +285,7 @@ instance Validation TemplateAdmissionFlow where
      (5,(6,7)),(6,(-11,7)),(7,(8,-11)),(8,(-1,-10))]
 
 -- Candidate P is authenticated before comparing or publishing its height.
--- Non-native fallback failure is optional; exchange-header failure is not.
+-- Non-native fallback failure is optional.
 data TemplateParentFlow = TemplateParentFlow Word32 Word32
 instance Validation TemplateParentFlow where
   type ValidationResult TemplateParentFlow = Int32
@@ -514,8 +511,8 @@ instance Validation StageAdmission where
   validate request = case request of
     RewardAddress action -> run 5 action
     NativeProduction action -> produce action
-      [(1,1),(2,2),(13,2),(3,3),(4,4),(5,5),(6,6),(11,6),(12,6),(7,7),(8,8),(9,9),(10,10)]
-      [(1,101),(2,102),(13,102),(3,103),(6,106),(11,111),(12,112),(7,107)]
+      [(1,1),(2,2),(13,2),(3,3),(4,4),(5,5),(6,6),(7,7),(8,8),(9,9),(10,10)]
+      [(1,101),(2,102),(13,102),(3,103),(6,106),(7,107)]
     EcxProduction action -> produce action
       [(1,1),(19,1),(2,2),(20,2),(3,3),(15,3),(4,4),(5,5),(6,6),(16,6),
        (7,7),(8,8),(9,9),(17,9),(10,10),(18,10),(11,11),(12,12),(13,13),(14,14)]
@@ -713,12 +710,6 @@ instance Validation ChildFlow where
     else [(1,(2,-11)),(2,(-11,3)),(3,(-1,4)),(4,(5,-11)),(5,(7,6)),
      (6,(-1,-11)),(7,(9,8)),(8,(-1,-11)),(9,(10,-10)),(10,(-11,2))]
 
-data AnnexAccountingFlow = AnnexAccountingFlow Word32 Word32
-instance Validation AnnexAccountingFlow where
-  type ValidationResult AnnexAccountingFlow = Int32
-  validate (AnnexAccountingFlow phase result) = transition phase result
-    [(1,(-11,2)),(2,(-1,-11))]
-
 -- Byte strings preserve native argv contents; this planner never invokes a shell.
 data CredentialRecordFlow = CredentialRecordFlow Word32 Word32
 instance Validation CredentialRecordFlow where
@@ -842,7 +833,7 @@ instance CredentialFormat AuthFile where
   validateCredentialRecord (AuthFile action) rotating = do
     bytes <- action 50 0 B.empty
     if B.length bytes>4096 then pure (-1)
-    else case validate (Exchange.ConfigurationField (if rotating then 7 else 8) bytes) of
+    else case validate (NodeRules.ConfigurationField (if rotating then 7 else 8) bytes) of
       Right accepted | accepted==B.singleton 1 -> pure 1
       Left 1 -> do
         reported <- authFileScalar action 60 0 B.empty
@@ -925,7 +916,7 @@ instance R.CredentialLoader RpcSession where
       file rotating = do
         ready <- if rotating then do
           chain <- rpcSessionBytes value 483 0 B.empty
-          let path = if validate (Exchange.NetworkSelection 3 0 chain) == 1 then ".cookie" else "regtest/.cookie"
+          let path = if validate (NodeRules.NetworkSelection 3 0 chain) == 1 then ".cookie" else "regtest/.cookie"
           rpcSessionNumber value 447 (C.pack path)
           else rpcSessionScalar value 445
         case ready of
@@ -1509,33 +1500,6 @@ fingerprintPayload source = do
       pure (blockHash ++ concatMap (bigEndian 4) fields ++ bigEndian 8 count ++ concatMap (bigEndian 4) times)
 
 data FingerprintRequest = FingerprintRequest (FunPtr ReadFingerprint) (Ptr ())
--- Exchange v10 field ordering. Native adapters expose values, not encoded layout.
-exchangeFingerprintPayload :: FingerprintSource op => op -> IO [Word8]
-exchangeFingerprintPayload source = do
-  private <- fingerprintNumber source 0 37
-  when (private > 1) (error "invalid exchange fingerprint mode")
-  swaps <- fingerprintNumber source 0 39
-  when (swaps > 1) (error "invalid swap fingerprint mode")
-  parts <- sequence $
-    [number 4 i | i <- [0..9]] ++ [number 8 i | i <- [10..20]] ++
-    concat [[raw i, number 4 (21+i)] | i <- [0..2]] ++
-    [sized 8 i | i <- [3..8]] ++ [number 1 i | i <- [24..26]] ++
-    [raw 9, sized 4 10] ++ [raw i | i <- [11..13]] ++
-    [number 4 27, raw 14, number 4 28] ++ [raw i | i <- [15..18]] ++
-    [sized 4 19, raw 20, number 1 29, number 1 30, number 4 31,
-     sized 8 21, sized 8 22] ++ [number 4 i | i <- [32..35]] ++
-    [sized 8 23] ++ [raw i | i <- [24..62]] ++
-    [number 8 36, pure [fromIntegral private],
-     if private == 1 then number 4 38 else pure (bigEndian 4 0),
-     pure [fromIntegral swaps]] ++ [raw i | i <- [63..66]]
-  pure (concat parts)
-  where
-    number width index = bigEndian width <$> fingerprintNumber source 0 index
-    raw = fingerprintBytes source
-    sized width index = do
-      bytes <- raw index
-      pure (bigEndian width (fromIntegral (length bytes)) ++ bytes)
-
 fingerprintField :: FingerprintRequest -> Word32 -> Word32 -> IO (Word64, Ptr Word8)
 fingerprintField (FingerprintRequest reader context) group index
   | reader == nullFunPtr = error "missing BMM fingerprint adapter"
@@ -1552,22 +1516,7 @@ instance FingerprintSource FingerprintRequest where
     if size > fromIntegral (maxBound :: Int) || (size /= 0 && bytes == nullPtr)
       then error "invalid BMM fingerprint bytes"
       else peekArray (fromIntegral size) bytes
-activationFingerprintPayload :: FingerprintSource op => op -> IO [Word8]
-activationFingerprintPayload source = concat <$> sequence (
-  [raw 0,raw 1] ++ [number 4 i | i <- [0..3]] ++ [raw 2] ++
-  [fixed i | i <- [3..45]] ++ [number 8 4,number 1 5,number 4 6,fixed 46,number 8 7])
-  where
-    raw = fingerprintBytes source
-    fixed index = do
-      bytes <- raw index
-      when (length bytes/=32) (error "invalid activation fingerprint identity")
-      pure bytes
-    number width index = do
-      value <- fingerprintNumber source 0 index
-      when (width<8 && value>=2^(8*width)) (error "invalid activation fingerprint number")
-      pure (bigEndian width value)
-
-data FingerprintFormat = BmmFormat | ExchangeFormat | ActivationFormat
+data FingerprintFormat = BmmFormat
 
 fingerprint :: FingerprintFormat -> DSL FingerprintRequest
 fingerprint = EncodeFingerprint
@@ -1576,8 +1525,6 @@ encodeFingerprint :: FingerprintSource op => FingerprintFormat -> op -> IO [Word
 encodeFingerprint format source = do
   bytes <- case format of
     BmmFormat -> fingerprintPayload source
-    ExchangeFormat -> exchangeFingerprintPayload source
-    ActivationFormat -> activationFingerprintPayload source
   mapM_ evaluate bytes
   pure bytes
 
@@ -2149,13 +2096,11 @@ data HeaderLayout = HeaderLayout Word32 Word32
 instance Validation HeaderLayout where
   type ValidationResult HeaderLayout = Maybe (Word32,Word32)
   validate (HeaderLayout version flags)
-    | flags > 127 || legacyFlags > 47 || (legacyFlags > 16 && legacyFlags < 32) = Nothing
-    | legacyFlags == 16 = Just (version,rawFields)
+    | flags > 47 || (flags > 16 && flags < 32) = Nothing
+    | flags == 16 = Just (version,rawFields)
     | not (testBit flags 0) = Just (version,0)
     | otherwise = Just (normalized,fields)
     where
-      legacyFlags = flags .&. 63
-      swapForced = testBit flags 6 && testBit version Constants.swapForcedHeaderBit
       reading = testBit flags 1
       withdrawal = if reading then testBit version Constants.withdrawalHeaderBit else testBit flags 2
       dynamic = if reading then testBit version 31 else testBit flags 3
@@ -2164,8 +2109,7 @@ instance Validation HeaderLayout where
         (if reading then 0 else present withdrawal Constants.withdrawalHeaderBit .|. present dynamic 31)
       fields = present withdrawal 0 .|. present dynamic 6 .|. extensions .|. present (testBit flags 5) 8
       rawFields = present (testBit version Constants.withdrawalHeaderBit) 0 .|. present (testBit version 31) 6 .|. extensions
-      extensions = extensionFields .|. present (extensionFields .&. 24 == 24) 7 .|. present swapForced 9
-      extensionFields = sum [present (testBit version bit) position | (bit,position) <- zip Constants.headerExtensionBits [1..5]]
+      extensions = present (testBit version 20) 1
 
 data CommitmentBytes = CommitmentBytes Word32 [Word8]
 instance Validation CommitmentBytes where

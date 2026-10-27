@@ -5,7 +5,6 @@
 
 #include <script/interpreter.h>
 #include <haskell/bridge.h>
-#include <script/ecx_activation_annex.h>
 
 #include <consensus/consensus.h>
 #include <crypto/ripemd160.h>
@@ -13,35 +12,11 @@
 #include <crypto/sha256.h>
 #include <pubkey.h>
 #include <script/script.h>
-#include <script/usdd_sp1_annex.h>
 #include <uint256.h>
 extern "C" {
 #include <simplicity/elements/env.h>
 #include <simplicity/elements/exec.h>
 
-#ifdef ECX_ENABLE_SP1_GROTH16_VERIFIER
-extern "C" bool ecx_sp1_6_3_1_verify_groth16_sha256(
-    void* context,
-    const unsigned char* proof,
-    size_t proof_len,
-    const uint32_t* program_id_words,
-    const unsigned char* public_values_sha256);
-
-static bool VerifyEcxSp1Groth16(
-    void* context,
-    const unsigned char* proof,
-    size_t proof_len,
-    const uint32_t* program_id_words,
-    const unsigned char* public_values_sha256)
-{
-    try {
-        return drivechain::haskell::VerifyGroth16(ecx_sp1_6_3_1_verify_groth16_sha256,
-            context, proof, proof_len, program_id_words, public_values_sha256);
-    } catch (...) {
-        return false; // No C++ exception may escape into the Simplicity C caller.
-    }
-}
-#endif
 #include <simplicity/errorCodes.h>
 }
 
@@ -2535,12 +2510,6 @@ std::vector<uint256> GetSpentScriptPubKeysSHA256(const std::vector<CTxOut>& outp
     return spent_spk_single_hashes;
 }
 
-template <typename... Values>
-static uint8_t ContextPresence(const Values&... values)
-{
-    return drivechain::haskell::ContextPresence((0U + ... + unsigned(values.has_value())), sizeof...(Values));
-}
-
 /** Compute the (single) SHA256 of the concatenation of all scriptSigs in a tx. */
 template <class T>
 uint256 GetScriptSigsSHA256(const T& txTo)
@@ -2603,42 +2572,6 @@ uint256 GetRangeproofsHash(const T& txTo) {
 
 } // namespace
 
-uint8_t PrecomputedTransactionData::EcxBondV2IdentityPresence() const
-{
-    return ContextPresence(m_bond_v2_configuration_hash, m_bond_v2_asset_id,
-        m_bond_v2_deployment_commitment, m_bond_v2_transition_cmr,
-        m_bond_v2_collateral_vault_script_sha256, m_bond_v2_collateral_vault_cmr,
-        m_bond_v2_insurance_reserve_script_sha256, m_bond_v2_insurance_reserve_cmr);
-}
-
-uint8_t PrecomputedTransactionData::EcxBondV2ProjectionPresence() const
-{
-    return ContextPresence(m_prior_active_bond_inbox_root, m_prior_active_bond_inbox_count, m_current_sidechain_height);
-}
-
-uint8_t PrecomputedTransactionData::EcxBondV2IncrementalActivationIdentityPresence() const
-{
-    return ContextPresence(m_bond_v2_incremental_activation_program_id, m_bond_v2_incremental_activation_configuration_hash,
-        m_bond_v2_incremental_activation_cmr, m_incremental_successor_program_id,
-        m_bond_v2_incremental_successor_configuration_hash, m_incremental_successor_transition_cmr,
-        m_incremental_successor_state_node_domain_sha256);
-}
-
-uint8_t PrecomputedTransactionData::EcxForcedInboxPresence() const
-{
-    return ContextPresence(m_prior_active_forced_inbox_root, m_prior_active_forced_processed_cursor);
-}
-
-uint8_t PrecomputedTransactionData::EcxDepositInboxPresence() const
-{
-    return ContextPresence(m_prior_active_deposit_inbox_root, m_prior_active_deposit_processed_cursor);
-}
-
-uint8_t PrecomputedTransactionData::EcxCurrentBmmPresence() const
-{
-    return ContextPresence(m_current_bmm_parent_block_hash, m_current_bmm_parent_height, m_current_bmm_parent_mtp);
-}
-
 template <class T>
 void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent_outputs, bool force)
 {
@@ -2700,7 +2633,6 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
         m_output_spk_single_hashes = GetOutputScriptPubKeysSHA256(txTo);
 
         std::vector<rawElementsBuffer> simplicityRawAnnex(txTo.witness.vtxinwit.size());
-        std::vector<rawElementsBuffer> simplicityRawFullAnnex(txTo.witness.vtxinwit.size());
         std::vector<rawElementsInput> simplicityRawInput(txTo.vin.size());
         for (size_t i = 0; i < txTo.vin.size(); ++i) {
             simplicityRawInput[i].prevTxid = txTo.vin[i].prevout.hash.ToUint256().begin();
@@ -2715,16 +2647,12 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
             simplicityRawInput[i].issuance.amount = txTo.vin[i].assetIssuance.nAmount.vchCommitment.empty() ? nullptr : txTo.vin[i].assetIssuance.nAmount.vchCommitment.data();
             simplicityRawInput[i].issuance.inflationKeys = txTo.vin[i].assetIssuance.nInflationKeys.vchCommitment.empty() ? nullptr : txTo.vin[i].assetIssuance.nInflationKeys.vchCommitment.data();
             simplicityRawInput[i].annex = nullptr;
-            simplicityRawInput[i].fullAnnex = nullptr;
             if (i < txTo.witness.vtxinwit.size()) {
                 Span<const valtype> stack{txTo.witness.vtxinwit[i].scriptWitness.stack};
                 if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
                     simplicityRawAnnex[i].buf = stack.back().data()+1;
                     simplicityRawAnnex[i].len = stack.back().size()-1;
                     simplicityRawInput[i].annex = &simplicityRawAnnex[i];
-                    simplicityRawFullAnnex[i].buf = stack.back().data();
-                    simplicityRawFullAnnex[i].len = stack.back().size();
-                    simplicityRawInput[i].fullAnnex = &simplicityRawFullAnnex[i];
                 }
                 simplicityRawInput[i].issuance.amountRangePrf.buf = txTo.witness.vtxinwit[i].vchIssuanceAmountRangeproof.data();
                 simplicityRawInput[i].issuance.amountRangePrf.len = txTo.witness.vtxinwit[i].vchIssuanceAmountRangeproof.size();
@@ -3292,88 +3220,7 @@ bool GenericTransactionSignatureChecker<T>::CheckSimplicity(const valtype& progr
 
     assert(txdata->m_simplicity_tx_data);
     assert(simplicityTapEnv);
-    ecx_prior_active_root_env ecx_root{};
-#ifdef ECX_ENABLE_SP1_GROTH16_VERIFIER
-    ecx_root.verify_sp1_groth16 = VerifyEcxSp1Groth16;
-    ecx_root.verify_sp1_groth16_context = nullptr;
-#endif
-    if (txdata->m_prior_active_exchange_state_root.has_value()) {
-        ecx_root.present = 1;
-        std::copy(
-            txdata->m_prior_active_exchange_state_root->begin(),
-            txdata->m_prior_active_exchange_state_root->end(),
-            ecx_root.root_wire);
-    }
-    ecx_root.forced_inbox_present = txdata->EcxForcedInboxPresence();
-    if (txdata->m_prior_active_forced_inbox_root.has_value()) {
-        std::copy(
-            txdata->m_prior_active_forced_inbox_root->begin(),
-            txdata->m_prior_active_forced_inbox_root->end(),
-            ecx_root.forced_inbox_root_wire);
-        if (txdata->m_prior_active_forced_processed_cursor.has_value()) {
-            ecx_root.forced_processed_cursor =
-                *txdata->m_prior_active_forced_processed_cursor;
-        }
-    }
-    ecx_root.deposit_inbox_present = txdata->EcxDepositInboxPresence();
-    if (txdata->m_prior_active_deposit_inbox_root.has_value()) {
-        std::copy(
-            txdata->m_prior_active_deposit_inbox_root->begin(),
-            txdata->m_prior_active_deposit_inbox_root->end(),
-            ecx_root.deposit_inbox_root_wire);
-        if (txdata->m_prior_active_deposit_processed_cursor.has_value()) {
-            ecx_root.deposit_processed_cursor =
-                *txdata->m_prior_active_deposit_processed_cursor;
-        }
-    }
-    ecx_root.current_bmm_parent_present = txdata->EcxCurrentBmmPresence();
-    if (ecx_root.current_bmm_parent_present == 1) {
-        std::copy(
-            txdata->m_current_bmm_parent_block_hash->begin(),
-            txdata->m_current_bmm_parent_block_hash->end(),
-            ecx_root.current_bmm_parent_block_hash_wire);
-        ecx_root.current_bmm_parent_height =
-            *txdata->m_current_bmm_parent_height;
-        ecx_root.current_bmm_parent_mtp = *txdata->m_current_bmm_parent_mtp;
-    }
-    ecx_root.bond_v2_identity_present = txdata->EcxBondV2IdentityPresence();
-    const auto copy_optional_hash = [](const auto& value, auto& output) {
-        if (value) std::copy(value->begin(), value->end(), output);
-    };
-    copy_optional_hash(txdata->m_bond_v2_configuration_hash, ecx_root.bond_v2_configuration_hash_wire);
-    copy_optional_hash(txdata->m_bond_v2_asset_id, ecx_root.bond_v2_asset_id_wire);
-    copy_optional_hash(txdata->m_bond_v2_deployment_commitment, ecx_root.bond_v2_deployment_commitment_wire);
-    copy_optional_hash(txdata->m_bond_v2_transition_cmr, ecx_root.bond_v2_transition_cmr_wire);
-    copy_optional_hash(txdata->m_bond_v2_collateral_vault_script_sha256, ecx_root.bond_v2_collateral_vault_script_sha256_wire);
-    copy_optional_hash(txdata->m_bond_v2_collateral_vault_cmr, ecx_root.bond_v2_collateral_vault_cmr_wire);
-    copy_optional_hash(txdata->m_bond_v2_insurance_reserve_script_sha256, ecx_root.bond_v2_insurance_reserve_script_sha256_wire);
-    copy_optional_hash(txdata->m_bond_v2_insurance_reserve_cmr, ecx_root.bond_v2_insurance_reserve_cmr_wire);
-    ecx_root.bond_v2_incremental_activation_identity_present =
-        txdata->EcxBondV2IncrementalActivationIdentityPresence();
-    copy_optional_hash(txdata->m_bond_v2_incremental_activation_cmr, ecx_root.bond_v2_incremental_activation_cmr_wire);
-    copy_optional_hash(txdata->m_incremental_successor_transition_cmr, ecx_root.incremental_successor_transition_cmr_wire);
-    ecx_root.bond_v2_projection_present =
-        txdata->EcxBondV2ProjectionPresence();
-    copy_optional_hash(txdata->m_prior_active_bond_inbox_root, ecx_root.prior_active_bond_inbox_root_wire);
-    if (txdata->m_prior_active_bond_inbox_count.has_value()) {
-        ecx_root.prior_active_bond_inbox_count =
-            *txdata->m_prior_active_bond_inbox_count;
-    }
-    if (txdata->m_current_sidechain_height.has_value()) {
-        ecx_root.current_sidechain_height =
-            *txdata->m_current_sidechain_height;
-    }
-    if (drivechain::haskell::ParentReplayAll<3>({[&] { return txdata->m_ecx_activation_execution_anchor_authenticated; },
-        [&] { return txdata->EcxBondV2IncrementalActivationIdentityPresence() == 1; },
-        [&] { return nIn < txTo->witness.vtxinwit.size(); }})) {
-        budget = ecx::ActivationExecutionBudget(budget, nIn,
-            txTo->witness.vtxinwit[nIn].scriptWitness.stack,
-            txdata->m_bond_v2_incremental_activation_cmr ?
-                &*txdata->m_bond_v2_incremental_activation_cmr : nullptr,
-            txdata->m_bond_v2_incremental_activation_program_id ?
-                &*txdata->m_bond_v2_incremental_activation_program_id : nullptr);
-    }
-    if (!simplicity_elements_execSimplicityWithBlockEnv(&error, 0, txdata->m_simplicity_tx_data.get(), nIn, simplicityTapEnv, txdata->m_hash_genesis_block.data(), &ecx_root, &simplicityRawBlock, 0, budget, 0, program.data(), program.size(), witness.data(), witness.size())) {
+    if (!simplicity_elements_execSimplicityWithBlockEnv(&error, 0, txdata->m_simplicity_tx_data.get(), nIn, simplicityTapEnv, txdata->m_hash_genesis_block.data(), &simplicityRawBlock, 0, budget, 0, program.data(), program.size(), witness.data(), witness.size())) {
         assert(!"simplicity_elements_execSimplicity internal error");
     }
     simplicity_elements_freeTapEnv(simplicityTapEnv);
@@ -3534,11 +3381,9 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
         // BIP341 Taproot: 32-byte non-P2SH witness v1 program (which encodes a P2C-tweaked pubkey)
         if (!(flags & SCRIPT_VERIFY_TAPROOT)) return set_success(serror);
         if (stack.size() == 0) return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
-        const valtype* tap_annex{nullptr};
         if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
             // Drop annex (this is non-standard; see IsWitnessStandard)
             const valtype& annex = SpanPopBack(stack);
-            tap_annex = &annex;
             execdata.m_annex_hash = (HashWriter{} << annex).GetSHA256();
             execdata.m_annex_present = true;
         } else {
@@ -3573,47 +3418,6 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             if ((flags & SCRIPT_VERIFY_SIMPLICITY) && (control[0] & TAPROOT_LEAF_MASK) == TAPROOT_LEAF_TAPSIMPLICITY) {
                 if (stack.size() != 2 || script.size() != 32) return set_error(serror, SCRIPT_ERR_SIMPLICITY_WRONG_LENGTH);
                 // Tapsimplicity (leaf version 0xbe)
-                static_assert(ElementsDrivechainIdentity::V11_PARAMETERIZED_CONTROLLER_PROFILE,
-                    "legacy verifier credit requires an explicit execution-budget policy");
-                if (drivechain::haskell::ParentReplayAll<2>({[&] { return tap_annex != nullptr; },
-                    [&] { return bool(flags & SCRIPT_VERIFY_USDD_SP1_ANNEX); }})) {
-                    const PrecomputedTransactionData* txdata = checker.GetPrecomputedTransactionData();
-                    switch (usdd::GateUsddSp1ProofAnnex(
-                        *tap_annex, script,
-                        drivechain::haskell::ParentReplayAll<2>({[&] { return txdata != nullptr; },
-                            [&] { return txdata->m_prior_active_bmm_parent_checkpoint.has_value(); }}))) {
-                    case usdd::Sp1ConsensusGateResult::NOT_USDD:
-                        break;
-                    case usdd::Sp1ConsensusGateResult::MALFORMED:
-                        return set_error(serror, SCRIPT_ERR_USDD_SP1_ANNEX);
-                    case usdd::Sp1ConsensusGateResult::WRONG_CONTROLLER_CMR:
-                        return set_error(
-                            serror,
-                            SCRIPT_ERR_USDD_SP1_WRONG_CONTROLLER_CMR);
-                    case usdd::Sp1ConsensusGateResult::WRONG_GUEST_PROGRAM_ID:
-                        return set_error(
-                            serror,
-                            SCRIPT_ERR_USDD_SP1_WRONG_GUEST_PROGRAM_ID);
-                    case usdd::Sp1ConsensusGateResult::MALFORMED_PUBLIC_VALUES:
-                        return set_error(
-                            serror,
-                            SCRIPT_ERR_USDD_SP1_MALFORMED_PUBLIC_VALUES);
-                    case usdd::Sp1ConsensusGateResult::DEPLOYMENT_UNCONFIGURED:
-                        return set_error(
-                            serror,
-                            SCRIPT_ERR_USDD_SP1_DEPLOYMENT_UNCONFIGURED);
-                    case usdd::Sp1ConsensusGateResult::WRONG_INBOUND_MINT_DOMAIN:
-                        return set_error(
-                            serror,
-                            SCRIPT_ERR_USDD_SP1_WRONG_INBOUND_MINT_DOMAIN);
-                    case usdd::Sp1ConsensusGateResult::BMM_CONTEXT_MISSING:
-                        return set_error(serror, SCRIPT_ERR_USDD_BMM_CONTEXT_MISSING);
-                    case usdd::Sp1ConsensusGateResult::VERIFIER_UNAVAILABLE:
-                        return set_error(serror, SCRIPT_ERR_USDD_SP1_VERIFIER_UNAVAILABLE);
-                    case usdd::Sp1ConsensusGateResult::READY_FOR_JET:
-                        break;
-                    }
-                }
                 const valtype& simplicity_program = SpanPopBack(stack);
                 const valtype& simplicity_witness = SpanPopBack(stack);
                 const int64_t budget = ::GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET;
@@ -3842,47 +3646,4 @@ extern "C" bool elements_haskell_optional_environment(uint32_t kind, uint32_t pr
 extern "C" bool elements_haskell_optional_checkpoint(bool present, const unsigned char* checkpoint)
 {
     return CallSimplicity(elements_hs_optional_checkpoint_v1,present ? 1 : 0,const_cast<unsigned char*>(checkpoint));
-}
-
-extern "C" bool elements_haskell_annex_retention(uint64_t full_size, uint64_t body_size,
-    const unsigned char* full, const unsigned char* body)
-{
-    return CallSimplicity(elements_hs_annex_retention_v1,full_size,body_size,
-        const_cast<unsigned char*>(full),const_cast<unsigned char*>(body));
-}
-
-extern "C" bool elements_haskell_parse_groth16(uint32_t kind, const unsigned char* input, size_t size,
-    unsigned char* program, unsigned char* digest, unsigned char* values, uint32_t capacity,
-    bool (*hash)(unsigned char*, const unsigned char*, size_t))
-{
-    return CallSimplicity(elements_hs_parse_groth16_v1,kind,const_cast<unsigned char*>(input),size,
-        program,digest,values,capacity,reinterpret_cast<HsFunPtr>(hash));
-}
-
-extern "C" bool elements_haskell_groth16_proof(uint32_t kind, const unsigned char* input, size_t size,
-    const unsigned char* program, const unsigned char* digest,
-    bool (*hash)(unsigned char*, const unsigned char*, size_t),
-    bool (*verify)(void*, const unsigned char*, size_t, const uint32_t*, const unsigned char*), void* context)
-{
-    return CallSimplicity(elements_hs_groth16_proof_v1,kind,const_cast<unsigned char*>(input),size,
-        const_cast<unsigned char*>(program),const_cast<unsigned char*>(digest),
-        reinterpret_cast<HsFunPtr>(hash),reinterpret_cast<HsFunPtr>(verify),context);
-}
-
-extern "C" bool elements_haskell_bond_input(uint64_t index, uint64_t current, uint32_t flags,
-    const unsigned char* actual, const unsigned char* expected)
-{
-    return CallSimplicity(elements_hs_bond_input_v1,index,current,flags,const_cast<unsigned char*>(actual),
-        const_cast<unsigned char*>(expected));
-}
-
-extern "C" bool elements_haskell_verify_jet(
-    uint32_t (*version)(),
-    uint32_t (*verify)(uint32_t, const unsigned char*, size_t, const unsigned char*, size_t, const unsigned char*, size_t),
-    bool (*reader)(const void*, const unsigned char**, size_t*),
-    const void* context, const unsigned char* program, const unsigned char* digest)
-{
-    return CallSimplicity<0>(elements_hs_verify_jet_v1,reinterpret_cast<HsFunPtr>(version), reinterpret_cast<HsFunPtr>(verify),
-        reinterpret_cast<HsFunPtr>(reader), const_cast<void*>(context), const_cast<unsigned char*>(program),
-        const_cast<unsigned char*>(digest));
 }

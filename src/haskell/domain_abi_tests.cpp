@@ -20,8 +20,8 @@ int main()
 {
     try {
         elements_hs_runtime_init();
-        const auto& domains = elements_hs_families_v2;
-        Require(domains.size() == 6);
+        const auto& domains = elements_hs_families_v3;
+        Require(domains.size() == 4);
         constexpr uint64_t CANARY{0x123456789abcdef0};
         uint32_t handlers{0};
         for (const auto& [domain, sections] : domains) {
@@ -45,18 +45,15 @@ int main()
             Require(result == CANARY);
         }
         uint64_t result{CANARY};
-        for (uint64_t f : {uint64_t{0}, uint64_t{1}, uint64_t{UINT32_MAX}, UINT64_MAX})
-        for (uint64_t fc : {uint64_t{0}, uint64_t{1}, uint64_t{UINT32_MAX}, UINT64_MAX})
-        for (uint64_t d : {uint64_t{0}, uint64_t{1}, uint64_t{UINT32_MAX}, UINT64_MAX})
-        for (uint64_t dc : {uint64_t{0}, uint64_t{1}, uint64_t{UINT32_MAX}, UINT64_MAX}) {
-            uint64_t fields[]{f,fc,d,dc}, output[]{CANARY,91,92,CANARY};
-            const bool valid = fc <= f && dc <= d;
-            Require(elements_hs_exchange_inbox_v1(5,4,fields,output+1) == (valid ? 0 : 1));
-            Require(output[0] == CANARY && output[3] == CANARY);
-            Require(output[1] == (valid ? f-fc : 91) && output[2] == (valid ? d-dc : 92));
-            Require(elements_hs_exchange_inbox_v1(5,3,fields,output+1) == -1);
-            Require(elements_hs_exchange_inbox_v1(5,4,nullptr,output+1) == -1);
-            Require(elements_hs_exchange_inbox_v1(5,4,fields,nullptr) == -1);
+        for (uint32_t version : {0U, 1U, 1U << 20, 1U << 30, 1U << 31, UINT32_MAX}) {
+            constexpr uint32_t canary{0xabcdef01};
+            uint32_t output[]{canary,91,92,canary};
+            Require(elements_hs_bmm_header_layout_v1(version,16,2,output+1) == 0);
+            Require(output[0] == canary && output[3] == canary);
+            Require(output[1] == version);
+            Require((output[2] & ~0x43U) == 0);
+            Require(elements_hs_bmm_header_layout_v1(version,16,1,output+1) == -1);
+            Require(elements_hs_bmm_header_layout_v1(version,16,2,nullptr) == -1);
         }
         uint64_t depth[]{100,105,6};
         Require(Raw(elements_hs_deposit_depth_v1,3,depth,0,nullptr,0,nullptr,&result) == 0 && result == 1);
@@ -64,8 +61,6 @@ int main()
         result = CANARY;
         Require(Raw(elements_hs_deposit_depth_v1,3,depth,0,nullptr,0,nullptr,&result) == -2 && result == CANARY);
         Require(Raw(elements_hs_deposit_depth_v1,3,nullptr,0,nullptr,0,nullptr,&result) == -1 && result == CANARY);
-        uint64_t envelope[]{0,256,0};
-        Require(Raw(elements_hs_exchange_envelope_header_v1,3,envelope,0,nullptr,0,nullptr,&result) == -2 && result == CANARY);
         uint64_t state[]{0,0xffffffff};
         Require(Raw(elements_hs_bmm_state_flow_v1,2,state,0,nullptr,0,nullptr,&result) == -2 && result == CANARY);
         // Canonical sign extension, including INT64_MIN, survives the new transport.

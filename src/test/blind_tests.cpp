@@ -37,37 +37,6 @@ BOOST_FIXTURE_TEST_SUITE(blind_tests, ElementsSetup)
 // Opt-in, stdin-only differential harness. Never print input transactions or
 // private wallet data. Each line is one consensus-serialized transaction
 // followed by a consensus-serialized vector of spent outputs.
-BOOST_AUTO_TEST_CASE(shared_amount_kernel_stdin)
-{
-    if (std::getenv("ECX_AMOUNT_KERNEL_STDIN") == nullptr) return;
-    BOOST_REQUIRE(InitRangeproofCache(DEFAULT_VALIDATION_CACHE_BYTES / 4));
-    BOOST_REQUIRE(InitSurjectionproofCache(DEFAULT_VALIDATION_CACHE_BYTES / 4));
-    std::string line;
-    size_t cases{0};
-    while (std::getline(std::cin, line)) {
-        BOOST_REQUIRE(line.size() <= 2'000'000);
-        BOOST_REQUIRE(IsHex(line));
-        DataStream stream{ParseHex(line)};
-        CMutableTransaction tx;
-        std::vector<CTxOut> previous;
-        stream >> TX_WITH_WITNESS(tx) >> previous;
-        BOOST_REQUIRE(stream.empty());
-        BOOST_REQUIRE_EQUAL(previous.size(), tx.vin.size());
-        if (std::getenv("ECX_DIAGNOSTIC_WITNESS_SHAPE") != nullptr) {
-            // Amount-only diagnostic for unsigned issuance; no signatures,
-            // no production validation change, no claim of wire acceptance.
-            tx.witness.vtxinwit.resize(tx.vin.size());
-        }
-        if (std::getenv("ECX_CREATION_ONLY") == nullptr) {
-            std::cout << "AMOUNT_KERNEL " << cases << " "
-                      << VerifyAmounts(previous, CTransaction(tx), nullptr, false)
-                      << std::endl;
-        }
-        ++cases;
-        std::cout << "EXPLICIT_CREATIONS " << Consensus::HasOnlyExplicitCreations(CTransaction(tx)) << std::endl;
-    }
-    BOOST_REQUIRE(cases > 0);
-}
 
 // TODO: Make deterministic blinding wrapper function, test caching more exactly
 
@@ -504,15 +473,12 @@ BOOST_AUTO_TEST_CASE(spendable_zero_value_blinding_fails_without_abort)
 
 BOOST_AUTO_TEST_CASE(confidential_reissuance_authority_round_trip)
 {
-    // Model the USDD singleton authority without a wallet, datadir, or live
+    // Model a reissuance authority without a wallet, datadir, or live
     // UTXO. The authority's asset is a blinded reissuance-token generator.
     // Reissuance reveals the current public ABF, mints the derived asset, and
     // rotates the successor to a distinct generator with a confidential value
     // commitment that preserves balance.
-    // Frozen prototype issuance entropy. Keeping this tied to the deployed
-    // asset/token pair makes the native secp256k1-zkp commitments useful as
-    // exact cross-language deployment vectors rather than merely checking an
-    // unrelated internally consistent issuance.
+    // Fixed issuance entropy provides exact secp256k1-zkp regression vectors.
     const uint256 entropy = uint256S(
         "0xf108d6c0265fd2bdc6b45277e3515804"
         "ea55892e6f342765b2df25a7023efb78");

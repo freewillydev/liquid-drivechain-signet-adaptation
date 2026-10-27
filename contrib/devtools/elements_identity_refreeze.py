@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""Independently audit the Elements Drivechain V11 / live Alpha identity.
-
-The default Alpha mode binds the exact pre-activation parent checkpoint and
-independently serializes its bootstrap state. Historical genesis-checkpoint
-derivations remain separate explicit modes; they cannot silently select Alpha.
-Future M1/M2 block hashes are neither inputs nor accepted arguments, preventing
-a proposal self-cycle. No identity calculation activates a catalogue or node.
-
-This is an independent implementation of the exact CHashWriter and genesis
-serialization used by ``CElementsDrivechainParams``.  Release review must
-compare its result with the C++ implementation before replacing any constants.
-"""
+"""Independently derive the fresh native-only child identity. Never activates a node."""
 
 from __future__ import annotations
 
@@ -27,9 +16,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 IDENTITY_HEADER = ROOT / "src" / "elements_drivechain_identity.h"
-FINAL_CONTROLLER_CMR = (
-    "a3be184f5fbff99b3bb961b26505519cc1cd44fec331057a9ac0ee125b16b0a1"
-)
 
 
 def sha256(data: bytes) -> bytes:
@@ -273,93 +259,21 @@ def add_common_protocol_fields(
     writer.string(header.string("GENESIS_STYLE"))
     writer.vector(bytes([header.integer("SIGNBLOCK_CHALLENGE_OPCODE")]))
     writer.u32(header.integer("MAX_BLOCK_SIGNATURE_SIZE"))
-    writer.boolean(True)  # enable_usdd_sp1_annex
     writer.boolean(True)  # drivechain_m6_withdrawal_validation
     writer.u32(annex_feature_version)
 
 
-def add_proof_bundle_v1(
-    writer: HashWriter, header: Header, *, parameterized_v11: bool = False
-) -> None:
-    writer.boolean(header.boolean("USDD_SP1_VERIFIER_ACTIVATION_CONFIGURED"))
-    writer.u32(header.integer("USDD_SP1_PROOF_BUNDLE_VERSION"))
-    writer.u32(header.integer("REQUIRED_USDD_SP1_VERIFIER_ABI_VERSION"))
-    writer.u32(header.integer("REQUIRED_USDD_SP1_VERIFIER_SEMANTIC_IDENTITY_VERSION"))
-    writer.vector(header.array("USDD_SP1_VERIFIER_SEMANTIC_IDENTITY"))
-    writer.string(header.string("USDD_SP1_VERSION"))
-    writer.string(header.string("USDD_SP1_GIT_COMMIT"))
-    writer.u32(header.integer("USDD_SP1_COMPRESSED_CIRCUIT_VERSION"))
-    writer.u32(header.integer("USDD_SP1_COMPRESSED_CODEC_VERSION"))
-    writer.string(header.string("USDD_SP1_PROOF_MODE"))
-    writer.string(header.string("USDD_SP1_PROOF_CODEC"))
-    writer.string(header.string("USDD_SP1_PUBLIC_VALUES_DIGEST_MODE"))
-    writer.vector(header.array("USDD_SP1_RECURSION_CONSTANTS_COMMITMENT"))
-    writer.u8(header.integer("USDD_SP1_ANNEX_ENVELOPE_VERSION"))
-    writer.u8(header.integer("USDD_SP1_ANNEX_PROOF_SYSTEM"))
-    writer.u8(header.integer("USDD_SP1_ANNEX_STATEMENT_KIND"))
-    writer.u8(header.integer("USDD_SP1_ANNEX_DIGEST_MODE"))
-    writer.u32(header.integer("USDD_SP1_ANNEX_MAX_BYTES"))
-    writer.u32(header.integer("USDD_SP1_PUBLIC_VALUES_MAX_BYTES"))
-    writer.u32(header.integer("USDD_SP1_DEPLOYMENT_BINDING_VERSION"))
-    writer.vector(header.array("USDD_SP1_INBOUND_MINT_DOMAIN_ID"))
-    writer.vector(header.array("USDD_SP1_GUEST_PROGRAM_ID"))
-    writer.u64(header.integer("USDD_SP1_GUEST_ELF_BYTES"))
-    writer.vector(header.array("USDD_SP1_GUEST_ELF_SHA256"))
-    if parameterized_v11:
-        writer.vector(header.array("PARAMETERIZED_CONTROLLER_PROFILE_ID"))
-    else:
-        writer.vector(header.array("USDD_SP1_CONTROLLER_CMR"))
-        writer.u64(header.integer("USDD_SP1_CONTROLLER_PROGRAM_BYTES"))
-        writer.vector(header.array("USDD_SP1_CONTROLLER_PROGRAM_SHA256"))
-        writer.vector(header.array("USDD_SP1_CONTROLLER_SOURCE_SHA256"))
-
+def add_native_rules(writer: HashWriter, header: Header) -> None:
     writer.string("current_bmm_parent_mtp")
     writer.u16(header.integer("CURRENT_BMM_PARENT_MTP_JET_CATALOGUE_ITEM"))
     writer.vector(header.array("CURRENT_BMM_PARENT_MTP_JET_ENCODING"))
     writer.vector(header.array("CURRENT_BMM_PARENT_MTP_JET_CMR"))
     writer.u64(header.integer("CURRENT_BMM_PARENT_MTP_JET_COST_MWU"))
-
-    writer.string("verify_sp1_compressed_sha256")
-    writer.u16(header.integer("VERIFY_SP1_COMPRESSED_SHA256_JET_CATALOGUE_ITEM"))
-    writer.vector(header.array("VERIFY_SP1_COMPRESSED_SHA256_JET_ENCODING"))
-    writer.vector(header.array("VERIFY_SP1_COMPRESSED_SHA256_JET_CMR"))
-    writer.u64(header.integer("VERIFY_SP1_COMPRESSED_SHA256_JET_COST_MWU"))
-
-
-def add_resource_schedule_v1(writer: HashWriter, header: Header) -> None:
-    """Bind every consensus/policy proof-lane limit into V7."""
-    writer.string("USDD_SP1_RESOURCE_SCHEDULE_V1")
     writer.u32(header.integer("CONSENSUS_MAX_BLOCK_SERIALIZED_SIZE"))
     writer.u32(header.integer("CONSENSUS_MAX_BLOCK_WEIGHT"))
-    writer.u32(header.integer("USDD_SP1_ANNEXES_PER_BLOCK"))
-    writer.u32(header.integer("USDD_SP1_PROOF_TX_MAX_WEIGHT"))
-    writer.u32(header.integer("USDD_SP1_ANNEX_MAX_BYTES"))
-    writer.u32(header.integer("USDD_SP1_PUBLIC_VALUES_MAX_BYTES"))
-    writer.u32(header.integer("USDD_SP1_MEASURED_RAW_PROOF_BYTES"))
-    writer.u32(header.integer("USDD_SP1_MEASURED_PUBLIC_VALUES_BYTES"))
-    writer.u32(header.integer("USDD_SP1_MEASURED_ANNEX_BYTES"))
-    writer.u32(header.integer("USDD_SP1_MEASURED_ANNEX_WEIGHT"))
-    writer.u32(header.integer("USDD_SP1_MAX_ANNEX_WEIGHT"))
-    writer.u32(header.integer("USDD_SP1_MAX_NON_ANNEX_TX_WEIGHT"))
-
-
-def add_withdrawal_fields(writer: HashWriter, header: Header) -> None:
     writer.string(header.string("BIP300301_ENFORCER_REVISION"))
     writer.string(header.string("BIP300301_LOCAL_RULE_DOMAIN"))
     writer.string(header.string("BIP300301_LOCAL_RULE_ID"))
-    writer.u32(header.integer("WITHDRAWAL_ACCUMULATOR_VERSION"))
-    writer.u32(header.integer("WITHDRAWAL_BIP301_CHECKPOINT_VERSION"))
-    writer.string(header.string("WITHDRAWAL_BIP301_CHECKPOINT_DOMAIN"))
-    writer.vector(header.array("WITHDRAWAL_MAGIC"))
-    writer.u8(header.integer("WITHDRAWAL_SCRIPT_PUSH_SIZE"))
-    writer.u32(header.integer("WITHDRAWAL_PROTOCOL_VERSION"))
-    writer.u8(header.integer("WITHDRAWAL_LEAF_PREFIX"))
-    writer.u8(header.integer("WITHDRAWAL_NODE_PREFIX"))
-    writer.u8(header.integer("WITHDRAWAL_TREE_DEPTH"))
-    writer.u64(header.integer("USDD_UNITS_PER_USDT_MICRO"))
-    writer.u64(header.integer("MAX_WITHDRAWAL_USDT_MICRO"))
-    writer.vector(header.array("WITHDRAWAL_BURN_ID_DOMAIN"))
-    writer.vector(header.array("WITHDRAWAL_LEAF_DOMAIN"))
 
 
 def add_deployment_fields(writer: HashWriter, header: Header) -> None:
@@ -428,75 +342,7 @@ def proposal(
     return description, hash256(description)
 
 
-def identity_commitment_v4(
-    header: Header,
-    manifest_digest: bytes,
-    proposal_description: bytes,
-    proposal_digest: bytes,
-) -> bytes:
-    writer = HashWriter().string("ELEMENTS_DRIVECHAIN_NETWORK_V4")
-    add_common_protocol_fields(
-        writer,
-        header,
-        p2p_domain=header.string("P2P_MAGIC_DOMAIN"),
-        annex_feature_version=header.integer("ANNEX_FEATURE_VERSION"),
-        include_network_namespaces=False,
-    )
-    add_withdrawal_fields(writer, header)
-    add_deployment_fields(writer, header)
-    writer.vector(commit_to_arguments(header))
-    add_parent_identity_fields(writer, header)
-    writer.u32(header.integer("PEGIN_MIN_DEPTH"))
-    writer.raw(manifest_digest)
-    writer.vector(proposal_description)
-    writer.raw(proposal_digest)
-    add_historical_parent_fields(writer, header)
-    writer.u16(header.integer("UNUSED_PROPOSAL_MAX_AGE"))
-    writer.u16(header.integer("UNUSED_ACTIVATION_THRESHOLD"))
-    writer.u16(header.integer("USED_PROPOSAL_MAX_AGE"))
-    writer.u16(header.integer("USED_ACTIVATION_THRESHOLD"))
-    writer.u16(header.integer("WITHDRAWAL_BUNDLE_MAX_AGE"))
-    writer.u16(header.integer("WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD"))
-    writer.u32(header.integer("PARENT_REPLAY_VERSION"))
-    return writer.digest()
-
-
-def identity_commitment_v7(
-    header: Header,
-    manifest_digest: bytes,
-    proposal_description: bytes,
-    proposal_digest: bytes,
-) -> bytes:
-    writer = HashWriter().string("ELEMENTS_DRIVECHAIN_NETWORK_V8")
-    add_common_protocol_fields(
-        writer,
-        header,
-        p2p_domain=header.string("P2P_MAGIC_DOMAIN"),
-        annex_feature_version=header.integer("ANNEX_FEATURE_VERSION"),
-        include_network_namespaces=True,
-    )
-    add_proof_bundle_v1(writer, header)
-    add_resource_schedule_v1(writer, header)
-    add_withdrawal_fields(writer, header)
-    add_deployment_fields(writer, header)
-    writer.vector(commit_to_arguments(header))
-    add_parent_identity_fields(writer, header)
-    writer.u32(header.integer("PEGIN_MIN_DEPTH"))
-    writer.raw(manifest_digest)
-    writer.vector(proposal_description)
-    writer.raw(proposal_digest)
-    add_historical_parent_fields(writer, header)
-    writer.u16(header.integer("UNUSED_PROPOSAL_MAX_AGE"))
-    writer.u16(header.integer("UNUSED_ACTIVATION_THRESHOLD"))
-    writer.u16(header.integer("USED_PROPOSAL_MAX_AGE"))
-    writer.u16(header.integer("USED_ACTIVATION_THRESHOLD"))
-    writer.u16(header.integer("WITHDRAWAL_BUNDLE_MAX_AGE"))
-    writer.u16(header.integer("WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD"))
-    writer.u32(header.integer("PARENT_REPLAY_VERSION"))
-    return writer.digest()
-
-
-def identity_commitment_v11(
+def identity_commitment(
     header: Header,
     manifest_digest: bytes,
     proposal_description: bytes,
@@ -504,7 +350,7 @@ def identity_commitment_v11(
     *,
     include_bootstrap: bool = False,
 ) -> bytes:
-    writer = HashWriter().string("ELEMENTS_DRIVECHAIN_NETWORK_V11")
+    writer = HashWriter().string("ELEMENTS_DRIVECHAIN_NETWORK_V13")
     add_common_protocol_fields(
         writer,
         header,
@@ -512,9 +358,7 @@ def identity_commitment_v11(
         annex_feature_version=header.integer("ANNEX_FEATURE_VERSION"),
         include_network_namespaces=True,
     )
-    add_proof_bundle_v1(writer, header, parameterized_v11=True)
-    add_resource_schedule_v1(writer, header)
-    add_withdrawal_fields(writer, header)
+    add_native_rules(writer, header)
     add_deployment_fields(writer, header)
     writer.vector(commit_to_arguments(header))
     add_parent_identity_fields(writer, header)
@@ -652,232 +496,7 @@ def genesis(identity_digest: bytes, header: Header) -> tuple[bytes, bytes]:
     return merkle_root, hash256(bytes(block_header))
 
 
-def calculate_v4(header: Header) -> IdentityResult:
-    manifest = HashWriter().string("ELEMENTS_DRIVECHAIN_PROTOCOL_MANIFEST_V4")
-    add_common_protocol_fields(
-        manifest,
-        header,
-        p2p_domain=header.string("P2P_MAGIC_DOMAIN"),
-        annex_feature_version=header.integer("ANNEX_FEATURE_VERSION"),
-        include_network_namespaces=False,
-    )
-    add_withdrawal_fields(manifest, header)
-    add_deployment_fields(manifest, header)
-    add_parent_identity_fields(manifest, header)
-    add_historical_parent_fields(manifest, header)
-    add_replay_fields(manifest, header)
-    manifest_digest = manifest.digest()
-    description, proposal_digest = proposal(
-        manifest_digest,
-        source_domain="ELEMENTS_DRIVECHAIN_PROTOCOL_SOURCE_V4",
-        text=(
-            "Elements Drivechain v1; native USDD; replay v4; one M6 per parent block; "
-            "withdrawal accumulator v1; Simplicity active; slot 24"
-        ),
-    )
-    identity_digest = identity_commitment_v4(
-        header, manifest_digest, description, proposal_digest
-    )
-    pegged = derive_pegged_asset(identity_digest, header.string("PARENT_GENESIS"))
-    merkle, genesis_digest = genesis(identity_digest, header)
-    return IdentityResult(
-        mode="audit-current-v4",
-        protocol_manifest_hash=display_hash(manifest_digest),
-        proposal_description_hex=description.hex(),
-        proposal_hash=display_hash(proposal_digest),
-        identity_commitment=display_hash(identity_digest),
-        pegged_asset=display_hash(pegged),
-        genesis_merkle_root=display_hash(merkle),
-        genesis_hash=display_hash(genesis_digest),
-        p2p_magic_domain=header.string("P2P_MAGIC_DOMAIN"),
-        p2p_message_start=header.array("P2P_MESSAGE_START").hex(),
-        data_dir=header.string("DATA_DIR"),
-        parent_replay_version=header.integer("PARENT_REPLAY_VERSION"),
-        annex_feature_version=header.integer("ANNEX_FEATURE_VERSION"),
-        parent_activation_required=False,
-        future_parent_milestones_committed=False,
-        m1_payload_hex="",
-        m2_payload_hex="",
-        used_slot_m2_votes_required=0,
-        used_slot_proposal_max_age=header.integer("USED_PROPOSAL_MAX_AGE"),
-    )
-
-
-def calculate_v7(header: Header) -> IdentityResult:
-    if not header.boolean("USDD_SP1_VERIFIER_ACTIVATION_CONFIGURED"):
-        raise ValueError("refusing V7: proof activation is false")
-    if header.array("USDD_SP1_INBOUND_MINT_DOMAIN_ID") != bytes(32):
-        raise ValueError("refusing V7: generic binding has a global domain")
-    if header.integer("USDD_SP1_DEPLOYMENT_BINDING_VERSION") != 2:
-        raise ValueError("refusing V7: generic controller binding version is not 2")
-    if header.array("USDD_SP1_CONTROLLER_CMR").hex() != FINAL_CONTROLLER_CMR:
-        raise ValueError("refusing candidate: final controller CMR is absent")
-    if not header.array("USDD_SP1_GUEST_PROGRAM_ID").hex() == (
-        "4f0511103dab14b61dd5b1403d077ba10d28a89a06dbb54d43e9683542c1df08"
-    ):
-        raise ValueError("refusing candidate: final guest program ID is absent")
-    if not header.array("USDD_SP1_VERIFIER_SEMANTIC_IDENTITY").hex() == (
-        "bcc6da9b30af2591d948533493291bd5543da448a3270ba99b1de0ade64e1711"
-    ):
-        raise ValueError("refusing candidate: final verifier semantic identity is absent")
-    if not header.array("USDD_SP1_RECURSION_CONSTANTS_COMMITMENT").hex() == (
-        "0f4d8d0495d43e3709803b600674e1e948a5cdcb16d1663945ad838de5efadba"
-    ):
-        raise ValueError("refusing candidate: recursion commitment is absent")
-    if header.string("P2P_MAGIC_DOMAIN") != "ecash-elements-drivechain-p2p-v9":
-        raise ValueError("refusing V8: incompatible P2P namespace is absent")
-    if header.string("DATA_DIR") != "elements-v8":
-        raise ValueError("refusing V8: incompatible datadir is absent")
-    expected_resources = {
-        "CONSENSUS_MAX_BLOCK_SERIALIZED_SIZE": 6_000_000,
-        "CONSENSUS_MAX_BLOCK_WEIGHT": 6_000_000,
-        "USDD_SP1_ANNEXES_PER_BLOCK": 1,
-        "USDD_SP1_PROOF_TX_MAX_WEIGHT": 1_500_000,
-        "USDD_SP1_ANNEX_MAX_BYTES": 1_310_720,
-        "USDD_SP1_MEASURED_RAW_PROOF_BYTES": 1_272_546,
-        "USDD_SP1_MEASURED_PUBLIC_VALUES_BYTES": 1_001,
-        "USDD_SP1_MEASURED_ANNEX_BYTES": 1_273_602,
-        "USDD_SP1_MEASURED_ANNEX_WEIGHT": 1_273_607,
-        "USDD_SP1_MAX_ANNEX_WEIGHT": 1_310_725,
-        "USDD_SP1_MAX_NON_ANNEX_TX_WEIGHT": 189_275,
-    }
-    for name, expected in expected_resources.items():
-        if header.integer(name) != expected:
-            raise ValueError(f"refusing V7: unexpected {name}")
-    if header.integer("USDD_SP1_PROOF_TX_MAX_WEIGHT") * 4 > header.integer(
-        "CONSENSUS_MAX_BLOCK_WEIGHT"
-    ):
-        raise ValueError("refusing V7: proof transaction exceeds 25% of block")
-
-    manifest = HashWriter().string("ELEMENTS_DRIVECHAIN_PROTOCOL_MANIFEST_V8")
-    add_common_protocol_fields(
-        manifest,
-        header,
-        p2p_domain=header.string("P2P_MAGIC_DOMAIN"),
-        annex_feature_version=header.integer("ANNEX_FEATURE_VERSION"),
-        include_network_namespaces=True,
-    )
-    add_proof_bundle_v1(manifest, header)
-    add_resource_schedule_v1(manifest, header)
-    add_withdrawal_fields(manifest, header)
-    add_deployment_fields(manifest, header)
-    add_parent_identity_fields(manifest, header)
-    add_historical_parent_fields(manifest, header)
-    add_replay_fields(manifest, header)
-    manifest_digest = manifest.digest()
-    description, proposal_digest = proposal(
-        manifest_digest,
-        source_domain="ELEMENTS_DRIVECHAIN_PROTOCOL_SOURCE_V8",
-        text=(
-            "Elements Drivechain v5; controller-bound SP1 verification active; replay v4; "
-            "annex v2; one M6 per parent block; withdrawal accumulator v1; "
-            "preactivation checkpoint v1; BIP301 checkpoint v1; Simplicity active; slot 24"
-        ),
-    )
-    identity_digest = identity_commitment_v7(
-        header, manifest_digest, description, proposal_digest
-    )
-    pegged = derive_pegged_asset(identity_digest, header.string("PARENT_GENESIS"))
-    merkle, genesis_digest = genesis(identity_digest, header)
-    return IdentityResult(
-        mode="candidate-v8-preactivation",
-        protocol_manifest_hash=display_hash(manifest_digest),
-        proposal_description_hex=description.hex(),
-        proposal_hash=display_hash(proposal_digest),
-        identity_commitment=display_hash(identity_digest),
-        pegged_asset=display_hash(pegged),
-        genesis_merkle_root=display_hash(merkle),
-        genesis_hash=display_hash(genesis_digest),
-        p2p_magic_domain=header.string("P2P_MAGIC_DOMAIN"),
-        p2p_message_start=hash256(
-            header.string("P2P_MAGIC_DOMAIN").encode("ascii")
-        )[:4].hex(),
-        data_dir=header.string("DATA_DIR"),
-        parent_replay_version=header.integer("PARENT_REPLAY_VERSION"),
-        annex_feature_version=header.integer("ANNEX_FEATURE_VERSION"),
-        parent_activation_required=True,
-        future_parent_milestones_committed=False,
-        m1_payload_hex=(
-            bytes.fromhex("d5e0c4af")
-            + bytes([header.integer("SIDECHAIN_SLOT")])
-            + description
-        ).hex(),
-        m2_payload_hex=(
-            bytes.fromhex("d6e1c5df")
-            + bytes([header.integer("SIDECHAIN_SLOT")])
-            + proposal_digest
-        ).hex(),
-        used_slot_m2_votes_required=(
-            header.integer("USED_ACTIVATION_THRESHOLD") + 1
-        ),
-        used_slot_proposal_max_age=header.integer("USED_PROPOSAL_MAX_AGE"),
-    )
-
-
-# These are the already-deployed Alpha checkpoint, not values for a new network.
-ALPHA_CHECKPOINT = {
-    "PARENT_GENESIS": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
-    "PARENT_CHECKPOINT_HASH": "000000000000000002838070eb876cd37738a069528efc82d946fbd25e763152",
-    "PARENT_CHECKPOINT_CHAINWORK": "0000000000000000000000000000000000000001418d991091e5b78fab4ab500",
-    "PARENT_CHECKPOINT_BOOTSTRAP_STATE_COMMITMENT": "aec8d4df22e27179419118f43b12c9e5a900fa74fdb9ae1683a2c382e6c913b7",
-}
-
-
-def alpha_bootstrap_commitment(header: Header, bootstrap: Header) -> str:
-    """Reproduce the C++ authenticated global-slot bootstrap serialization."""
-    if not bootstrap.boolean("ENABLED"):
-        raise ValueError("Alpha bootstrap must be enabled")
-    match = re.search(r"SLOTS\s*\{\{(.*?)\}\};", bootstrap.text, re.DOTALL)
-    if not match:
-        raise ValueError("Alpha bootstrap slot table is absent")
-    record = re.compile(
-        r'Slot\{\s*(\d+),\s*"([0-9a-f]{64})",\s*"([0-9a-f]{64})",\s*(\d+),\s*(\d+)\s*\}'
-    )
-    slots = record.findall(match.group(1))
-    if re.sub(r"[\s,]", "", record.sub("", match.group(1))) or not slots:
-        raise ValueError("Alpha bootstrap slot table is malformed")
-    writer = HashWriter().string("ELEMENTS_ALPHANET_PARENT_REPLAY_BOOTSTRAP_V1")
-    writer.u32(header.integer("PARENT_CHECKPOINT_HEIGHT"))
-    writer.uint256(header.string("PARENT_CHECKPOINT_HASH"))
-    writer.uint256(header.string("PARENT_CHECKPOINT_CHAINWORK"))
-    writer.u32(len(slots))
-    previous = -1
-    for slot_string, active, ctip, vout_string, value_string in slots:
-        slot, vout, value = int(slot_string), int(vout_string), int(value_string)
-        has_ctip = ctip != "00" * 32
-        if not previous < slot <= 255 or slot == header.integer("SIDECHAIN_SLOT") or active == "00" * 32:
-            raise ValueError("Alpha bootstrap slots must be unique, ordered, active and foreign")
-        if not has_ctip and (vout != 0xFFFFFFFF or value != 0):
-            raise ValueError("Alpha bootstrap absent CTIP is malformed")
-        writer.u8(slot).uint256(active).boolean(has_ctip)
-        if has_ctip:
-            writer.uint256(ctip).u32(vout).i64(value)
-        previous = slot
-    return display_hash(writer.digest())
-
-
-def calculate_v11(header: Header) -> IdentityResult:
-    """Historical genesis-checkpoint V11; never silently selects Alpha."""
-    return _calculate_v11(header, alphanet=False)
-
-
-def calculate_alphanet_v11(header: Header, bootstrap: Header | None = None) -> IdentityResult:
-    """Live Alpha, including its exact non-genesis parent bootstrap."""
-    if bootstrap is None:
-        bootstrap = Header(header.path.parent / "elements_drivechain_bootstrap.h", header.generated_include_dir)
-    for name, value in ALPHA_CHECKPOINT.items():
-        if header.string(name) != value:
-            raise ValueError(f"refusing Alpha: wrong {name}")
-    if header.integer("PARENT_CHECKPOINT_HEIGHT") != 995347 or header.integer("SIDECHAIN_SLOT") != 24:
-        raise ValueError("refusing Alpha: wrong checkpoint height or slot")
-    if alpha_bootstrap_commitment(header, bootstrap) != ALPHA_CHECKPOINT["PARENT_CHECKPOINT_BOOTSTRAP_STATE_COMMITMENT"]:
-        raise ValueError("refusing Alpha: bootstrap state commitment mismatch")
-    return _calculate_v11(header, alphanet=True)
-
-
-BETANET_FORK_HEIGHT = 967680
 BETANET_BOOTSTRAP_DOMAIN = "ELEMENTS_BETANET_PARENT_REPLAY_BOOTSTRAP_V1"
-BETANET_LOCAL_RULE_DOMAIN = "ELEMENTS_SLOT24_SEQUENTIAL_M6_REPROPOSAL_V1"
 
 
 def betanet_bootstrap_commitment(header: Header) -> str:
@@ -890,55 +509,15 @@ def betanet_bootstrap_commitment(header: Header) -> str:
     return display_hash(writer.digest())
 
 
-def calculate_betanet_v11(header: Header) -> IdentityResult:
-    """Candidate only: the checkpoint must separately pass authenticated replay."""
-    expected = {
-        "SIDECHAIN_SLOT": 24,
-        "PARENT_CHECKPOINT_HEIGHT": BETANET_FORK_HEIGHT - 1,
-        "PARENT_REPLAY_VERSION": 5,
-        "UNUSED_PROPOSAL_MAX_AGE": 2016,
-        "UNUSED_ACTIVATION_THRESHOLD": 1008,
-        "USED_PROPOSAL_MAX_AGE": 26300,
-        "USED_ACTIVATION_THRESHOLD": 13150,
-        "WITHDRAWAL_BUNDLE_MAX_AGE": 26300,
-        "WITHDRAWAL_BUNDLE_INCLUSION_THRESHOLD": 13150,
-    }
-    for name, value in expected.items():
-        if header.integer(name) != value:
-            raise ValueError(f"refusing Betanet: wrong {name}")
-    if (header.string("BIP300301_LOCAL_RULE_DOMAIN") != BETANET_LOCAL_RULE_DOMAIN
-            or header.string("BIP300301_LOCAL_RULE_ID") != sha256(
-                BETANET_LOCAL_RULE_DOMAIN.encode("ascii")).hex()):
-        raise ValueError("refusing Betanet: local replay rule commitment mismatch")
-    if header.string("PARENT_GENESIS") != ALPHA_CHECKPOINT["PARENT_GENESIS"]:
-        raise ValueError("refusing Betanet: wrong parent genesis")
-    if header.string("PARENT_CHECKPOINT_HASH") in (
-        "00" * 32, header.string("PARENT_GENESIS"), ALPHA_CHECKPOINT["PARENT_CHECKPOINT_HASH"]
-    ):
-        raise ValueError("refusing Betanet: absent or historical checkpoint")
+def calculate_fresh(header: Header) -> IdentityResult:
+    if header.boolean("BETANET_EXISTING_ELEMENTS_TEST_PROFILE"):
+        raise ValueError("fresh chain cannot reuse the live Betanet proposal")
+    if header.string("DATA_DIR") != "elements-native-v1":
+        raise ValueError("fresh child data directory is required")
+    if header.string("P2P_MAGIC_DOMAIN") != "ecash-elements-native-slot24-p2p-v1":
+        raise ValueError("fresh child P2P namespace is required")
     if header.string("PARENT_CHECKPOINT_BOOTSTRAP_STATE_COMMITMENT") != betanet_bootstrap_commitment(header):
-        raise ValueError("refusing Betanet: empty bootstrap commitment mismatch")
-    return _calculate_v11(header, alphanet=False, betanet=True)
-
-
-def _calculate_v11(header: Header, *, alphanet: bool, betanet: bool = False) -> IdentityResult:
-    if alphanet and betanet:
-        raise ValueError("network identity modes are mutually exclusive")
-    existing_elements_test = ("BETANET_EXISTING_ELEMENTS_TEST_PROFILE" in header.text
-                     and header.boolean("BETANET_EXISTING_ELEMENTS_TEST_PROFILE"))
-    if existing_elements_test and not betanet:
-        raise ValueError("Elements test profile requires Betanet")
-    profile_id = header.array("PARAMETERIZED_CONTROLLER_PROFILE_ID")
-    if profile_id.hex() != "6fd5a5e55769320cc1c6a497644d0bc7a642eed8442ab1703af304cfac253d25":
-        raise ValueError("refusing V11: corrected parameterized profile is absent")
-    if profile_id == bytes(32):
-        raise ValueError("refusing V11: zero parameterized profile")
-    p2p_domain = "ecash-elements-drivechain-betanet-slot24-p2p-v1" if betanet else "ecash-elements-drivechain-p2p-v11"
-    data_dir = "elements-betanet-slot24-v1" if betanet else "elements-v11"
-    if header.string("P2P_MAGIC_DOMAIN") != p2p_domain:
-        raise ValueError("refusing V11: incompatible P2P namespace is absent")
-    if header.string("DATA_DIR") != data_dir:
-        raise ValueError("refusing V11: incompatible data directory is absent")
+        raise ValueError("parent bootstrap commitment mismatch")
     zero_hash = "00" * 32
     preactivation_checkpoint_is_canonical = (
         header.string("HISTORICAL_PROPOSAL_DESCRIPTION_HEX") == ""
@@ -947,56 +526,40 @@ def _calculate_v11(header: Header, *, alphanet: bool, betanet: bool = False) -> 
         and header.string("HISTORICAL_PROPOSAL_BLOCK_HASH") == zero_hash
         and header.integer("HISTORICAL_ACTIVATION_HEIGHT") == 0
         and header.string("HISTORICAL_ACTIVATION_BLOCK_HASH") == zero_hash
-        and (alphanet or betanet or header.integer("PARENT_CHECKPOINT_HEIGHT") == 0)
-        and (alphanet or betanet or header.string("PARENT_CHECKPOINT_HASH") == header.string("PARENT_GENESIS"))
+        and header.integer("PARENT_CHECKPOINT_HEIGHT") == 967679
+        and header.string("PARENT_CHECKPOINT_HASH") != header.string("PARENT_GENESIS")
         and header.string("PARENT_CHECKPOINT_CHAINWORK") != zero_hash
         and header.string("PARENT_CHECKPOINT_CTIP_TXID") == zero_hash
         and header.integer("PARENT_CHECKPOINT_CTIP_VOUT") == 0xFFFFFFFF
         and header.integer("PARENT_CHECKPOINT_CTIP_VALUE") == 0
     )
     if not preactivation_checkpoint_is_canonical:
-        raise ValueError("refusing V11: canonical genesis pre-activation checkpoint is absent")
+        raise ValueError("canonical pre-activation checkpoint is absent")
 
-    manifest = HashWriter().string("ELEMENTS_DRIVECHAIN_PROTOCOL_MANIFEST_V11")
+    manifest = HashWriter().string("ELEMENTS_DRIVECHAIN_PROTOCOL_MANIFEST_V13")
     add_common_protocol_fields(
         manifest, header, p2p_domain=header.string("P2P_MAGIC_DOMAIN"),
         annex_feature_version=header.integer("ANNEX_FEATURE_VERSION"),
         include_network_namespaces=True,
     )
-    add_proof_bundle_v1(manifest, header, parameterized_v11=True)
-    add_resource_schedule_v1(manifest, header)
-    add_withdrawal_fields(manifest, header)
+    add_native_rules(manifest, header)
     add_deployment_fields(manifest, header)
     add_parent_identity_fields(manifest, header)
-    add_historical_parent_fields(manifest, header, include_bootstrap=alphanet or betanet)
+    add_historical_parent_fields(manifest, header, include_bootstrap=True)
     add_replay_fields(manifest, header)
     manifest_digest = manifest.digest()
     description, proposal_digest = proposal(
         manifest_digest,
-        source_domain="ELEMENTS_DRIVECHAIN_PROTOCOL_SOURCE_V11",
-        text=("Elements Drivechain Betanet v1; parameterized controller profile; replay v5; "
-              "annex v2; sequential M6; withdrawal accumulator v1; "
-              "BIP301 checkpoint v1; Simplicity active; slot 24") if betanet else
-             ("Elements Drivechain v11; parameterized controller profile; replay v4; "
-              "annex v2; one M6 per parent block; withdrawal accumulator v1; "
-              "BIP301 checkpoint v1; Simplicity active; slot 24"),
+        source_domain="ELEMENTS_DRIVECHAIN_PROTOCOL_SOURCE_V13",
+        text=header.string("PROPOSAL_TEXT"),
     )
-    if existing_elements_test:
-        description = bytes.fromhex(header.string("BETANET_EXISTING_ELEMENTS_PROPOSAL_HEX"))
-        proposal_digest = hash256(description)
-        expected = "866e33f1e4c854fadea9f9792064708ced3633bc963b000a03d4d4ac2e1a2400"
-        if (display_hash(proposal_digest) != expected
-                or header.string("BETANET_EXISTING_ELEMENTS_PROPOSAL_HASH") != expected):
-            raise ValueError("Elements test proposal hash mismatch")
-    identity_digest = identity_commitment_v11(
-        header, manifest_digest, description, proposal_digest, include_bootstrap=alphanet or betanet
+    identity_digest = identity_commitment(
+        header, manifest_digest, description, proposal_digest, include_bootstrap=True
     )
     pegged = derive_pegged_asset(identity_digest, header.string("PARENT_GENESIS"))
     merkle, genesis_digest = genesis(identity_digest, header)
     return IdentityResult(
-        mode="candidate-v11-betanet-existing_elements-authorized-test" if existing_elements_test else
-             "candidate-v11-betanet-preactivation-parent" if betanet else
-             "candidate-v11-alphanet-preactivation-parent" if alphanet else "candidate-v11-parameterized-controller",
+        mode="fresh-native-v1",
         protocol_manifest_hash=display_hash(manifest_digest),
         proposal_description_hex=description.hex(),
         proposal_hash=display_hash(proposal_digest),
@@ -1018,7 +581,7 @@ def _calculate_v11(header: Header, *, alphanet: bool, betanet: bool = False) -> 
     )
 
 
-def assert_current_v7(header: Header, result: IdentityResult) -> None:
+def assert_current(header: Header, result: IdentityResult) -> None:
     expected = {
         "protocol_manifest_hash": header.string("PROTOCOL_MANIFEST_HASH"),
         "proposal_description_hex": header.string("PROPOSAL_DESCRIPTION_HEX"),
@@ -1047,12 +610,12 @@ def assert_current_v7(header: Header, result: IdentityResult) -> None:
 
 
 def indexer_bindings(header: Header) -> dict:
-    """Export audited Beta bindings, not evidence of activation or live readiness."""
-    result = calculate_betanet_v11(header)
-    assert_current_v7(header, result)
+    """Export audited fresh-chain bindings, not evidence of activation."""
+    result = calculate_fresh(header)
+    assert_current(header, result)
     return {
         "schema": "elements-indexer-bindings-v1",
-        "network": "betanet",
+        "network": "native-fresh",
         "identity_commitment": result.identity_commitment,
         "genesis_hash": result.genesis_hash,
         "native_asset": result.pegged_asset,
@@ -1076,10 +639,6 @@ def indexer_bindings(header: Header) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mode", choices=("v7", "v11", "v11-alphanet", "v11-betanet"), default="v11-betanet",
-        help="explicit identity derivation mode (default: Betanet)",
-    )
-    parser.add_argument(
         "--header",
         type=Path,
         default=IDENTITY_HEADER,
@@ -1092,22 +651,19 @@ def main() -> int:
     )
     parser.add_argument(
         "--indexer-bindings", action="store_true",
-        help="export audited Betanet consumer bindings (requires --mode v11-betanet; no --candidate)",
+        help="export audited fresh-chain consumer bindings (no --candidate)",
     )
     parser.add_argument("--generated-include-dir", type=Path,
-                        help="build src directory containing haskell/bootstrap_constants.h (required for Alpha)")
+                        help="build src directory containing haskell/bootstrap_constants.h")
     args = parser.parse_args()
-    if args.indexer_bindings and (args.candidate or args.mode != "v11-betanet"):
-        parser.error("--indexer-bindings requires --mode v11-betanet and forbids --candidate")
+    if args.indexer_bindings and args.candidate:
+        parser.error("--indexer-bindings forbids --candidate")
 
     try:
         header = Header(args.header, args.generated_include_dir)
-        calculate = {"v7": calculate_v7, "v11": calculate_v11,
-                     "v11-alphanet": calculate_alphanet_v11,
-                     "v11-betanet": calculate_betanet_v11}[args.mode]
-        result = calculate(header)
+        result = calculate_fresh(header)
         if not args.candidate:
-            assert_current_v7(header, result)
+            assert_current(header, result)
         output = indexer_bindings(header) if args.indexer_bindings else asdict(result)
     except (OSError, ValueError, struct.error) as exc:
         print(f"error: {exc}", file=sys.stderr)

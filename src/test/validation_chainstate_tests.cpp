@@ -47,7 +47,7 @@ BOOST_FIXTURE_TEST_CASE(child_checkpoint_rpc_exports_source_blocks, TestChain100
     BOOST_CHECK_EQUAL(result["headers"].size(), 101U);
     BOOST_CHECK(result["coins"].size() > 0);
     BOOST_CHECK(result["coin_source_blocks"].size() > 0);
-    BOOST_CHECK_EQUAL(result["withdrawals"]["frontier"].size(), 64U);
+    BOOST_CHECK(result["withdrawals"].isNull());
     {
         LOCK(cs_main);
         auto& manager = *m_node.chainman;
@@ -57,10 +57,6 @@ BOOST_FIXTURE_TEST_CASE(child_checkpoint_rpc_exports_source_blocks, TestChain100
             return HexStr(bytes);
         };
         auto sources = node::PrepareChildCheckpointSources(manager);
-        BOOST_CHECK_EQUAL(result["withdrawals"]["count"].getInt<uint64_t>(), sources.withdrawals.count);
-        BOOST_CHECK_EQUAL(result["withdrawals"]["root"].get_str(), HexStr(sources.withdrawals.root));
-        for (size_t i = 0; i < sources.withdrawals.frontier.size(); ++i)
-            BOOST_CHECK_EQUAL(result["withdrawals"]["frontier"][i].get_str(), HexStr(sources.withdrawals.frontier[i]));
         for (int height = 0; height <= sources.height; ++height) {
             CBlock block;
             BOOST_REQUIRE(manager.m_blockman.ReadBlock(block, *manager.ActiveChain()[height]));
@@ -131,7 +127,6 @@ BOOST_FIXTURE_TEST_CASE(child_checkpoint_sources_stay_at_one_tip, TestChain100Se
     BOOST_CHECK(!after.spent_claims->Valid());
     BOOST_CHECK(sources.spent_claims->GetKey() == claim);
     BOOST_CHECK(read_coins(*sources.coins) == before);
-    BOOST_CHECK(sources.withdrawals.IsSane());
     BOOST_CHECK(sources.block_hash == baseline.block_hash);
 
     LOCK(cs_main);
@@ -144,14 +139,6 @@ BOOST_FIXTURE_TEST_CASE(child_checkpoint_sources_stay_at_one_tip, TestChain100Se
         BOOST_CHECK(!state.CoinsDB().IsPeginSpent(claim));
         BOOST_CHECK(state.CoinsTip().IsPeginSpent(claim));
     };
-    auto saved_frontier = tip->m_usdd_withdrawal_accumulator;
-    tip->m_usdd_withdrawal_accumulator.reset();
-    rejects_without_flush("Child checkpoint withdrawal frontier unavailable or malformed");
-    tip->m_usdd_withdrawal_accumulator = saved_frontier;
-    tip->m_usdd_withdrawal_accumulator->root[0] ^= 1;
-    rejects_without_flush("Child checkpoint withdrawal frontier unavailable or malformed");
-    BOOST_CHECK(sources.withdrawals == baseline.withdrawals);
-    tip->m_usdd_withdrawal_accumulator = saved_frontier;
     state.CoinsTip().SetBestBlock(uint256::ONE);
     rejects_without_flush("Child checkpoint cache/active tip mismatch");
     state.CoinsTip().SetBestBlock(tip->GetBlockHash());

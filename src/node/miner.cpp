@@ -17,7 +17,6 @@
 #include <consensus/validation.h>
 #include <deploymentstatus.h>
 #include <drivechain_bmm.h>
-#include <ecx_exchange_state.h>
 #include <node/drivechain_withdrawal_bundle.h>
 #include <pegins.h>
 #include <logging.h>
@@ -26,7 +25,6 @@
 #include <policy/policy.h>
 #include <pow.h>
 #include <primitives/transaction.h>
-#include <usdd_sp1_resources.h>
 #include <util/moneystr.h>
 #include <util/signalinterrupt.h>
 #include <util/time.h>
@@ -253,7 +251,6 @@ void BlockAssembler::resetBlock()
     // These counters do not include coinbase tx
     nBlockTx = 0;
     nFees = 0;
-    m_usdd_sp1_namespace_annexes = 0;
 }
 
 std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
@@ -284,26 +281,6 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     nHeight = pindexPrev->nHeight + 1;
     m_include_drivechain_pegins =
         m_chainstate.IsDrivechainMempoolCurrentForMining();
-
-    const ecx::ExchangeConsensus& ecx_consensus = ecx::LayerTwoLabsExchangeConsensus();
-    m_ecx_source_append_budget = 0;
-    m_ecx_source_appends_selected = 0;
-    ecx::ExchangeConsensusSnapshot source_snapshot;
-    std::string source_error;
-    if (!drivechain::haskell::ExchangeTemplateBudget(nHeight, ecx_consensus.activation_height,
-        [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint64_t {
-            switch (step) {
-            case 0: return chainparams.GetConsensus().elements_mode;
-            case 1: return ecx::GetExchangeConsensusSnapshot(m_chainstate.CoinsTip(), pindexPrev, source_snapshot, source_error);
-            case 2: return source_snapshot.forced_entry_count;
-            case 3: return source_snapshot.forced_processed_cursor;
-            case 4: return source_snapshot.deposit_entry_count;
-            case 5: return source_snapshot.deposit_processed_cursor;
-            default: throw std::runtime_error("Unknown template budget action");
-            }
-        },m_ecx_source_append_budget,source_error)) {
-        throw std::runtime_error("CreateNewBlock(): " + source_error);
-    }
 
     pblock->nVersion = m_chainstate.m_chainman.m_versionbitscache.ComputeBlockVersion(pindexPrev, chainparams.GetConsensus());
     // -regtest only: allow overriding block.nVersion with
@@ -369,12 +346,6 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
             }
         });
 
-    if (ecx_consensus.custody_successor.activation_enabled && nHeight>ecx_consensus.activation_height) {
-        const uint64_t source_parent=m_candidate_parent ? m_candidate_parent->parent_height :
-            authenticated_parent_height.value_or(pindexPrev->ecxParentHeight);
-        if (!ecx::CustodySourceAppendBudget(*pindexPrev,source_parent,m_ecx_source_append_budget))
-            throw std::runtime_error("CreateNewBlock(): fresh source admission budget unavailable");
-    }
     int nPackagesSelected = 0;
     int nDescendantsUpdated = 0;
     if (m_mempool) {
@@ -406,27 +377,9 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     }
     coinbaseTx.vin[0].scriptSig = CScript() << nHeight << OP_0;
     uint256 withdrawal_bundle_hash;
-    std::optional<DrivechainWithdrawalBundleEnvelope> envelope;
-    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::TEMPLATE_ENVELOPE,
-        [&](uint32_t step) -> uint32_t {
-            switch (step) {
-            case 1: case 4: return chainparams.GetConsensus().elements_mode;
-            case 2: return chainparams.GetConsensus().has_parent_chain;
-            case 3: withdrawal_bundle_hash = GetCurrentDrivechainWithdrawalBundleHash(); return 1;
-            case 5: return !withdrawal_bundle_hash.IsNull();
-            case 6: return withdrawal_bundle_hash != pindexPrev->hashWithdrawalBundle;
-            case 7: return (static_cast<uint32_t>(pindexPrev->nVersion) & CBlockHeader::EXCHANGE_STATE_HF_MASK) != 0;
-            case 8: envelope = GetCurrentDrivechainWithdrawalBundleEnvelope(); return envelope.has_value();
-            case 9: return Hash(envelope->m6_no_witness) == withdrawal_bundle_hash;
-            case 10:
-                coinbaseTx.vout.insert(std::prev(coinbaseTx.vout.end()), CTxOut(policyAsset, 0,
-                    ecx::BuildWithdrawalBundleEnvelopeScript(ecx::WithdrawalBundleEnvelopeV1{
-                        envelope->checkpoint_height, envelope->checkpoint_block_hash, envelope->m6_no_witness})));
-                return 1;
-            case 11: throw std::runtime_error("CreateNewBlock(): new withdrawal bundle lacks its authenticated M6 preimage");
-            default: throw std::runtime_error("Unknown template envelope action");
-            }
-        });
+if (chainparams.GetConsensus().elements_mode && chainparams.GetConsensus().has_parent_chain) {
+    withdrawal_bundle_hash = GetCurrentDrivechainWithdrawalBundleHash();
+}
     // Non-consensus commitment output before finishing coinbase transaction
     if (!commit_scripts.empty()) {
         for (const auto& commit_script: commit_scripts) {
@@ -442,38 +395,10 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // Fill in header
     pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
     pblock->hashWithdrawalBundle = withdrawal_bundle_hash;
-    // All block-template paths, including regtest's generatetoaddress RPC,
-    // must commit the authenticated BMM parent height when one is available.
-    // Previously only the L1-sync miner supplied it, so a private checkpoint
-    // produced an internally accepted header whose ECX parent height disagreed
-    // with the BMM chainstate exposed to Simplicity and RPC consumers.
-    DrivechainParentBlockContext parent;
-    drivechain::BmmL1State bmm_state;
-    drivechain::BmmParentContext bmm_parent;
-    std::string parent_error, exchange_error;
-    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::TEMPLATE_PARENT,
-        [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
-            switch (step) {
-            case 1: return chainparams.GetConsensus().elements_mode;
-            case 2: return chainparams.GetConsensus().drivechain_slot.has_value();
-            // Authenticate this coinbase's P, not the prior anchor or future M7 Q.
-            case 3: return GetDrivechainParentBlockContext(*pblock,
-                chainparams.GetConsensus().drivechain_slot.value(), parent, &exchange_error);
-            case 4: case 7: return authenticated_parent_height.has_value();
-            case 5: return authenticated_parent_height.value() == parent.parent_height;
-            case 6: authenticated_parent_height = parent.parent_height; return 1;
-            case 8: return drivechain::GetEffectiveBmmState(m_chainstate.CoinsTip(), pindexPrev, bmm_state, parent_error);
-            case 9: return drivechain::GetBmmParentContext(bmm_state, bmm_parent, parent_error);
-            case 10: authenticated_parent_height = bmm_parent.height; return 1;
-            case 11:
-                exchange_error.clear();
-                return ecx::PrepareExchangeStateHeader(*pblock, pindexPrev, m_chainstate.CoinsTip(),
-                    nHeight, exchange_error, ecx::LayerTwoLabsExchangeConsensus(), authenticated_parent_height);
-            case 12: throw std::runtime_error("CreateNewBlock(): " + exchange_error);
-            case 13: throw std::runtime_error("CreateNewBlock(): supplied parent height disagrees with authenticated candidate P");
-            default: throw std::runtime_error("Unknown template parent action");
-            }
-        });
+if (authenticated_parent_height && m_candidate_parent &&
+    *authenticated_parent_height != m_candidate_parent->parent_height) {
+    throw std::runtime_error("CreateNewBlock(): supplied parent height disagrees with authenticated candidate P");
+}
     UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
     pblock->nBits          = g_signed_blocks ? 0 : GetNextWorkRequired(pindexPrev, pblock, chainparams.GetConsensus());
     if (g_con_blockheightinheader) {
@@ -543,44 +468,19 @@ bool BlockAssembler::TestPackage(uint64_t packageSize, int64_t packageSigOpsCost
 // - transaction finality (locktime)
 bool BlockAssembler::TestPackageTransactions(const CTxMemPool& mempool, const CTxMemPool::setEntries& package) const
 {
-    auto it = package.begin();
-    usdd::ResourceReader resources;
-    const auto source = resources.Source();
-    const uint32_t flags = m_include_drivechain_pegins |
-        (m_candidate_parent.has_value() << 1) | (chainparams.GetConsensus().enable_usdd_sp1_annex << 2);
-    return drivechain::haskell::UsddPackageResources(flags, package.size(),
-        m_usdd_sp1_namespace_annexes, usdd::SP1_ANNEXES_PER_BLOCK,
-        [&](uint32_t step, uint64_t) EXCLUSIVE_LOCKS_REQUIRED(cs_main, mempool.cs) -> uint64_t {
-            assert(it != package.end());
-            const auto& tx = (*it)->GetTx();
-            switch (step) {
-            case 0: return !drivechain::haskell::ParentReplayEach(tx.vin, [](const CTxIn& input) { return !input.m_is_pegin; });
-            case 1: return IsFinalTx(tx, nHeight, m_lock_time_cutoff);
-            case 2:
-                assert(m_candidate_parent);
-                return CheckNativeCandidateTransactionScripts(tx, m_chainstate,
-                    mempool, pblocktemplate->block, *m_candidate_parent);
-            case 3: return resources.Select(tx);
-            case 5: ++it; return 1;
-            default: throw std::runtime_error("Unknown USDD package read");
-            }
-        },&source);
+    for (const auto& entry : package) {
+        const auto& tx = entry->GetTx();
+        if (!m_include_drivechain_pegins && std::any_of(tx.vin.begin(), tx.vin.end(),
+                [](const CTxIn& input) { return input.m_is_pegin; })) return false;
+        if (!IsFinalTx(tx, nHeight, m_lock_time_cutoff)) return false;
+        if (m_candidate_parent && !CheckNativeCandidateTransactionScripts(tx, m_chainstate,
+                mempool, pblocktemplate->block, *m_candidate_parent)) return false;
+    }
+    return true;
 }
 
 void BlockAssembler::AddToBlock(CTxMemPool::txiter iter)
 {
-    drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::ANNEX_ACCOUNTING,
-        [&](uint32_t step) -> uint32_t {
-            if (step == 1) return chainparams.GetConsensus().enable_usdd_sp1_annex;
-            if (step != 2) throw std::logic_error("invalid annex accounting action");
-            const usdd::Sp1AnnexResourceUsage usage =
-                usdd::GetUsddSp1AnnexResourceUsage(iter->GetTx());
-            assert(usage.Flags() == 0);
-            assert(!usdd::ExceedsUsddSp1AnnexLane(
-                m_usdd_sp1_namespace_annexes, usage.namespace_annexes));
-            m_usdd_sp1_namespace_annexes += usage.namespace_annexes;
-            return 1;
-        });
     pblocktemplate->block.vtx.emplace_back(iter->GetSharedTx());
     pblocktemplate->vTxFees.push_back(iter->GetFee());
     pblocktemplate->vTxSigOpsCost.push_back(iter->GetSigOpCost());
@@ -821,32 +721,10 @@ void BlockAssembler::addPackageTxs(int& nPackagesSelected, int& nDescendantsUpda
         std::vector<CTxMemPool::txiter> sortedEntries;
         SortForBlock(ancestors, sortedEntries);
 
-        uint64_t forced_count{0}, deposit_count{0};
-        if (!drivechain::haskell::ExchangeSourcePackage(chainparams.GetConsensus().elements_mode,
-            sortedEntries.size(), [&](uint32_t step,uint64_t index) -> uint64_t {
-                switch (step) {
-                case 0: {
-                    forced_count=deposit_count=0;
-                    std::string error;
-                    if (!ecx::CheckCustodyReservedSpendPolicy(sortedEntries[index]->GetTx(),
-                            m_chainstate.m_chain.Tip(),error,ecx::LayerTwoLabsExchangeConsensus(),
-                            [&](const Txid& parent) { return mempool.get(parent.ToUint256()); })) return 0;
-                    return ecx::CountSourceTransactionMarkers(sortedEntries[index]->GetTx(),
-                        forced_count,deposit_count,error,ecx::LayerTwoLabsExchangeConsensus(),
-                        m_candidate_parent ? std::optional<uint64_t>{m_candidate_parent->parent_height} :
-                            std::optional<uint64_t>{m_options.authenticated_parent_height.value_or(m_chainstate.m_chain.Tip()->ecxParentHeight)});
-                }
-                case 1: return forced_count;
-                case 2: return deposit_count;
-                case 3: return m_ecx_source_appends_selected;
-                case 4: return m_ecx_source_append_budget;
-                case 5: AddToBlock(sortedEntries[index]); return 1;
-                case 6: mapModifiedTx.erase(sortedEntries[index]); return 1;
-                case 7: mapModifiedTx.get<confidential_score>().erase(modit); return 1;
-                case 8: failedTx.insert(iter->GetSharedTx()->GetHash()); return 1;
-                default: throw std::logic_error("invalid source package action");
-                }
-            },m_ecx_source_appends_selected,fUsingModified)) continue;
+for (const auto& entry : sortedEntries) {
+    AddToBlock(entry);
+    mapModifiedTx.erase(entry);
+}
 
         ++nPackagesSelected;
         pblocktemplate->m_package_feerates.emplace_back(packageFees, static_cast<int32_t>(packageSize));

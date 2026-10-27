@@ -22,11 +22,10 @@ import System.Exit (exitFailure)
 import Test.QuickCheck hiding (output)
 import Test.QuickCheck.Random (mkQCGen)
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
-import Foreign.C.Types (CBool(..), CSize(..))
 import Foreign.Marshal.Array (allocaArray, withArray, peekArray, pokeArray)
 import Foreign.Marshal.Utils (withMany)
 import Foreign.Ptr (Ptr, FunPtr, castPtr, nullPtr, nullFunPtr, plusPtr, freeHaskellFunPtr)
-import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff, pokeElemOff)
+import Foreign.Storable (peek, poke, peekByteOff, pokeByteOff)
 import GHC.Float (castWord64ToDouble)
 import Withdrawal (withdrawal, wordBE, wordLE)
 import qualified Withdrawal
@@ -54,18 +53,12 @@ import qualified ProofSessionTests
 import qualified BmmChainTests
 import qualified CommitmentTests
 import qualified SignetSessionTests
-import qualified ForcedOutputTests
-import qualified ForcedBlockTests
-import qualified CustodyPolicyTests
-import qualified CustodyIdentityTests
 import qualified ReplayStoreTests
 import qualified ConfirmationDepthTests
-import qualified Usdd
 import qualified BmmConstants as Constants
 import OperationTests
-import ExchangeTests
 import AbiTests
-import qualified Exchange
+import qualified NodeRules
 import qualified ScriptPolicy
 import Control.Operation.Validation (Validation(..))
 import Control.Operation (Operation(interpret), SomeOperation(..), execute)
@@ -79,35 +72,6 @@ scriptCacheSuffix endpoint = B.pack
    0x13,0x8f,0x46,0x39,0x6b,0xca,0x42,0xb7,0x5e,0xfd,0xe5,0xdc,0x55,0x03,0xfe,0x26,0,1,
    if isJust endpoint then 1 else 0] <> fromMaybe (B.replicate 80 0) endpoint
 
-scriptCacheParity :: Property
-scriptCacheParity = forAll gen $ \(authenticated,hashes,numbers,endpoint) -> ioProperty $ do
-  let optional = maybe (B.singleton 0) (B.cons 1)
-      input = B.cons (if authenticated then 1 else 0) $ B.concat
-        (map optional hashes ++ map (optional . fmap (wordLE 8)) numbers ++ [optional endpoint])
-      h n = fromMaybe (B.replicate 32 0) (hashes !! n)
-      u n = wordBE 8 (fromMaybe 0 (numbers !! n))
-      hp = isJust . (hashes !!)
-      up = isJust . (numbers !!)
-      tag bs = B.singleton (if and bs then 1 else if or bs then 2 else 0)
-      expected = B.pack [if authenticated then 1 else 0,0,14] <>
-        tag [hp 0] <> h 0 <> tag [hp 1,up 2] <> h 1 <>
-        tag [hp 2,up 3] <> h 2 <> tag [hp 3,up 0,up 1] <> h 3 <>
-        B.concat (map u [0..3]) <> tag (map hp [4..11]) <> B.concat (map h [4..11]) <>
-        tag (map hp [12..18]) <> B.concat (map h [12..18]) <>
-        tag [hp 19,up 4,up 5] <> h 19 <> u 4 <> u 5 <>
-        tag [up 6] <> u 6 <> scriptCacheSuffix endpoint
-  B.useAsCString input $ \ptr -> allocaArray 824 $ \output -> do
-    pokeArray output (replicate 824 (0xa5 :: Word8))
-    status <- elements_hs_script_cache_encode 0 (fromIntegral (B.length input)) (castPtr ptr) 822 (output `plusPtr` 1)
-    actual <- peekArray 824 output
-    pure $ conjoin [status===0,actual === 0xa5 : B.unpack expected ++ [0xa5],B.length expected===822,
-      validate (Exchange.ScriptCacheEncoding False input)===Just expected]
-  where
-    maybeValue values = frequency [(1,pure Nothing),(2,Just <$> values)]
-    gen = (,,,) <$> arbitrary <*> vectorOf 20 (maybeValue (B.pack <$> vectorOf 32 arbitrary)) <*>
-      vectorOf 7 (maybeValue (frequency [(1,arbitrary),(2,elements [0,1,0x100000000,0x8000000000000000,maxBound])])) <*>
-      maybeValue (B.pack <$> vectorOf 80 arbitrary)
-
 scriptCacheEndpoint :: Property
 scriptCacheEndpoint = forAll (oneof [pure Nothing,Just . B.pack <$> vectorOf 80 arbitrary]) $ \endpoint -> ioProperty $ do
   let input = maybe (B.singleton 0) (B.cons 1) endpoint
@@ -117,7 +81,7 @@ scriptCacheEndpoint = forAll (oneof [pure Nothing,Just . B.pack <$> vectorOf 80 
     status <- elements_hs_script_cache_encode 1 (fromIntegral (B.length input)) (castPtr ptr) 115 (output `plusPtr` 1)
     actual <- peekArray 117 output
     pure $ conjoin [status===0,actual === 0xa5 : B.unpack expected ++ [0xa5],
-      validate (Exchange.ScriptCacheEncoding True input)===Just expected]
+      validate (NodeRules.ScriptCacheEncoding True input)===Just expected]
 
 scriptCacheMalformed :: Property
 scriptCacheMalformed = once $ ioProperty $ allocaArray 824 $ \output -> do
@@ -134,91 +98,13 @@ scriptCacheMalformed = once $ ioProperty $ allocaArray 824 $ \output -> do
         pure $ conjoin [status=== -1,remaining===replicate 824 0xa5]
   malformed <- mapM (\input -> do
     actual <- check 0 822 input False False
-    pure (actual .&&. validate (Exchange.ScriptCacheEncoding False input)===Nothing)) invalid
+    pure (actual .&&. validate (NodeRules.ScriptCacheEncoding False input)===Nothing)) invalid
   boundary <- sequence [check 2 822 full False False,check maxBound 822 full False False,
     check 0 821 full False False,check 0 823 full False False,
     check 0 822 full True False,check 0 822 full False True,
     check 1 115 (B.singleton 2) False False,check 1 115 (B.singleton 1) False False,
     check 1 115 (B.replicate 81 0) False False]
   pure (conjoin (malformed ++ boundary))
-
-resourceScheduleGolden :: Property
-resourceScheduleGolden = once $ conjoin
-  [ Constants.alphaPeginOneConfirmationHeight === 64
-  , [Constants.walletRpcRoute isWithdrawal native pak | isWithdrawal <- [False,True],
-       native <- [False,True], pak <- [False,True]] === [0,0,1,1,0,1,2,2]
-  , Constants.journalFilename === "drivechain_withdrawal.dat"
-  , Constants.journalMagic === "ELEMENTS_DRIVECHAIN_WITHDRAWAL_JOURNAL_V1"
-  , Constants.productionChainName === "elements"
-  , Constants.configFilename === "elements.conf"
-  , Constants.exchangeInterfaceConstants ===
-      [("uint8_t","EXCHANGE_STATE_INTERFACE_VERSION",1),
-       ("uint16_t","EXCHANGE_SCRIPT_CACHE_REVISION",14),
-       ("uint32_t","ECX_CONSENSUS_RULESET_REVISION",8),
-       ("uint32_t","DEFAULT_BOND_DEPLOYMENT_VERSION",2),
-       ("int","DISABLED_EXCHANGE_ACTIVATION_HEIGHT",2147483647),
-       ("bool","BOND_V2_PARTITIONED_INCREMENTAL_RECOVERY_BOUND_PROVEN",1)]
-  , Constants.historicalDepositSlot === 24
-  , Constants.historicalDepositDefaults ===
-      [("SIDECHAIN_NETWORK","liquid-signet"),("MAINCHAIN_NETWORK","signet"),
-       ("SIGNET_CHALLENGE","00148835832e28c816b7acd8fdb19772ab2199603a56"),
-       ("ENFORCER_NETWORK","NETWORK_SIGNET"),("TITLE","Elements"),
-       ("HASH_ID_1","5883560531f013b9b27b2f9cfbac4f64ee5062b95ad3e21593a8f6916530b74b"),
-       ("HASH_ID_2","b2b7b20f3fbc4baf50e9d39f58661c6168e279d4")]
-  , Constants.anchorVersion === 1
-  , Constants.pegEventVersion === 1
-  , [Constants.checkpointHeaderLimit,Constants.checkpointEntryLimit,Constants.checkpointByteLimit,
-     Constants.pegEventDefaultCount,Constants.pegEventCountLimit] === [10000,100000,67108864,1000,10000]
-  , [Constants.withdrawalReadConfirmations,Constants.withdrawalSubmitConfirmations,
-     Constants.withdrawalProofSeconds,Constants.withdrawalProofInterruptInterval] === [1,6,10,4096]
-  , [Constants.bondExportDefaultBlocks,Constants.bondExportBlockLimit,Constants.bondExportEntryLimit] === [1,64,8]
-  , Constants.peginIdentityNetwork === "elements"
-  , Constants.peginIdentitySlot === 24
-  , Constants.peginIdentityDepth === 100
-  , length (List.nub (map fst Constants.peginIdentityPins)) === 5
-  , property (all (\(_,pin) -> length pin == 64 && all (`elem` "0123456789abcdef") pin) Constants.peginIdentityPins)
-  , map snd Constants.simplicityLengths === [356,609,850,364,1627,1693,791]
-  , Constants.ownedAnnexLimit === 1310720
-  , Constants.grpcCredentialDefaults ===
-      [("GRPC_CA_FILE","enforcer-tls/ca.pem"),
-       ("GRPC_CLIENT_CERT_FILE","enforcer-tls/elements-client.pem"),
-       ("GRPC_CLIENT_KEY_FILE","enforcer-tls/elements-client-key.pem")]
-  , Constants.activationBudget === 1002636
-  , Constants.activationCmr ===
-      [0xd9,0xef,0x88,0xa9,0x38,0x9f,0x87,0x11,0x4f,0x62,0x53,0x9d,0x7e,0x0e,0x2d,0x07,
-       0x0f,0xed,0x1a,0x4e,0xa9,0x0f,0xda,0xa7,0xc2,0x06,0xac,0x14,0x0e,0xcf,0x2e,0x87]
-  , Constants.compressedSp1Cost === 900007720
-  , [digest | (_,_,digest,_,_,_) <- Constants.publicJetPins] ===
-      ["12dc3d4f22466873daaf83b10e1cfa1ea551e23ae7d0fbd6d9da64ce7e89a3e2",
-       "c824e737318c66258d0b094d9ad35380ef1f58484c27ad47dea02ca345e0c061",
-       "ae9ed26c25af1ff1217a944bc849db9217124d63d3fa3590c030a9dafb0213e8",
-       "e5d2571137e635b83c813800d1167215ec512d9a61a1d5b2e8b80f5030bcf612",
-       "25cc2f7ba2f4eb93053076d482a0439efeaba84b12fc60b188ed750df5a5a807",
-       "9c1194d4572852baa7320808db7f4ea64c0f1785f08a08b67b51efd96597882a",
-       "595cfa3adbc83e616918a6a51441ba847f19faf7e77f3cb97d21314e28928399"]
-  , [(source,target,cost) | (_,_,_,source,target,cost) <- Constants.publicJetPins] ===
-      [("u","mw64",108),("u","w64",108),("w256","b",108),("w32","b",108),
-       ("w32","b",108),("u","pw256pw64pw64w256",216),("w512","b",900007720)]
-  , length (List.nub [name | (name,_,_,_,_,_) <- Constants.publicJetPins]) === 7
-  , length (List.nub [name | (name,_,_,_,_) <- Constants.privateJetPins]) === 23
-  , length (List.nub [digest | (_,digest,_,_,_) <- Constants.privateJetPins]) === 23
-  , property (all (\(_,digest,source,target,_) -> length digest == 64 &&
-      all (`elem` "0123456789abcdef") digest && source `elem` ["u","w32","ecx_pw256w256"] &&
-      target `elem` ["u","b","w64","w256"]) Constants.privateJetPins)
-  , [cost | (_,_,_,_,cost) <- Constants.privateJetPins] ===
-      [235,231,235,193,191,236,195,202,235,234,234,235,842045435,820469462,826626612,
-       233,190,191,200,195,232,231,825247407]
-  , Constants.depositAddressLimit === 128
-  , Constants.standardScriptVerifyFlags === 134217728
-  , Constants.depositMarker === "drivechain-deposit-v2"
-  , Constants.legacyDepositMarker === "drivechain-deposit-v1"
-  , Constants.depositLayouts ===
-      [("LEGACY_DEPOSIT_LAYOUT",[0,1,2,3,255,4]),
-       ("NATIVE_DEPOSIT_LAYOUT",[0,1,2,3,254,4,5,6]),
-       ("EVIDENCE_DEPOSIT_LAYOUT",[0,1,2,3,254,4,5,6,7,8,9])]
-  , map snd Constants.resourceConstants ===
-      [6000000,6000000,1,1500000,1310720,16384,1272546,1001,1273602,1273607,1310725,189275,64]
-  , length (List.nub (map fst Constants.resourceConstants)) === 13 ]
 
 parameterGateParity :: Property
 parameterGateParity = forAll ((,,) <$> elements [0,1,2,3,maxBound] <*> parameterValue <*> parameterValue) $ \(mode,first,second) -> ioProperty $ do
@@ -262,27 +148,6 @@ optionalEnvironmentParity = forAll ((,,) <$> elements [0..6] <*>
     pure (conjoin [actual===expected,
       validate (ScriptPolicy.OptionalEnvironment kind present fields)===expected])
 
-frontierWireOrder :: Property
-frontierWireOrder = forAll ((,,) <$> frequency [(1,arbitrary),(1,elements [0,1,maxBound,0x8000000000000000])] <*>
-  arbitrary <*> chooseInt (0,64)) $ \(count,reading,failAt) -> ioProperty $ do
-    let commands=[fromIntegral level + if testBit count level then 0 else 64 |
-          level<-[0..63],reading || testBit count level]
-        wanted=(if failAt<length commands then -1 else 1,take (failAt+1) commands)
-        run invoke = do
-          calls <- newIORef []
-          code <- invoke (\step -> do
-            seen <- readIORef calls
-            modifyIORef' calls (++[step])
-            pure (if length seen==failAt then -1 else 1))
-          seen <- readIORef calls
-          pure (code,seen)
-    direct <- run (validate . Usdd.FrontierWire count reading)
-    abi <- run (\action -> bracket (wrapPolicyEffect (\_ -> action)) freeHaskellFunPtr $ \callback ->
-      elements_hs_frontier_wire count (if reading then 1 else 0) callback nullPtr)
-    absent <- elements_hs_frontier_wire count 0 nullFunPtr nullPtr
-    invalid <- elements_hs_frontier_wire count 2 nullFunPtr nullPtr
-    pure $ conjoin [direct===wanted,abi===wanted,absent===(-1),invalid===(-1)]
-
 merkleReplacementParity :: Property
 merkleReplacementParity = forAll ((,,,) <$> elements [0,1,2,3,maxBound] <*>
   elements [0,1,2,maxBound] <*> elements [0,1,2,maxBound] <*> elements [0,1,2,3,4,maxBound]) $
@@ -296,39 +161,6 @@ merkleReplacementParity = forAll ((,,,) <$> elements [0,1,2,3,maxBound] <*>
     actual <- elements_hs_merkle_replacement mode index position flags
     pure $ conjoin [actual===expected,
       validate (ScriptPolicy.MerkleReplacement mode index position flags)===expected]
-
-annexRetentionParity :: Property
-annexRetentionParity = forAll ((,,) <$> resize 128 arbitrary <*> arbitrary <*> arbitrary) $ \(payload,tag,alter) ->
-  ioProperty $ withArray (tag:payload) $ \full -> withArray payload $ \body -> do
-    let count=fromIntegral (length payload)
-    actual <- elements_hs_annex_retention (count+1) count full body
-    mismatch <- elements_hs_annex_retention (count+1) (count+2) full body
-    absent <- elements_hs_annex_retention (count+1) count nullPtr body
-    absentBody <- elements_hs_annex_retention (count+1) count full nullPtr
-    changed <- withArray (map (`xor` 1) payload) $ \other ->
-      elements_hs_annex_retention (count+1) count full (if alter then other else body)
-    pure $ conjoin [actual===(if tag==0x50 then 1 else 0),mismatch===0,absent===0,
-      absentBody===(if tag==0x50 && null payload then 1 else 0),
-      changed===(if tag==0x50 && (not alter || null payload) then 1 else 0)]
-
-annexRetentionOrder :: Property
-annexRetentionOrder = once $ ioProperty $ do
-  let limit=fromIntegral Constants.ownedAnnexLimit
-      cases=[(0,0,True,True,0x50,[]),(limit+1,0,True,True,0x50,[]),
-             (maxBound,0,True,True,0x50,[]),(2,1,False,True,0x50,[]),
-             (2,1,True,True,0x51,[1]),(2,0,True,True,0x50,[1]),
-             (2,1,True,False,0x50,[1]),(1,0,True,False,0x50,[1]),
-             (limit,limit-1,True,True,0x50,[1,2])]
-  results <- mapM (\(fullSize,bodySize,fullPresent,bodyPresent,tag,expectedCalls) -> do
-    calls <- newIORef ([]::[Int])
-    let record step=modifyIORef' calls (++[step])
-    accepted <- validate (ScriptPolicy.AnnexRetention fullSize bodySize fullPresent bodyPresent
-      (record 1 >> pure tag) (record 2 >> pure True))
-    observed <- readIORef calls
-    pure $ conjoin [observed===expectedCalls,
-      accepted===(fullPresent && fullSize>0 && fullSize<=limit && tag==0x50 &&
-        bodySize==fullSize-1 && (bodySize==0 || bodyPresent))]) cases
-  pure (conjoin results)
 
 optionalCheckpointParity :: Property
 optionalCheckpointParity = forAll ((,,) <$> elements [0,1,2,maxBound] <*>
@@ -350,177 +182,6 @@ jetHeightParity = forAll ((,) <$> choose (0,3) <*> frequency [(1,arbitrary),(3,e
     actual <- elements_hs_jet_height present height
     pure (actual===(if present>1 then -1 else if present==1 && height/=0 then 1 else 0))
 
-groth16ProofFlow :: Property
-groth16ProofFlow = forAll ((,,,) <$> elements [0,3] <*> chooseInt (0,7) <*> arbitrary <*> arbitrary) $
-  \(kind,mutation,hashOk,verifyOk) -> ioProperty $ do
-    calls <- newIORef ([]::[Int])
-    let program=B.concat [wordBE 4 i | i<-[1..8]]
-        digest=B.replicate 32 9
-        activation=B.pack [0,0,0,1] <> B.concat [B.replicate 32 i | i<-[1..10]] <>
-          B.concat (replicate 5 (wordBE 8 1))
-        values=if kind==0 then B.empty else activation
-        base=C.pack "ECXSP1\0" <> B.pack [if kind==0 then 2 else 5,2,1,0] <>
-          program <> digest <> wordBE 4 356 <> B.replicate 356 7 <> values
-        changed offset=B.take offset base <> B.singleton 0xff <> B.drop (offset+1) base
-        input=case mutation of
-          3 -> changed 0
-          4 -> if kind==0 then changed 78 else changed (435+3)
-          5 -> B.drop 1 base
-          6 -> changed 11
-          _ -> base
-        record step=modifyIORef' calls (++[step])
-        digestAction payload=do record 1; pure (if hashOk && payload==values then digest else B.empty)
-        verify proof words32 actualDigest=do
-          record 2
-          pure (verifyOk && proof==B.replicate 356 7 && words32==[1..8] && actualDigest==digest)
-        expectedProgram=if mutation==1 then B.replicate 32 8 else program
-        expectedDigest=if mutation==2 then B.replicate 32 8 else digest
-        valid=mutation<3
-        matches=mutation==0
-        expectedCalls
-          | not valid || (kind==0 && not matches) = []
-          | kind==0 = [2]
-          | otherwise = [1] ++ [2 | hashOk && matches]
-    accepted <- validate (Exchange.Groth16Proof (if mutation==7 then 99 else kind) input
-      expectedProgram expectedDigest digestAction verify)
-    trace <- readIORef calls
-    pure $ conjoin [trace===expectedCalls,accepted===(valid && matches && (kind==0 || hashOk) && verifyOk)]
-
-bondInputParity :: Property
-bondInputParity = forAll ((,,,) <$> index <*> index <*> choose (0,15) <*> arbitrary) $
-  \(input,current,flags,matches) -> ioProperty $ do
-    calls <- newIORef (0::Int)
-    let eligible=input>=2 && input==current && flags==4
-        left=B.replicate 32 7
-        right=B.replicate 32 (if matches then 7 else 8)
-    accepted <- validate (Exchange.BondInput input current flags (modifyIORef' calls (+1) >> pure matches))
-    count <- readIORef calls
-    B.useAsCString left $ \a -> B.useAsCString right $ \b -> do
-      actual <- elements_hs_bond_input input current flags (castPtr a) (castPtr b)
-      missing <- elements_hs_bond_input input current flags nullPtr (castPtr b)
-      pure $ conjoin [accepted===(eligible && matches),count===(if eligible then 1 else 0),
-        actual===(if eligible && matches then 1 else 0),missing===0]
-  where index=frequency [(1,arbitrary),(5,elements [0,1,2,3,maxBound])]
-foreign import ccall unsafe reference_groth16_header :: Word32 -> Ptr Word8 -> IO Int32
-
-groth16HeaderParity :: Property
-groth16HeaderParity = forAll ((,,,,) <$> arbitrary <*> vectorOf 8 limb <*> chooseInt (0,78) <*> arbitrary <*> arbitrary) $
-  \(version,program,offset,byte,mutate) -> ioProperty $ do
-    let base=C.pack "ECXSP1\0" <> B.pack [version,2,1,0] <>
-          B.concat (map (wordBE 4) program) <> B.replicate 32 0 <> wordBE 4 356
-        input=if mutate then B.take offset base <> B.singleton byte <> B.drop (offset+1) base else base
-    B.useAsCString input $ \ptr -> do
-      actual <- elements_hs_groth16_header (fromIntegral version) 79 (castPtr ptr)
-      expected <- reference_groth16_header (fromIntegral version) (castPtr ptr)
-      short <- elements_hs_groth16_header (fromIntegral version) 78 (castPtr ptr)
-      long <- elements_hs_groth16_header (fromIntegral version) 80 (castPtr ptr)
-      unknown <- elements_hs_groth16_header 256 79 (castPtr ptr)
-      missing <- elements_hs_groth16_header (fromIntegral version) 79 nullPtr
-      pure $ conjoin [actual===expected,short===(-1),long===(-1),unknown===(-1),missing===(-1)]
-  where limb=frequency [(4,choose (0,0x7f000000)),(1,elements [0,1,0x7f000000,0x7f000001,0xffffffff])]
-
-foreign import ccall unsafe reference_canonical_values :: Word32 -> Ptr Word8 -> IO Int32
-
-canonicalValuesParity :: Property
-canonicalValuesParity = forAll ((,,,,) <$> elements [4,5,23] <*> arbitrary <*> arbitrary <*>
-  chooseInt (0,1626) <*> arbitrary) $ \(version,reserveWord,deficitWord,offset,byte) -> ioProperty $ do
-    let successor=version==23
-        size=case version of 4 -> 609; 5 -> 850; _ -> 1627
-        reserve=toInteger (reserveWord::Word64)
-        deficit=toInteger (deficitWord::Word64)
-        target=deficit+(deficit+3) `div` 4
-        coverage=if deficit==0 then 12500 else reserve*10000 `div` deficit
-        mode=if reserve>=target then 0 else if reserve>=deficit then 1 else 2
-        encode :: Int -> Integer -> B.ByteString
-        encode width value=B.pack [fromInteger (value `div` (256^i)) | i<-reverse [0..width-1]]
-        put payload (start,replacement)=B.take start payload <> replacement <> B.drop (start+B.length replacement) payload
-        n start width value=(start,encode width value)
-        hashes=if successor then [4,36..1252] else [0,36,68,100,132,164,196,244,276,308,340,372,404,436] ++
-          (if version==5 then [609,650,682,722,762,802] else [])
-        fields=if successor then
-          [n 0 4 23,n 1284 8 1,n 1292 8 1,n 1300 8 1,n 1308 8 1,n 1316 8 1,n 1324 8 1,
-           n 1332 8 2100000000000000,n 1348 8 2100000000000000,n 1372 8 1,
-           n 1396 16 deficit,n 1412 16 deficit,n 1428 16 deficit,n 1444 16 target,
-           n 1460 16 reserve,n 1524 16 coverage,n 1624 1 mode]
-          else [n 32 4 (toInteger version),n 228 8 1,n 236 8 1,n 468 16 reserve,n 508 16 deficit,
-                n 524 16 target,n 540 16 coverage,n 556 1 mode,n 557 8 1,n 565 8 2] ++
-                (if version==5 then [n 641 8 1] else [])
-        base=foldl put (B.replicate size 0) ([(start,B.replicate 32 1) | start<-hashes]++fields)
-        mutated=put base (offset `mod` size,B.singleton byte)
-        verify payload=B.useAsCString payload $ \ptr -> do
-          actual <- elements_hs_canonical_values version (fromIntegral size) (castPtr ptr)
-          expected <- reference_canonical_values version (castPtr ptr)
-          pure (actual===expected)
-    valid <- B.useAsCString base $ \ptr -> elements_hs_canonical_values version (fromIntegral size) (castPtr ptr)
-    original <- verify base
-    changed <- verify mutated
-    missing <- elements_hs_canonical_values version (fromIntegral size) nullPtr
-    invalid <- elements_hs_canonical_values 0 (fromIntegral size) nullPtr
-    pure $ conjoin [valid===1,original,changed,missing===(-1),invalid===(-1)]
-
-foreign import ccall unsafe reference_canonical_activation :: Ptr Word8 -> IO Int32
-
-canonicalActivationParity :: Property
-canonicalActivationParity = forAll ((,,,) <$> vectorOf 5 arbitrary <*> chooseInt (0,363) <*> arbitrary <*> chooseInt (0,5)) $
-  \(numbers,offset,byte,mode) -> ioProperty $ do
-    let ordered=List.sort (map (max 1) numbers)
-        base=B.pack [0,0,0,1] <> B.concat [B.replicate 32 i | i<-[1..10]] <>
-          B.concat (map (wordBE 8) [ordered !! 0,ordered !! 1,ordered !! 3,ordered !! 2,ordered !! 4])
-        replace start replacement=B.take start base <> replacement <> B.drop (start+B.length replacement) base
-        input=case mode of
-          0 -> base
-          1 -> replace offset (B.singleton byte)
-          2 -> replace (4+32*(offset `mod` 10)) (B.replicate 32 0)
-          3 -> replace 36 (B.take 32 (B.drop 4 base))
-          4 -> replace (324+8*(offset `mod` 5)) (B.replicate 8 0)
-          _ -> replace 100 (B.take 32 (B.drop 36 base))
-    valid <- B.useAsCString base $ \ptr -> elements_hs_canonical_activation 364 (castPtr ptr)
-    B.useAsCString input $ \ptr -> do
-      actual <- elements_hs_canonical_activation 364 (castPtr ptr)
-      expected <- reference_canonical_activation (castPtr ptr)
-      short <- elements_hs_canonical_activation 363 (castPtr ptr)
-      long <- elements_hs_canonical_activation 365 (castPtr ptr)
-      missing <- elements_hs_canonical_activation 364 nullPtr
-      pure $ conjoin [valid===1,validate (Exchange.CanonicalActivation base)===True,
-        actual===expected,short===(-1),long===(-1),missing===(-1),
-        validate (Exchange.CanonicalActivation input)===(expected==1),
-        validate (Exchange.CanonicalActivation (B.take 363 input))===False]
-foreign import ccall unsafe reference_muldiv128 :: Word64 -> Word64 -> Word64 -> Word64 -> Word64 -> Ptr Word64 -> IO Int32
-
-mulDiv128Parity :: Property
-mulDiv128Parity = forAll (vectorOf 5 limb) $ \inputs -> ioProperty $ case inputs of
-  [hi,lo,multiplier,dhi,dlo] -> withArray [91,92,93,94 :: Word64] $ \output ->
-    withArray [91,92,93,94 :: Word64] $ \reference -> do
-      actual <- elements_hs_muldiv128 hi lo multiplier dhi dlo (output `plusPtr` 8)
-      expected <- reference_muldiv128 hi lo multiplier dhi dlo (reference `plusPtr` 8)
-      actualWords <- peekArray 4 output
-      expectedWords <- peekArray 4 reference
-      missing <- elements_hs_muldiv128 hi lo multiplier dhi dlo nullPtr
-      pure $ conjoin [actual===expected,actualWords===expectedWords,missing===(-1),
-        head actualWords===91,last actualWords===94,
-        property (actual==1 || actualWords==[91,92,93,94])]
-  _ -> pure (property False)
-  where limb = frequency [(3,arbitrary),(2,elements [0,1,2,3,10000,100000000,maxBound,9223372036854775808])]
-
-runtimeActivation :: Property
-runtimeActivation = forAll ((,,) <$> arbitrary <*> height <*> height) $ \(present,activation,privateHeight) ->
-  ioProperty $ allocaArray 3 $ \output -> do
-    pokeArray output [17,23,31 :: Int32]
-    let private = if present then Just privateHeight else Nothing
-        first = min activation (if present then privateHeight else maxBound)
-        configured = activation /= maxBound || present
-        flag = if present then 1 else 0
-        supplied = if present then privateHeight else 0
-    code <- elements_hs_runtime_activation flag activation supplied (output `plusPtr` 4)
-    observed <- peekArray 3 output
-    invalid <- elements_hs_runtime_activation 2 activation supplied output
-    reserved <- elements_hs_runtime_activation 0 activation 1 output
-    missing <- elements_hs_runtime_activation flag activation supplied nullPtr
-    after <- peekArray 3 output
-    pure $ conjoin [validate (Exchange.RuntimeActivation activation private) === (configured,first),
-      code === (if configured then 1 else 0), observed === [17,first,31],
-      invalid === -1, reserved === -1, missing === -1, after === observed]
-  where height = frequency [(1,elements [minBound,-1,0,1,maxBound-1,maxBound]),(1,arbitrary)]
 
 boundedAppendRule :: Property
 boundedAppendRule = forAll ((,,) <$> size <*> size <*> count) $ \(limit,used,n) -> ioProperty $ do
@@ -563,32 +224,10 @@ unsigned32Fields = forAll (resize 8 (listOf field)) $ \fields -> ioProperty $ wi
   oversized <- elements_hs_unsigned32_fields maxBound input
   empty <- elements_hs_unsigned32_fields 0 nullPtr
   let expected = all (\value -> toInteger value < 2^(32 :: Int)) fields
-  pure $ conjoin [validate (Exchange.Unsigned32Fields fields) === expected,
+  pure $ conjoin [validate (NodeRules.Unsigned32Fields fields) === expected,
     actual === (if expected then 1 else 0), unchanged === fields,
     missing === -1, oversized === -1, empty === 1]
   where field = frequency [(1,arbitrary),(2,elements [0,1,4294967294,4294967295,4294967296,9223372036854775808,maxBound])]
-
-exportRange :: Property
-exportRange = forAll ((,,,,) <$> arbitrary <*> rangeField <*> rangeField <*> rangeField <*> rangeField) $
-  \(bounded,start,count,activation,tip) -> ioProperty $ do
-    let expected | start < activation || count < 1 || count > 64 = Left 1
-                 | not bounded = Right start
-                 | tip < 0 || start > tip = Left 2
-                 | otherwise = Right (fromInteger (minimum [toInteger tip,toInteger start+toInteger count-1]))
-        mode = if bounded then 1 else 0
-    withArray ([12345,67890,54321] :: [Int32]) $ \output -> do
-      code <- elements_hs_export_range mode start count activation tip (output `plusPtr` 4)
-      contents <- peekArray 3 output
-      invalid <- elements_hs_export_range 4 start count activation tip output
-      missing <- elements_hs_export_range mode start count activation tip nullPtr
-      unchanged <- peekArray 3 output
-      pure $ conjoin [
-        validate (Exchange.ExportRange start count activation (if bounded then Just tip else Nothing)) === expected,
-        code === either id (const 0) expected,
-        contents === [12345,either (const 67890) id expected,54321],
-        invalid === -1,missing === -1,unchanged === contents]
-  where
-    rangeField = frequency [(1,arbitrary),(3,elements [minBound,-1,0,1,63,64,65,maxBound-63,maxBound])]
 
 pegEventDefaultStart :: Property
 pegEventDefaultStart = forAll (frequency [(1,arbitrary),(3,elements [minBound,-1,0,1,998,999,1000,maxBound])]) $ \tip -> ioProperty $
@@ -600,7 +239,7 @@ pegEventDefaultStart = forAll (frequency [(1,arbitrary),(3,elements [minBound,-1
       (a,b,c) <- [(1,0,0),(0,1,0),(0,0,1),(-1,0,0),(0,-1,0),(0,0,-1)]]
     missing <- elements_hs_export_range 3 0 0 0 tip nullPtr
     unchanged <- peekArray 3 output
-    pure $ conjoin [validate (Exchange.PegEventStart tip) === Right expected,code===0,
+    pure $ conjoin [validate (NodeRules.PegEventStart tip) === Right expected,code===0,
       contents===[12345,expected,54321],invalid===replicate 6 (-1),missing===(-1),unchanged===contents]
 
 pegEventRange :: Property
@@ -615,35 +254,11 @@ pegEventRange = forAll ((,,) <$> field <*> field <*> field) $ \(start,count,tip)
     missing <- elements_hs_export_range 2 start count 0 tip nullPtr
     invalid <- elements_hs_export_range maxBound start count 0 tip output
     unchanged <- peekArray 3 output
-    pure $ conjoin [validate (Exchange.PegEventRange start count tip) === expected,
+    pure $ conjoin [validate (NodeRules.PegEventRange start count tip) === expected,
       code === either id (const 0) expected,
       contents === [12345,either (const 67890) id expected,54321],
       reserved === -1,missing === -1,invalid === -1,unchanged === contents]
   where field = frequency [(1,arbitrary),(3,elements [minBound,-1,0,1,9999,10000,10001,maxBound-9999,maxBound])]
-
-wideDecimal :: Property
-wideDecimal = forAll (oneof [choose (0,2^(128::Int)-1), elements [0,1,2^(127::Int)-1,2^(127::Int),2^(128::Int)-1]]) $ \value ->
-  forAll arbitrary $ \signed -> ioProperty $ do
-    let encoded = B.pack [fromInteger (value `div` 256^i `mod` 256) | i <- [15,14..0 :: Int]]
-        expected = C.pack (show (if signed && value>=2^(127::Int) then value-2^(128::Int) else value))
-        mode = if signed then 1 else 0
-        wanted = B.length expected
-    cases <- B.useAsCString encoded $ \input -> mapM (\capacity -> allocaBytes 42 $ \output -> do
-      pokeArray output (replicate 42 (0xa5 :: Word8))
-      size <- elements_hs_wide_decimal mode (castPtr input) 16 (output `plusPtr` 1) (fromIntegral capacity)
-      contents <- B.pack <$> peekArray 42 output
-      pure $ conjoin [size === (if capacity<wanted then -1 else fromIntegral wanted),
-        contents === (if capacity<wanted then B.replicate 42 0xa5
-          else B.singleton 0xa5 <> expected <> B.replicate (41-wanted) 0xa5)]) [wanted-1,wanted,40]
-    rejected <- B.useAsCString encoded $ \input -> allocaBytes 42 $ \output -> do
-      pokeArray output (replicate 42 (0xa5 :: Word8))
-      codes <- sequence [elements_hs_wide_decimal m p n q 40 | (m,p,n,q) <-
-        [(2,castPtr input,16,output),(0,castPtr input,15,output),(0,castPtr input,17,output),
-         (0,nullPtr,16,output),(0,castPtr input,16,nullPtr)]]
-      contents <- peekArray 42 output
-      pure $ conjoin [codes === replicate 5 (-1),contents === replicate 42 0xa5]
-    pure $ conjoin ([validate (Exchange.WideDecimal signed encoded) === Just expected,
-      validate (Exchange.WideDecimal signed (B.take 15 encoded)) === Nothing,rejected] ++ cases)
 
 anchorRules :: Property
 anchorRules = forAll fixture $ \(candidate,previous) -> ioProperty $ do
@@ -716,415 +331,6 @@ anchorCheckpointFraming = once $ ioProperty $
       missingInput===(-1),missingOutput===(-1),observed===replicate 82 0xa5,
       conjoin [validate (Bmm.AnchorCheckpoint (B.replicate size 0))===Left 1 | size <- [0..445]]]
 
-activationSettingsOrder :: Property
-activationSettingsOrder = forAll ((,) <$> choose (0,1023 :: Int) <*> choose (-1,9 :: Int)) $ \(mask,fault) -> ioProperty $ do
-  let present = any (testBit mask) [0..8]
-      expected | not present = 0
-               | not (testBit mask 9) = 23
-               | not (all (testBit mask) [0..7]) = 24
-               | otherwise = 25
-      trace = [0..if present then 9 else 8]
-  seen <- newIORef []
-  outcome <- try (validate (Exchange.TransactionShape 16 (\step -> do
-    modifyIORef' seen (++[step])
-    if step == fault then ioError (userError "activation setting fault") else pure (testBit mask step))))
-      :: IO (Either SomeException Int)
-  observed <- readIORef seen
-  let wantedTrace = if fault `elem` trace then takeWhile (/=fault) trace ++ [fault] else trace
-  pure $ conjoin [observed === wantedTrace, case outcome of
-    Left _ -> property (fault `elem` trace)
-    Right code -> conjoin [property (fault `notElem` trace),code === expected]]
-
-oracleProfileAbi :: Property
-oracleProfileAbi = forAll ((,,) <$> choose (0,221) <*> arbitrary <*> arbitrary) $ \(offset,byte,confirmations) -> ioProperty $ do
-  let truth = B.concat [B.replicate 32 i | i <- [1..4]]
-      widths = [8,8,4,8,8,8,4,4,4,4,4,4,4,4,8,8]
-      fields = [0,1,1,1,1,1,1,0,1000000,0,9999,9999,499999999,10000,100000000,100000000]
-      original = B.cons 1 truth <> B.concat (zipWith wordBE widths fields)
-      input = if offset==221 then original else B.take offset original <> B.singleton byte <> B.drop (offset+1) original
-      expected = validate (Exchange.HybridOracleProfile confirmations truth input)
-  B.useAsCString input $ \ptr -> B.useAsCString truth $ \hashes -> withArray (replicate 18 (0xa5::Word8)) $ \output -> do
-    code <- elements_hs_exchange_frozen_profile 0 confirmations 221 (castPtr ptr) (castPtr hashes) (output `plusPtr` 1)
-    values <- peekArray 18 output
-    rejected <- sequence [elements_hs_exchange_frozen_profile 0 confirmations size p h q |
-      (size,p,h,q) <- [(220,castPtr ptr,castPtr hashes,output),(222,castPtr ptr,castPtr hashes,output),
-        (221,nullPtr,castPtr hashes,output),(221,castPtr ptr,nullPtr,output),(221,castPtr ptr,castPtr hashes,nullPtr)]]
-    unchanged <- peekArray 18 output
-    pure $ conjoin [code===(case expected of Nothing -> 1; Just _ -> 0),
-      values===([0xa5] ++ maybe (replicate 16 0xa5) (\(a,b) -> B.unpack (wordBE 8 a <> wordBE 8 b)) expected ++ [0xa5]),
-      rejected===replicate 5 (-1),unchanged===values]
-
-truthProfileAbi :: Property
-truthProfileAbi = forAll ((,) <$> choose (0,389) <*> arbitrary) $ \(offset,byte) -> ioProperty $ do
-  let original = B.pack (3:replicate 385 1) <> wordBE 4 16777216
-      input = B.take offset original <> B.singleton byte <> B.drop (offset+1) original
-      expected = validate (Exchange.TruthcoinProfile input)
-  B.useAsCString input $ \ptr -> withArray (replicate 166 (0xa5::Word8)) $ \output -> do
-    code <- elements_hs_exchange_frozen_profile 1 0 390 (castPtr ptr) nullPtr (output `plusPtr` 1)
-    values <- peekArray 166 output
-    invalid <- elements_hs_exchange_frozen_profile 11 0 390 (castPtr ptr) nullPtr output
-    missing <- elements_hs_exchange_frozen_profile 1 0 390 nullPtr nullPtr output
-    pure $ conjoin [code===(case expected of Nothing -> 1; Just _ -> 0),
-      values===([0xa5] ++ maybe (replicate 164 0xa5) B.unpack expected ++ [0xa5]),invalid===(-1),missing===(-1)]
-
-checkpointProfileAbi :: Property
-checkpointProfileAbi = forAll ((,,) <$> arbitrary <*> choose (0,72) <*> arbitrary) $ \(anchor,offset,byte) -> ioProperty $ do
-  let policy = B.replicate 32 3
-      first = B.replicate 32 1
-      second = B.replicate 32 2
-      original = B.singleton 1 <> first <> (if anchor then wordBE 8 1 <> second else second <> wordBE 8 1123200)
-      input = B.take offset original <> B.singleton byte <> B.drop (offset+1) original
-      expected = validate (Exchange.CheckpointProfile anchor policy input)
-      mode = if anchor then 3 else 2
-  B.useAsCString input $ \ptr -> B.useAsCString policy $ \key -> withArray (replicate 66 (0xa5::Word8)) $ \output -> do
-    code <- elements_hs_exchange_frozen_profile mode 0 73 (castPtr ptr) (castPtr key) (output `plusPtr` 1)
-    values <- peekArray 66 output
-    invalid <- elements_hs_exchange_frozen_profile mode 0 72 (castPtr ptr) (castPtr key) output
-    missing <- elements_hs_exchange_frozen_profile 3 0 73 (castPtr ptr) nullPtr output
-    pure $ conjoin [code===(case expected of Nothing -> 1; Just _ -> 0),
-      values===([0xa5]++maybe (replicate 64 0xa5) B.unpack expected++[0xa5]),invalid===(-1),missing===(-1)]
-
-identityProfileAbi :: Property
-identityProfileAbi = forAll ((,,) <$> arbitrary <*> choose (0,177) <*> arbitrary) $ \(availability,index,byte) -> ioProperty $ do
-  let expectedKey = B.replicate (if availability then 32 else 16) 3
-      original = if availability then B.singleton 1 <> expectedKey <> B.replicate 32 2 <> B.pack [3,5] <> wordBE 4 16777216
-        else B.pack [5,3] <> B.replicate 32 1 <> expectedKey <> B.replicate 128 2
-      offset = index `mod` B.length original
-      input = B.take offset original <> B.singleton byte <> B.drop (offset+1) original
-      expected = validate (Exchange.IdentityProfile availability expectedKey input)
-      count = if availability then 64 else 161
-      mode = if availability then 5 else 4
-  B.useAsCString input $ \ptr -> B.useAsCString expectedKey $ \key -> withArray (replicate (count+2) (0xa5::Word8)) $ \output -> do
-    code <- elements_hs_exchange_frozen_profile mode 0 (fromIntegral (B.length input)) (castPtr ptr) (castPtr key) (output `plusPtr` 1)
-    values <- peekArray (count+2) output
-    missing <- elements_hs_exchange_frozen_profile mode 0 (fromIntegral (B.length input)) (castPtr ptr) nullPtr output
-    pure $ conjoin [code===(case expected of Nothing -> 1; Just _ -> 0),missing===(-1),
-      values===([0xa5]++maybe (replicate count 0xa5) B.unpack expected++[0xa5])]
-
-matcherAccumulatorAbi :: Property
-matcherAccumulatorAbi = forAll ((,,,) <$> arbitrary <*> arbitrary <*> choose (0,99) <*> arbitrary) $ \(matcher,signer,index,byte) -> ioProperty $ do
-  let original = if matcher then B.singleton 1 <> wordBE 8 0 <> B.replicate 32 1 <> wordBE 8 0 <> B.replicate 32 2 <> wordBE 4 6
-        else B.replicate 32 1 <> B.replicate 32 2 <> B.replicate 32 3 <> wordBE 4 64
-      offset = index `mod` B.length original
-      input = B.take offset original <> B.singleton byte <> B.drop (offset+1) original
-      expected = if matcher then validate (Exchange.MatcherProfile signer input) else validate (Exchange.AccumulatorProfile input)
-      count = if matcher then 32 else 96
-      mode = if matcher then 6 else 7
-  B.useAsCString input $ \ptr -> withArray (replicate (count+2) (0xa5::Word8)) $ \output -> do
-    code <- elements_hs_exchange_frozen_profile mode (if signer then 1 else 0) (fromIntegral (B.length input)) (castPtr ptr) nullPtr (output `plusPtr` 1)
-    values <- peekArray (count+2) output
-    invalid <- elements_hs_exchange_frozen_profile 6 2 85 (castPtr ptr) nullPtr output
-    pure $ conjoin [code===(case expected of Nothing -> 1; Just _ -> 0),invalid===(-1),
-      values===([0xa5]++maybe (replicate count 0xa5) B.unpack expected++[0xa5])]
-
-frozenTailAbi :: Property
-frozenTailAbi = forAll ((,,) <$> arbitrary <*> choose (0,259) <*> arbitrary) $ \(direct,offset,byte) -> ioProperty $ do
-  let original = B.concat (map (wordBE 4) [6,65536,8,589824,786432,64,64,4096,6]) <>
-        B.replicate 192 (if direct then 0 else 1) <>
-        B.concat (zipWith wordBE [8,4,4,8,8] [1,1,32,2100000000000000,1008])
-      input = B.take offset original <> B.singleton byte <> B.drop (offset+1) original
-      expected = validate (Exchange.FrozenTail direct input)
-  B.useAsCString input $ \ptr -> withArray [0xa5::Word8] $ \output -> do
-    code <- elements_hs_exchange_frozen_profile 8 (if direct then 1 else 0) 260 (castPtr ptr) nullPtr output
-    invalid <- elements_hs_exchange_frozen_profile 8 2 260 (castPtr ptr) nullPtr output
-    value <- peek output
-    pure $ conjoin [code===fromIntegral expected,invalid===(-1),value===0xa5]
-
-configurationIdentitiesAbi :: Property
-configurationIdentitiesAbi = forAll ((,,) <$> arbitrary <*> arbitrary <*> vectorOf 36 arbitrary) $ \(outer,direct,tags) -> ioProperty $ do
-  let offsets = [2,50,82,146,179,211,754,1096,1132,1164,1196] ++
-        map (+1232) ([0,32..224] ++ [257,289] ++ [325,357..453]) ++ [1753,1785..1913] ++ [114,293,325,681]
-      put encodedSoFar (offset,tag) = B.take offset encodedSoFar <> B.replicate 32 tag <> B.drop (offset+32) encodedSoFar
-      input = foldl put (B.cons (if direct then 6 else 5) (B.replicate 1976 0)) (zip offsets tags)
-      expected = validate (Exchange.ConfigurationIdentities outer input)
-  B.useAsCString input $ \ptr -> withArray [0xa5::Word8] $ \output -> do
-    code <- elements_hs_exchange_frozen_profile 10 (if outer then 1 else 0) 1977 (castPtr ptr) nullPtr output
-    invalid <- elements_hs_exchange_frozen_profile 10 2 1977 (castPtr ptr) nullPtr output
-    short <- elements_hs_exchange_frozen_profile 10 0 1976 (castPtr ptr) nullPtr output
-    value <- peek output
-    pure $ conjoin [code===fromIntegral expected,invalid===(-1),short===(-1),value===0xa5]
-
-bondProfileAbi :: Property
-bondProfileAbi = forAll ((,) <$> choose (0,484) <*> arbitrary) $ \(offset,byte) -> ioProperty $ do
-  let codec = B.replicate 32 9
-      original = B.replicate 192 1 <> B.pack (snd (Constants.exchangeIdentities !! 1)) <>
-        B.pack (snd (head Constants.exchangeIdentities)) <> B.singleton 0xbe <>
-        B.replicate 32 2 <> B.replicate 32 3 <> wordBE 4 12 <> B.replicate 128 4 <> codec
-      input = B.take offset original <> B.singleton byte <> B.drop (offset+1) original
-      expected = validate (Exchange.BondProfile codec input)
-  B.useAsCString input $ \ptr -> B.useAsCString codec $ \key -> withArray [0xa5::Word8] $ \output -> do
-    code <- elements_hs_exchange_frozen_profile 9 0 485 (castPtr ptr) (castPtr key) output
-    missing <- elements_hs_exchange_frozen_profile 9 0 485 (castPtr ptr) nullPtr output
-    short <- elements_hs_exchange_frozen_profile 9 0 484 (castPtr ptr) (castPtr key) output
-    value <- peek output
-    pure $ conjoin [code===(maybe 1 (const 0) expected),missing===(-1),short===(-1),value===0xa5]
-
-bondSettingsOrder :: Property
-bondSettingsOrder = forAll ((,) <$> choose (-1,39) <*> choose (-1,39)) $ \(failed,fault) -> ioProperty $ do
-  seen <- newIORef []
-  result <- try (validate (Exchange.TransactionShape 17 (\step -> do
-    modifyIORef' seen (++[step])
-    if step==fault then ioError (userError "bond setting read") else pure (step/=failed))))
-      :: IO (Either SomeException Int)
-  observed <- readIORef seen
-  let lastStep = if failed<0 then 39 else failed
-      reached = fault>=0 && fault<=lastStep
-      expected = if failed<0 then 0 else if failed>36 then 38 else failed+1
-  pure $ conjoin [observed===[0..if reached then fault else lastStep],
-    case result of Left _ -> property reached; Right code -> conjoin [property (not reached),code===expected]]
-
-deploymentOutputScan :: Property
-deploymentOutputScan = forAll (listOf1 (choose (0,511 :: Word64))) $ \facts ->
-  forAll (choose (0,length facts-1)) $ \skipped -> ioProperty $ do
-    seen <- newIORef []
-    result <- validate (Exchange.DeploymentOutputs (fromIntegral skipped) (fromIntegral (length facts)) (\index -> do
-      modifyIORef' seen (++[fromIntegral index :: Int])
-      pure (facts !! fromIntegral index)))
-    observed <- readIORef seen
-    let validFact bits=bits<256 && all (testBit bits) [0,1,2] && not (testBit bits 3) &&
-          (not (testBit bits 4) || testBit bits 7) && (not (testBit bits 5) || not (testBit bits 6))
-        indices=filter (/=skipped) [0..length facts-1]
-        passed=takeWhile (validFact . (facts !!)) indices
-        accepted=length passed==length indices
-    invalid <- validate (Exchange.DeploymentOutputs 1 1 (\_ -> error "invalid range read"))
-    pure $ conjoin [result===(if accepted then Right Nothing else Left 2),
-      observed===take (length passed+1) indices,invalid===Left (-1)]
-
-runtimeIdentityBinding :: Property
-runtimeIdentityBinding = forAll ((,,) <$> vectorOf 16 (arbitrary :: Gen Word8) <*> choose (0,15 :: Int) <*> arbitrary) $
-  \(tags,index,replacement) -> ioProperty $ do
-    let baseline i=replicate 32 (tags !! if i<2 then i else i-i `mod` 2)
-        hashes=[if i==index then replicate 32 replacement else baseline i | i <- [0..15]]
-        expected=if hashes !! 0/=hashes !! 1 && and [hashes !! i==hashes !! (i+1) | i <- [2,4..14]] then 0 else 1
-    actual <- withArray (concat hashes) (elements_hs_exchange_identity_relation 12 16)
-    invalid <- sequence [elements_hs_exchange_identity_relation 12 count nullPtr | count <- [0,15,16,17]]
-    unknown <- withArray (concat hashes) (elements_hs_exchange_identity_relation 13 16)
-    pure $ conjoin [actual===expected,invalid===replicate 4 (-1),unknown===(-1),
-      validate (Exchange.RuntimeIdentities (map B.pack hashes))===(expected==0),
-      property (not (validate (Exchange.RuntimeIdentities []))),
-      property (not (validate (Exchange.RuntimeIdentities (B.empty:map B.pack (tail hashes)))))]
-
-activationFactBinding :: Property
-activationFactBinding = forAll ((,,,) <$> vectorOf 40 (choose (1,255 :: Word8)) <*> choose (0,39 :: Int) <*>
-  choose (0,2 :: Int) <*> arbitrary) $ \(tags,index,mode,replacement) -> ioProperty $ do
-    let groups=[[0,1],[2,3],[4,5,6],[7,8],[9,10],[11,12],[13,14],[15,16],[17,18],[19,20],[21,22],[25,26,27],[24,28],[29,30]]
-        baseline i | i `elem` [13,14] = snd (Constants.exchangeIdentities !! 1)
-                   | i `elem` [15,16] = snd (head Constants.exchangeIdentities)
-                   | otherwise = replicate 32 (tags !! head ([head group | group <- groups,i `elem` group]++[i]))
-        hashes=[if i==index && mode/=0 then replicate 32 (if mode==1 then 0 else replacement) else baseline i | i <- [0..39]]
-        at i=hashes !! i
-        joined=all (\group -> all ((==at (head group)) . at) (tail group)) groups &&
-          at 14==snd (Constants.exchangeIdentities !! 1) && at 16==snd (head Constants.exchangeIdentities) &&
-          at 22/=at 23 && at 22/=at 24 && at 24/=at 23
-        expected | not joined = 1
-                 | any (all (==0) . at) ([31..39]++[22,24,18,20]) = 2
-                 | otherwise = 0
-    actual <- withArray (concat hashes) (elements_hs_exchange_identity_relation 11 40)
-    invalid <- sequence [elements_hs_exchange_identity_relation 11 count nullPtr | count <- [0,39,40,41]]
-    unknown <- withArray (concat hashes) (elements_hs_exchange_identity_relation 12 40)
-    pure $ conjoin [actual===expected, invalid===replicate 4 (-1), unknown===(-1),
-      validate (Exchange.ActivationFacts (map B.pack hashes))===fromIntegral expected,
-      validate (Exchange.ActivationFacts [])===(-1),
-      validate (Exchange.ActivationFacts (B.empty:map B.pack (tail hashes)))===(-1)]
-
-frozenIdentityOrder :: Property
-frozenIdentityOrder = forAll ((,) <$> arbitrary <*> vectorOf 22 (choose (0,24 :: Word8))) $ \(direct,tags) -> ioProperty $ do
-  let duplicate values = or [a==b | (i,a) <- zip [0::Int ..] values,b <- drop (i+1) values]
-      expected | duplicate (take 3 tags) = 1
-               | duplicate (take (if direct then 3 else 5) (drop 3 tags)) = 2
-               | duplicate (take 9 (drop 8 tags)) = 3
-               | tags !! 17 `elem` drop 18 tags = 4
-               | otherwise = 0
-      mode = if direct then 10 else 9
-  actual <- withArray (concatMap (replicate 32) tags) (elements_hs_exchange_identity_relation mode 22)
-  invalid <- sequence [elements_hs_exchange_identity_relation mode count nullPtr | count <- [0,21,22,23,46]]
-  pure $ conjoin [actual===expected,invalid===replicate 5 (-1)]
-
-deploymentIdentityOrder :: Property
-deploymentIdentityOrder = forAll ((,) <$> arbitrary <*> vectorOf 22 (choose (0,24 :: Word8))) $ \(direct,tags) -> ioProperty $ do
-  let duplicate values = or [a==b | (i,a) <- zip [0::Int ..] values,b <- drop (i+1) values]
-      proofs = take (if direct then 3 else 5) (drop 3 tags)
-      proofErrors = [if value==0 then 2 else 3 | (i,value) <- zip [0::Int ..] proofs,value==0 || value `elem` drop (i+1) proofs]
-      expected | duplicate (take 3 tags) = 1
-               | first:_ <- proofErrors = first
-               | duplicate (0:take 9 (drop 8 tags)) = 4
-               | tags !! 17 `elem` (0:drop 18 tags) = 5
-               | otherwise = 0
-      mode = if direct then 6 else 5
-  actual <- withArray (concatMap (replicate 32) tags) (elements_hs_exchange_identity_relation mode 22)
-  missing <- elements_hs_exchange_identity_relation mode 22 nullPtr
-  wrongCount <- elements_hs_exchange_identity_relation mode 21 nullPtr
-  pure $ conjoin [actual===expected,missing===(-1),wrongCount===(-1)]
-
-blinderIdentityOrder :: Property
-blinderIdentityOrder = forAll ((,,) <$> tag <*> tag <*> tag) $ \(issuance,asset,value) -> ioProperty $ do
-  let tags = [issuance,asset,value]
-      expected | issuance==0 || issuance==asset || issuance==value = 1
-               | asset==value = 2
-               | otherwise = 0
-  actual <- withArray (concatMap (replicate 32) tags) (elements_hs_exchange_identity_relation 4 3)
-  missing <- elements_hs_exchange_identity_relation 4 3 nullPtr
-  wrongCount <- elements_hs_exchange_identity_relation 4 2 nullPtr
-  pure $ conjoin [actual===expected,missing===(-1),wrongCount===(-1),
-    validate (Exchange.BlinderIdentities [B.empty,B.replicate 32 1,B.replicate 32 2])===(-1)]
-  where tag = choose (0,3 :: Word8)
-
-proofIdentityOrder :: Property
-proofIdentityOrder = forAll (choose (0,45)) $ \count ->
-  forAll (vectorOf count (choose (0,45 :: Word8))) $ \tags -> ioProperty $ do
-    let values = map (replicate 32) tags
-        failures = [if value==0 then 1 else 2 :: Int32 |
-          (i,value) <- zip [0::Int ..] tags, value==0 || value `elem` drop (i+1) tags]
-        expected = case failures of [] -> 0; first:_ -> first
-    actual <- withArray (concat values) (elements_hs_exchange_identity_relation 3 (fromIntegral count))
-    invalid <- elements_hs_exchange_identity_relation 3 46 nullPtr
-    missing <- elements_hs_exchange_identity_relation 3 1 nullPtr
-    pure $ conjoin [actual===expected,invalid===(-1),missing===(-1),
-      validate (Exchange.ProofIdentities [B.empty])===(-1)]
-
-identitySentinelRules :: Property
-identitySentinelRules = forAll (vectorOf 9 (choose (0,10 :: Word8))) $ \tags ->
-  let values = map (B.replicate 32) tags
-      zero = B.replicate 32 0
-      distinct = and [a/=b | (i,a) <- zip [0::Int ..] values, b <- drop (i+1) values]
-  in conjoin
-    [validate (Exchange.IdentitySet (zero:values)) === (all (/=0) tags && distinct),
-     validate (Exchange.IsolatedIdentity (head values:zero:tail values)) ===
-       (head tags/=0 && head tags `notElem` tail tags)]
-
-startupBoundsAbi :: Property
-startupBoundsAbi = forAll ((,,,) <$> signed <*> signed <*> activation <*> signed) $ \(price,height,start,mtp) -> ioProperty $ do
-  let priceFields=[fromIntegral price :: Word64]
-      contextFields=map fromIntegral [height,fromIntegral start,mtp] :: [Word64]
-      priceValid=price>0
-      activationFields=[fromIntegral height,2147483647]
-      activationValid=height>0 && height<2147483647
-      contextValid=height>0 && height<fromIntegral start && mtp>0 && mtp<=4294967295
-  priceCode <- withArray priceFields (elements_hs_exchange_frozen_bounds 1)
-  activationCode <- withArray activationFields (elements_hs_exchange_frozen_bounds 2)
-  contextCode <- withArray contextFields (elements_hs_exchange_frozen_bounds 3)
-  missing <- mapM (\count -> elements_hs_exchange_frozen_bounds count nullPtr) [1,2,3]
-  pure $ conjoin [priceCode===(if priceValid then 0 else 1),contextCode===(if contextValid then 0 else 1),
-    validate (Exchange.FrozenBounds priceFields)===priceValid,validate (Exchange.FrozenBounds contextFields)===contextValid,
-    activationCode===(if activationValid then 0 else 1),
-    validate (Exchange.FrozenBounds activationFields)===activationValid,
-    missing===replicate 3 (-1)]
-  where
-    signed=frequency [(1,arbitrary),(2,elements [minBound,-1,0,1,2,2147483647,2147483648,4294967295,4294967296,maxBound :: Int64])]
-    activation=frequency [(1,arbitrary),(2,elements [minBound,-1,0,1,2,maxBound :: Int32])]
-
-activationShapeOrder :: Property
-activationShapeOrder = forAll gen $ \values -> ioProperty $ do
-  let accepted = [values!!0==5,values!!1==32,values!!2==800,values!!3==80,
-        values!!4 `elem` [33,65..4129],values!!5 `elem` [190,191]]
-      failure = List.findIndex not accepted
-      wanted = case failure of
-        Nothing -> (1,[0..5])
-        Just index -> (if values!!index<0 then -1 else 0,[0..index])
-      run invoke = do
-        trace <- newIORef []
-        code <- invoke (\step -> modifyIORef' trace (++[fromIntegral step]) >> pure (values!!fromIntegral step))
-        seen <- readIORef trace
-        pure (code,seen)
-  direct <- run (validate . ScriptPolicy.ActivationShape)
-  abi <- run (\action -> bracket (wrapMatchFact (\_ -> action)) freeHaskellFunPtr $ \callback ->
-    elements_hs_activation_shape callback nullPtr)
-  missing <- elements_hs_activation_shape nullFunPtr nullPtr
-  pure $ conjoin [direct===wanted,abi===wanted,missing===(-1)]
-  where
-    gen = do
-      base <- sequence [pure 5,pure 32,pure 800,pure 80,elements [33,65,4129],elements [190,191]]
-      frequency [(1,pure base),(3,do
-        index <- chooseInt (0,5)
-        value <- elements [minBound,-1,0,1,5,31,32,33,34,80,190,191,192,255,256,799,800,801,4129,4130,maxBound]
-        pure (take index base++[value]++drop (index+1) base))]
-
-activationCreditOrder :: Property
-activationCreditOrder = forAll gen $ \(ordinary,input,replies) -> ioProperty $ do
-  let eligible = ordinary>=0 && ordinary<=1002636 && input==0
-      wanted = if not eligible then (Right ordinary,[]) else case List.findIndex (/=1) replies of
-        Nothing -> (Right 1002636,[0..6])
-        Just index -> (if replies!!index==0 then Right ordinary else Left (-1),[0..index])
-      run invoke = do
-        trace <- newIORef []
-        code <- invoke (\step -> modifyIORef' trace (++[fromIntegral step]) >> pure (replies!!fromIntegral step))
-        seen <- readIORef trace
-        pure (code,seen)
-  direct <- run (validate . ScriptPolicy.ActivationBudget ordinary input)
-  abi <- run (\action -> bracket (wrapPolicyEffect (\_ -> action)) freeHaskellFunPtr $ \callback ->
-    alloca $ \output -> do
-      poke output 42
-      code <- elements_hs_activation_budget ordinary input output callback nullPtr
-      value <- peek output
-      if code==0 then pure (Right value)
-      else if value==42 then pure (Left code) else fail "failed activation budget modified output")
-  missing <- alloca $ \output -> do
-    poke output 42
-    code <- elements_hs_activation_budget ordinary input output nullFunPtr nullPtr
-    value <- peek output
-    pure (code,value)
-  absentReads <- newIORef (0 :: Int)
-  absent <- bracket (wrapPolicyEffect (\_ _ -> modifyIORef' absentReads (+1) >> pure 1)) freeHaskellFunPtr $ \callback ->
-    elements_hs_activation_budget ordinary input nullPtr callback nullPtr
-  absentCount <- readIORef absentReads
-  pure $ conjoin [direct===wanted,abi===wanted,missing===(-1,42),absent===(-1),absentCount===0]
-  where
-    gen = (,,) <$> elements [minBound,-1,0,1,1002636,1002637,maxBound] <*> elements [0,1,maxBound] <*>
-      frequency [(1,pure (replicate 7 1)),(3,vectorOf 7 (elements [-1,0,1,2]))]
-
-foreign import ccall "wrapper" wrapRustVersion :: RustVerifierVersion -> IO (FunPtr RustVerifierVersion)
-foreign import ccall "wrapper" wrapRustIdentity :: RustVerifierIdentity -> IO (FunPtr RustVerifierIdentity)
-
-verifierIdentityOrder :: Property
-verifierIdentityOrder = forAll gen $ \(active,configured,available,abiVersion,formatVersion,status,matches) -> ioProperty $ do
-  trace <- newIORef ([] :: [Int])
-  let called step value = modifyIORef' trace (++[step]) >> pure value
-      wanted
-        | not active = (0,[])
-        | not configured = (1,[])
-        | not available = (6,[])
-        | abiVersion /= 1 = (2,[1])
-        | formatVersion /= 1 = (3,[1,2])
-        | status /= 0 = (4,[1,2,3])
-        | not matches = (5,[1,2,3])
-        | otherwise = (0,[1,2,3])
-  result <- bracket (wrapRustVersion (called 1 abiVersion)) freeHaskellFunPtr $ \version ->
-    bracket (wrapRustVersion (called 2 formatVersion)) freeHaskellFunPtr $ \format ->
-    bracket (wrapRustIdentity (\out size -> do
-      if size /= 32 then fail "incorrect identity buffer size" else
-        pokeArray out (replicate 32 (if matches then 7 else 9))
-      called 3 status)) freeHaskellFunPtr $ \identity ->
-    withArray (replicate 32 (if configured then 7 else 0)) $ \expected ->
-      elements_hs_verifier_identity (if active then 1 else 0) 1 1 expected
-        (if available then version else nullFunPtr) format identity
-  seen <- readIORef trace
-  inactive <- elements_hs_verifier_identity 0 1 1 nullPtr nullFunPtr nullFunPtr nullFunPtr
-  invalid <- elements_hs_verifier_identity 2 1 1 nullPtr nullFunPtr nullFunPtr nullFunPtr
-  missing <- elements_hs_verifier_identity 1 1 1 nullPtr nullFunPtr nullFunPtr nullFunPtr
-  pure (conjoin [(result,seen) === wanted,inactive === 0,invalid === (-1),missing === (-1)])
-  where gen = (,,,,,,) <$> arbitrary <*> arbitrary <*> arbitrary <*>
-          elements [0,1,2,maxBound] <*> elements [0,1,2,maxBound] <*>
-          elements [0,1,2,3,4,maxBound] <*> arbitrary
-
-verifierStartupOrder :: Property
-verifierStartupOrder = forAll ((,) <$> arbitrary <*> frequency
-  [(1,pure (replicate 6 1)),(3,vectorOf 6 (elements [-1,0,1,2]))]) $ \(active,replies) -> ioProperty $ do
-  let failure = List.findIndex (/=1) replies
-      wanted = if not active then (0,[]) else case failure of
-        Nothing -> (0,[0..5])
-        Just index -> (if replies!!index==0 then [1,6,2,3,4,5]!!index else -1,[0..index])
-      run invoke = do
-        trace <- newIORef []
-        code <- invoke (\step -> modifyIORef' trace (++[fromIntegral step]) >> pure (replies!!fromIntegral step))
-        seen <- readIORef trace
-        pure (code,seen)
-  direct <- run (validate . ScriptPolicy.VerifierStartup active)
-  abi <- run (\action -> bracket (wrapPolicyEffect (\_ -> action)) freeHaskellFunPtr $ \callback ->
-    elements_hs_verifier_startup (if active then 1 else 0) callback nullPtr)
-  missing <- elements_hs_verifier_startup 0 nullFunPtr nullPtr
-  invalid <- elements_hs_verifier_startup 2 nullFunPtr nullPtr
-  pure $ conjoin [direct===wanted,abi===wanted,missing===(-1),invalid===(-1)]
-
 depositInputLimitAbi :: Property
 depositInputLimitAbi = forAll gen $ \(enabled,rows,limit,fault) -> ioProperty $ do
   let events = if not enabled then [] else concat
@@ -1172,109 +378,6 @@ depositInputLimitAbi = forAll gen $ \(enabled,rows,limit,fault) -> ioProperty $ 
       fault <- chooseInt (-1,126)
       pure (enabled,rows,limit,fault)
 
-returnMarkerAbi :: Property
-returnMarkerAbi = forAll gen $ \(magic,encoded) -> ioProperty $ do
-  let wanted = B.take 1 encoded == B.singleton 106 &&
-        B.unpack magic `List.isInfixOf` drop 1 (B.unpack encoded)
-  (actual,empty,missing,oversized) <- B.useAsCString magic $ \marker -> do
-    actual <- B.useAsCStringLen encoded $ \(ptr,size) ->
-      elements_hs_return_marker (fromIntegral size) (castPtr ptr) (castPtr marker)
-    empty <- elements_hs_return_marker 0 nullPtr (castPtr marker)
-    missing <- elements_hs_return_marker 1 nullPtr (castPtr marker)
-    oversized <- elements_hs_return_marker maxBound nullPtr (castPtr marker)
-    pure (actual,empty,missing,oversized)
-  noMarker <- elements_hs_return_marker 0 nullPtr nullPtr
-  pure $ conjoin [actual === if wanted then 1 else 0,
-    validate (ScriptPolicy.ReturnMarker magic encoded) === wanted,
-    empty === 0, missing === -1, oversized === -1, noMarker === -1]
-  where
-    gen = do
-      magic <- B.pack <$> vectorOf 4 arbitrary
-      raw <- B.pack <$> resize 80 arbitrary
-      position <- chooseInt (0,B.length raw)
-      prefix <- arbitrary
-      encoded <- elements [raw, B.cons prefix (B.take position raw <> magic <> B.drop position raw),
-        B.singleton 106 <> B.take position raw <> magic <> B.drop position raw]
-      pure (magic,encoded)
-
-bondMarkerPolicyAbi :: Property
-bondMarkerPolicyAbi = forAll gen $ \(exact,encoded) -> ioProperty $ do
-  actual <- B.useAsCStringLen encoded $ \(ptr,size) ->
-    elements_hs_bond_marker_policy (if exact then 1 else 0) (fromIntegral size) (castPtr ptr)
-  let raw = B.unpack encoded
-      wanted = if exact then length raw==507 && take 2 raw==[106,77]
-               else length raw>=8 && take 1 raw==[106] && [69,67,88,66] `List.isInfixOf` drop 1 raw
-  missing <- elements_hs_bond_marker_policy 0 1 nullPtr
-  oversized <- elements_hs_bond_marker_policy 0 maxBound nullPtr
-  invalid <- elements_hs_bond_marker_policy 2 0 nullPtr
-  empty <- elements_hs_bond_marker_policy 0 0 nullPtr
-  pure $ conjoin [actual===(if wanted then 1 else 0),
-    validate (ScriptPolicy.BondMarkerPolicy exact encoded)===wanted,
-    missing===(-1),oversized===(-1),invalid===(-1),empty===0]
-  where
-    gen = do
-      exact <- arbitrary
-      size <- elements [0,1,2,4,7,8,9,506,507,508,600]
-      raw <- B.pack <$> vectorOf size arbitrary
-      position <- chooseInt (0,size)
-      encoded <- elements [raw, B.take size (B.pack [106,77] <> raw),
-        B.singleton 106 <> B.take position raw <> B.pack [69,67,88,66] <> B.drop position raw]
-      pure (exact,encoded)
-
-witnessAnnexOrder :: Property
-witnessAnnexOrder = forAll ((,) <$> vectorOf 8 arbitrary <*> choose (-1,9 :: Int)) $ \(flags,fault) ->
-  let yes step = flags !! (if step==5 then 1 else step-1)
-      branch step accepted rejected =
-        let (code,rest) = if yes step then accepted else rejected
-        in (code,(fromIntegral step,if yes step then 1 else 0):rest)
-      reject = (1,[])
-      usdd = branch 5 (branch 6 (branch 7 reject (branch 8 (3,[]) reject)) reject) reject
-      fallback = branch 4 usdd (2,[])
-      (expected,script) = branch 1 (branch 2 (branch 3 (2,[]) fallback) fallback) (0,[])
-  in ioProperty $ commandTrace 263 8 (\phase result -> validate (ScriptPolicy.WitnessAnnexFlow phase result))
-       script fault expected
-
-foreign import ccall "wrapper" wrapRustCustody :: RustCustody -> IO (FunPtr RustCustody)
-
-custodyVerifierAbi :: Property
-custodyVerifierAbi = forAll ((,,,) <$> choose (0,8 :: Word64) <*> elements [0,1,137 :: Word64] <*>
-    chooseInt (0,4) <*> arbitrary) $ \(count,extra,missing,accepted) -> ioProperty $ do
-  let size = count*138+extra
-  withArray ([17,29] :: [Word8]) $ \bundle ->
-    withArray ([31,41,53] :: [Word8]) $ \registry ->
-      allocaBytes (max 1 (fromIntegral size)) $ \receipts -> do
-        calls <- newIORef ([] :: [Bool])
-        let callback b bl r rl c n = do
-              modifyIORef' calls (++[b==bundle && bl==2 && r==registry && rl==3 && c==receipts && fromIntegral n==count])
-              pure (if accepted then 1 else 0)
-        bracket (wrapRustCustody callback) freeHaskellFunPtr $ \verify -> do
-          result <- elements_hs_verify_custody (if missing==1 then nullFunPtr else verify)
-            (if missing==2 then nullPtr else bundle) 2 (if missing==3 then nullPtr else registry) 3
-            (if missing==4 then nullPtr else receipts) size count
-          observed <- readIORef calls
-          let reached = extra==0 && missing/=1 && missing/=2 && missing/=3 && (missing/=4 || size==0)
-              forwarded = missing/=4
-          pure (result == (if reached && accepted then 1 else 0) && observed == (if reached then [forwarded] else []))
-
-custodyCountOverflow :: Property
-custodyCountOverflow = once $ ioProperty $ withArray [0 :: Word8] $ \buffer -> do
-  calls <- newIORef (0 :: Int)
-  codes <- bracket (wrapRustCustody (\_ _ _ _ _ _ -> modifyIORef' calls (+1) >> pure 1))
-    freeHaskellFunPtr $ \verify -> sequence
-      [elements_hs_verify_custody verify buffer 1 buffer 1 buffer (count*138) count |
-        count <- [maxBound `div` 138+1,2^(63 :: Int),maxBound :: Word64]]
-  observed <- readIORef calls
-  pure $ conjoin [codes===replicate 3 0,observed===0]
-
-journalVerifierOrder :: Property
-journalVerifierOrder = forAll ((,,) <$> arbitrary <*> arbitrary <*> arbitrary) $ \(valid,available,status) -> ioProperty $ do
-  calls <- newIORef ([] :: [Int])
-  let action index value = modifyIORef' calls (++[index]) >> pure value
-  result <- validate (ScriptPolicy.JournalVerifier valid (action 1 available) (action 2 status))
-  trace <- readIORef calls
-  pure (result == (if not valid then 1 else if not available then 2 else if status==0 then 0 else 1) &&
-        trace == (if not valid then [] else if not available then [1] else [1,2]))
-
 peerAdmissionOrder :: Property
 peerAdmissionOrder = forAll ((,,) <$> arbitrary <*> vectorOf 7 arbitrary <*> choose (-1,8 :: Int)) $
   \(syncing,flags,fault) ->
@@ -1289,60 +392,6 @@ peerAdmissionOrder = forAll ((,,) <$> arbitrary <*> vectorOf 7 arbitrary <*> cho
                        in (code,(2,1):rest)) (branch 7 accept reject)
   in ioProperty $ commandTrace (if syncing then 265 else 264) (if syncing then 2 else 7)
        (\phase result -> validate (Bmm.PeerAdmissionFlow syncing phase result)) script fault expected
-
-standardnessGateAbi :: Property
-standardnessGateAbi = forAll gen $ \(kind,facts,count,limit) -> ioProperty $ do
-  let expected
-        | kind>2 || (kind<2 && (count/=0 || limit/=0 || facts>7)) = -1
-        | kind==0 = if all (testBit facts) [0..2] then 1 else 0
-        | kind==1 = if any (testBit facts) [0..2] then 1 else 0
-        | facts/=0 || count>limit = 0
-        | otherwise = 1
-      direct = case kind of
-        0 -> validate (ScriptPolicy.AnnexNetwork facts)
-        1 -> validate (ScriptPolicy.OutputExceptions facts)
-        _ -> validate (ScriptPolicy.WitnessResources facts count limit)
-  actual <- elements_hs_standardness_gate kind facts count limit
-  pure $ conjoin [actual===expected,
-    if kind<=2 && (kind==2 || (count==0 && limit==0)) then direct===expected else property True]
-  where
-    gen = do
-      kind <- elements [0,1,2,3,maxBound]
-      facts <- frequency [(3,choose (0,7)),(1,arbitrary)]
-      (count,limit) <- frequency [(3,pure (0,0)),(2,(,) <$> elements [0,1,2,maxBound] <*> elements [0,1,2,maxBound])]
-      pure (kind,facts,count,limit)
-
-taprootWitnessPolicyAbi :: Property
-taprootWitnessPolicyAbi = forAll gen $ \(flags,count,leaf,scriptSize,input) -> ioProperty $ do
-  let annex = testBit flags 0
-      expected
-        | flags>3 || leaf>255 || count==0 = -1
-        | count>=2 = if leaf==190 then (if count-2==2 && scriptSize==32 then 1 else 0)
-            else if annex then 0 else 1
-        | count==1 = if annex && not (testBit flags 1 && input==0) then 0 else 1
-        | otherwise = 0
-  actual <- elements_hs_taproot_witness_policy flags count leaf scriptSize input
-  pure $ conjoin [actual===expected,
-    validate (ScriptPolicy.TaprootWitnessPolicy flags count leaf scriptSize input)===expected]
-  where
-    gen = (,,,,) <$> elements [0,1,2,3,4,maxBound] <*> elements [0,1,2,3,4,5,maxBound] <*>
-      frequency [(1,arbitrary),(4,elements [0,190,191,192,193,196,197,254,255,256,257,maxBound])] <*>
-      elements [0,1,31,32,33,maxBound] <*> elements [0,1,maxBound]
-
-transactionWeightAbi :: Property
-transactionWeightAbi = forAll gen $ \(bond,weight,annex,ordinary,proof) -> ioProperty $ do
-  actual <- elements_hs_transaction_weight bond weight annex ordinary proof
-  let rejected = annex > weight || (bond == 1 && annex /= 0) ||
-        (toInteger weight - toInteger annex > toInteger ordinary && bond == 0) ||
-        (annex /= 0 && weight > proof)
-      expected | bond > 1 = -1
-               | rejected = 0
-               | otherwise = 1
-  pure $ conjoin [actual===expected,
-    validate (ScriptPolicy.TransactionWeight bond weight annex ordinary proof)===expected]
-  where
-    weightEdge = frequency [(1,arbitrary),(4,elements [0,1,399999,400000,400001,1499999,1500000,1500001,maxBound])]
-    gen = (,,,,) <$> elements [0,1,2,maxBound] <*> weightEdge <*> weightEdge <*> weightEdge <*> weightEdge
 
 ctvAdmissionAbi :: Property
 ctvAdmissionAbi = forAll gen $ \(flags,size) -> ioProperty $ do
@@ -1363,18 +412,6 @@ ctvAdmissionAbi = forAll gen $ \(flags,size) -> ioProperty $ do
   where
     gen = frequency [(1,arbitrary),(5,(,) <$> choose (0,31) <*> elements [0,1,31,32,33,520,maxBound])]
 
-contextPresenceAbi :: Property
-contextPresenceAbi = forAll gen $ \(count,required) -> ioProperty $ do
-  actual <- elements_hs_context_presence count required
-  let expected | required == 0 || count > required = -1
-               | count == 0 = 0
-               | count == required = 1
-               | otherwise = 2
-  pure $ conjoin [actual===expected,validate (Exchange.ContextPresence count required)===expected]
-  where
-    gen = frequency [(1,arbitrary),(3,elements [(n,r) | r <- [0,1,2,3,7,8,maxBound],
-      n <- [0,1,r,if r==0 then 0 else r-1,if r==maxBound then r else r+1,maxBound]])]
-
 paymentUriAbi :: Property
 paymentUriAbi = forAll gen $ \(flags,scheme) -> ioProperty $ do
   actual <- elements_hs_payment_uri flags scheme
@@ -1382,7 +419,7 @@ paymentUriAbi = forAll gen $ \(flags,scheme) -> ioProperty $ do
       expected | flags>7 || scheme>5 = -1
                | otherwise = let (selected,accepted) = table !! fromIntegral flags
                              in if scheme==4 then selected else if scheme `elem` accepted then 1 else 0
-  pure $ conjoin [actual===expected,validate (Exchange.PaymentUri flags scheme)===expected]
+  pure $ conjoin [actual===expected,validate (NodeRules.PaymentUri flags scheme)===expected]
   where gen = frequency [(1,arbitrary),(5,(,) <$> elements [0..8] <*> elements [0,1,2,3,4,5,6,maxBound])]
 
 addressAliasAbi :: Property
@@ -1394,7 +431,7 @@ addressAliasAbi = forAll gen $ \(network,prefix) -> ioProperty $
                    | (flags,C.unpack network,C.unpack prefix) `elem`
                        [(0,"elements","ert"),(2,"elements","el")] = 1
                    | otherwise = 0
-      pure $ conjoin [actual===expected,validate (Exchange.AddressAlias flags network prefix)===expected]
+      pure $ conjoin [actual===expected,validate (NodeRules.AddressAlias flags network prefix)===expected]
       | flags <- [0,1,2,3,4,maxBound]]
     badNetwork <- elements_hs_address_alias 0 1 nullPtr 0 nullPtr
     badPrefix <- elements_hs_address_alias 0 0 nullPtr 1 nullPtr
@@ -1422,44 +459,13 @@ networkSelectionAbi = forAll (frequency [(1,B.pack <$> arbitrary),(3,elements (m
                    | name=="simplicity" = 4
                    | name=="dynafed" = 5
                    | otherwise = 0
-      pure $ conjoin [actual===expected,validate (Exchange.NetworkSelection mode flags text)===expected]
+      pure $ conjoin [actual===expected,validate (NodeRules.NetworkSelection mode flags text)===expected]
       | mode <- [0,1,2,3,4,maxBound], flags <- [0,1,2,maxBound]]
     missing <- elements_hs_network_selection 0 1 0 nullPtr
     noInput <- elements_hs_network_selection 0 0 1 nullPtr
     oversized <- elements_hs_network_selection 0 0 maxBound nullPtr
     empty <- elements_hs_network_selection 1 0 0 nullPtr
     pure $ conjoin (checks++[missing===(-1),noInput===(-1),oversized===(-1),empty===0])
-
-evaluatorSourceOrder :: Property
-evaluatorSourceOrder = forAll ((,) <$> arbitrary <*> choose (-1,3 :: Int)) $ \((private,frozen),fault) -> ioProperty $
-  let flag value = if value then 1 else 0
-      script = [(1,flag private)] ++ if not private then [] else
-        [(2,flag frozen)] ++ [(3,1) | not frozen]
-  in commandTrace 269 3 (\phase reply -> validate (Exchange.EvaluatorSourceFlow phase reply)) script fault 1
-
-evaluatorIdentityAbi :: Property
-evaluatorIdentityAbi = forAll ((,) <$> identityText <*> identityText) $ \(catalogue,program) -> ioProperty $
-  B.useAsCStringLen catalogue $ \(cataloguePtr,catalogueSize) ->
-    B.useAsCStringLen program $ \(programPtr,programSize) -> do
-      checks <- mapM (\flags -> do
-        actual <- elements_hs_evaluator_identity flags (fromIntegral catalogueSize) (castPtr cataloguePtr)
-          (fromIntegral programSize) (castPtr programPtr)
-        let expected | flags>3 = -1
-                     | not (valid catalogue && valid program) = 0
-                     | flags==0 = 1
-                     | otherwise = 3
-        pure $ conjoin [actual===expected,validate (Exchange.EvaluatorIdentity flags catalogue program)===expected])
-        [0,1,2,3,4,maxBound]
-      missing <- elements_hs_evaluator_identity 0 64 nullPtr 64 nullPtr
-      oversized <- elements_hs_evaluator_identity 0 maxBound nullPtr 64 nullPtr
-      pure $ conjoin (checks ++ [missing===(-1),oversized===0])
-  where
-    valid text = B.length text==64 && B.all (`elem` [48..57]++[65..70]++[97..102]) text
-    identityText = frequency
-      [(3,B.pack <$> vectorOf 64 (elements ([48..57]++[65..70]++[97..102]))),
-       (2,elements [B.empty,B.replicate 64 48,B.replicate 63 65,B.replicate 65 65,
-                    B.replicate 64 103,B.replicate 63 65<>B.singleton 0]),
-       (1,B.pack <$> resize 100 arbitrary)]
 
 configurationFieldAbi :: Property
 configurationFieldAbi = forAll gen $ \(kind,text,capacity) -> ioProperty $
@@ -1471,7 +477,7 @@ configurationFieldAbi = forAll gen $ \(kind,text,capacity) -> ioProperty $
     noOutput <- elements_hs_configuration_field kind (fromIntegral size) (castPtr input) 0 nullPtr
     noInput <- elements_hs_configuration_field kind 1 nullPtr 1 output
     invalid <- elements_hs_configuration_field 10 maxBound nullPtr 0 output
-    let parsed = validate (Exchange.ConfigurationField kind text)
+    let parsed = validate (NodeRules.ConfigurationField kind text)
         (expected,payload) = case parsed of
           Left code -> (fromIntegral (-1-code),[])
           Right value | B.length value<=capacity -> (fromIntegral (B.length value),B.unpack value)
@@ -1504,35 +510,10 @@ proposalDescriptionBoundaries = once $ ioProperty $ do
         status = if not valid then -2 else if null written then -1 else length written
     pure $ conjoin [fromIntegral code===status,
       observed===([0xa5]++written++replicate (capacity+1-length written) 0xa5),
-      validate (Exchange.ConfigurationField 9 payload)===(if valid then Right expected else Left 1)]
+      validate (NodeRules.ConfigurationField 9 payload)===(if valid then Right expected else Left 1)]
     | size <- [0,51,52,53,65526,65527], capacity <- [size+9,size+10,size+11],
       let payload = B.pack (take size (cycle [0,255,1,128]))]
   pure (conjoin checks)
-
-runtimeSettingsOrder :: Property
-runtimeSettingsOrder = forAll ((,) <$> choose (0,31 :: Int) <*> choose (-1,4 :: Int)) $ \(mask,fault) -> ioProperty $ do
-  let checkpoint = testBit mask 0
-      activation = testBit mask 1
-      expected | not checkpoint && not activation = 0
-               | not (testBit mask 2) = 18
-               | not (testBit mask 3) = 19
-               | not activation = 20
-               | not checkpoint = 21
-               | not (testBit mask 4) = 22
-               | otherwise = 0
-      trace = [0,1] ++ (if not checkpoint && not activation then [] else
-        [2] ++ if not (testBit mask 2) then [] else
-        [3] ++ if expected `elem` [19,20,21] then [] else [4])
-  seen <- newIORef []
-  outcome <- try (validate (Exchange.TransactionShape 15 (\step -> do
-    modifyIORef' seen (++[step])
-    if step == fault then ioError (userError "runtime setting fault") else pure (testBit mask step))))
-      :: IO (Either SomeException Int)
-  observed <- readIORef seen
-  let wantedTrace = if fault `elem` trace then takeWhile (/=fault) trace ++ [fault] else trace
-  pure $ conjoin [observed === wantedTrace, case outcome of
-    Left _ -> property (fault `elem` trace)
-    Right code -> conjoin [property (fault `notElem` trace),code === expected]]
 
 replayInitialActions :: Property
 replayInitialActions = forAll arbitrary $ \reply -> conjoin
@@ -1680,9 +661,7 @@ headerLayoutPolicy = forAll ((,,) <$> arbitrary <*> elements ([0..48] ++ [maxBou
         clean = clearBit (clearBit version 30) 31
         encoded = if reading then clean else clean + (if hasWithdrawal then 0x40000000 else 0) + (if dynamic then 0x80000000 else 0)
         fields = sum [if enabled then weight else 0 | (enabled,weight) <-
-          [(hasWithdrawal,1),(testBit version 20,2),(testBit version 19,4),(testBit version 18,8),
-           (testBit version 17,16),(testBit version 16,32),(dynamic,64),
-           ((version `div` 0x20000) `mod` 4 == 3,128),(testBit flags 5,256)]]
+          [(hasWithdrawal,1),(testBit version 20,2),(dynamic,64),(testBit flags 5,256)]]
         validFlags = flags <= 16 || (flags >= 32 && flags <= 47)
         expected | not validFlags = Nothing
                  | flags == 16 = Just (version,fields)
@@ -1695,19 +674,6 @@ headerLayoutPolicy = forAll ((,,) <$> arbitrary <*> elements ([0..48] ++ [maxBou
     missing <- elements_hs_bmm_header_layout version flags count nullPtr
     pure (conjoin [actual === if admitted then 0 else -1, observed === wanted, missing === -1,
       validate (Bmm.HeaderLayout version flags) === expected])
-
-fixedProfileBounds :: Property
-fixedProfileBounds = once $ ioProperty $ allocaBytes 400 $ \out -> do
-  checks <- sequence [do
-    pokeArray out (replicate 400 (0xaa :: Word8))
-    short <- elements_hs_exchange_genesis_state mode 0 0 0 nullPtr (size-1) out
-    before <- peekArray 400 out
-    ok <- elements_hs_exchange_genesis_state mode 0 0 0 nullPtr size out
-    after <- peekArray 400 out
-    pure $ conjoin [short===(-1),before===replicate 400 0xaa,ok===0,
-      drop (fromIntegral size) after===replicate (400-fromIntegral size) 0xaa]
-    | (mode,size) <- [(5,383),(6,100),(7,41)]]
-  pure (conjoin checks)
 
 foreign import ccall unsafe reference_parent_replay_record :: Word32 -> Word32 -> Int64 -> Word64 -> Word64 -> IO Int32
 parentReplayRecordParity :: Property
@@ -1810,55 +776,6 @@ parentBootstrapCatalog = forAll (frequency [(3,elements [0,3,4,5,6,maxBound]),(1
   in conjoin [ids === expected, Constants.emptyBootstrapVersion === 5,
        Constants.emptyBootstrapHeight === 967679,
        property (maybe True (all (\(_,active,txid,_,_) -> length active == 64 && length txid == 64)) actual)]
-
-pegDefaults :: Property
-pegDefaults = once $ conjoin [Constants.sidechainSlot === 24,
-  Constants.grpcEndpoint === "127.0.0.1:55051", Constants.pegoutMainFee === 10000,
-  Constants.defaultBmmBid === 1000,
-  Constants.defaultBmmWorkPrice === 1000,
-  Constants.defaultBmmProducerReserve === 0,
-  Constants.withdrawalDestinationSize === 128, Constants.withdrawalReferenceSize === 74,
-  Constants.withdrawalLegacySize === 251,
-  Constants.bmmEdgeCacheSize === 8, Constants.bmmNegativeCacheSize === 64,
-  Constants.bmmNegativeCacheSeconds === 5,
-  Constants.peerBlockTimeoutSeconds === 30,
-  Constants.peerRejectedBackoffSeconds === 30,
-  Constants.peerUnavailableBackoffSeconds === 5,
-  Constants.peerRejectedStrikes === 2,
-  Constants.forcedInclusionBlocks === 6,
-  Constants.maxCombinedUnconsumed === 64,
-  Constants.maxCombinedAppends === 64,
-  Constants.maxPendingWitnessEntries === 448,
-  Constants.maxTrancheWork === 64,
-  Constants.forcedBodySizes === [201,208,193], Constants.depositPayloadSize === 73]
-
-bondConfigurationArgumentCatalog :: Property
-bondConfigurationArgumentCatalog = once $ conjoin [
-  length Constants.bondHashArguments === 22,
-  length (List.nub Constants.bondHashArguments) === 22,
-  take 4 Constants.bondHashArguments === map ("-ecxbondv2" ++) ["publicstatedomain","statenodedomain","journaldomain","transitioncmr"],
-  take 6 (drop 13 Constants.bondHashArguments) === map ("-ecxbondv2" ++)
-    ["ecxbtcprogramid","ecxbtcredemptioncovenant","ecxbtcsourcecheckpoint",
-     "usddusdprogramid","usddusdredemptioncovenant","usddusdsourcecheckpoint"],
-  drop 19 Constants.bondHashArguments === map ("-ecxbondv2" ++) ["matcherreceipt","orderreceiptsroot","availabilityroot"]]
-
-bondInboxDomainCatalog :: Property
-bondInboxDomainCatalog = once $ conjoin [
-  map fst Constants.bondInboxDomains === map (\name -> "ECX_BOND_"++name++"_TAGS")
-    ["CONTEXT","SIGNATURE","BUNDLE","STAGING_AUTH","NO_STAGING_AUTH","ENTRY","STEP"],
-  map (length . snd) Constants.bondInboxDomains === replicate 7 2,
-  map length Constants.bondInboxCustodyDomains === [6,6],
-  length (List.nub domains) === 26,
-  property (all (\tag -> all (\c -> c>='!' && c<='~') tag) domains),
-  map snd Constants.bondInboxDomains ===
-    [["ECX/bond-inbox-availability-context/v2","ECX/successor-bond-inbox-availability-context/v2-u128"],
-     ["ECX/bond-inbox-marker-signature/v2","ECX/successor-bond-inbox-marker-signature/v2-u128"],
-     ["ECX/bond-inbox-encrypted-availability-bundle/v2","ECX/successor-bond-inbox-encrypted-availability-bundle/v2-u128"],
-     ["ECX/bond-inbox-staging-source-authorization/v2","ECX/successor-bond-inbox-staging-source-authorization/v2-u128"],
-     ["ECX/bond-inbox-no-staging-source-authorization/v2","ECX/successor-bond-inbox-no-staging-source-authorization/v2-u128"],
-     ["ECX/bond-inbox-entry/v2","ECX/successor-bond-inbox-entry/v2-u128"],
-     ["ECX/bond-inbox-step/v2","ECX/successor-bond-inbox-step/v2-u128"]]]
-  where domains = concatMap snd Constants.bondInboxDomains ++ concat Constants.bondInboxCustodyDomains
 
 parentLifecyclePlans :: Property
 parentLifecyclePlans = forAll ((,,) <$> elements [minBound..maxBound] <*> arbitrary <*> arbitrary) $ \(kind,enabled,boundary) ->
@@ -2006,15 +923,6 @@ headerAdmissionBounds = once $ ioProperty $ do
     kind <- [210,211], phase <- [8,maxBound], reply <- [0,1], phase/=maxBound || reply/=0]
   pure $ conjoin [bounds===[7,7],malformed===replicate 28 (-1),invalid===replicate 6 (-1)]
 
-activationPolicyBounds :: Property
-activationPolicyBounds = once $ ioProperty $ do
-  bound <- elements_hs_parent_replay_store_checked 212 maxBound 0
-  malformed <- sequence [elements_hs_parent_replay_store_checked 212 phase reply |
-    phase <- [1..14], reply <- [2,maxBound]]
-  invalid <- sequence [elements_hs_parent_replay_store_checked 212 phase reply |
-    phase <- [15,maxBound], reply <- [0,1], phase/=maxBound || reply/=0]
-  pure $ conjoin [bound===14,malformed===replicate 28 (-1),invalid===replicate 3 (-1)]
-
 feeFreeSelectionOrder :: Property
 feeFreeSelectionOrder = forAll ((,,) <$> arbitrary <*>
   resize 8 (listOf (frequency [(1,pure (replicate 10 True)),(1,vectorOf 10 arbitrary)])) <*>
@@ -2092,30 +1000,26 @@ feeFreeSelectionValues = forAll ((,,,,,,) <$> arbitrary <*> timestamp <*> timest
   where timestamp = elements [minBound,-1,0,1,10,maxBound :: Int64]
 
 templateCommitmentOrder :: Property
-templateCommitmentOrder = forAll ((,,) <$> arbitrary <*> vectorOf 11 arbitrary <*> choose (-1,12 :: Int)) $
-  \(envelope,flags,fault) -> ioProperty $ do
+templateCommitmentOrder = forAll ((,) <$> vectorOf 3 arbitrary <*> choose (-1,4 :: Int)) $
+  \(flags,fault) -> ioProperty $ do
     let yes step = flags !! (step-1)
-        insert = [8 :: Int] ++ if not (yes 8) then [11] else [9,if yes 9 then 10 else 11]
-        changed = [6] ++ if yes 6 then insert else [7] ++ if yes 7 then [] else insert
-        attach = [4] ++ if not (yes 4) then [] else [5] ++ if yes 5 then changed else []
-        script | envelope = [1] ++ (if yes 1 then [2] ++ if yes 2 then [3] else [] else []) ++ attach
-               | otherwise = [1] ++ if yes 1 then [2] ++ if yes 2 then [3] else [] else []
+        script = [1 :: Int] ++ if yes 1 then [2] ++ if yes 2 then [3] else [] else []
         failed = fault>=0 && fault<length script
         planned = if failed then take (fault+1) script else script
-        wanted = if failed then -1 else if last script==11 then 0 else 1
-        kind = if envelope then 217 else 216
-        bound = if envelope then 11 else 3
+        wanted = if failed then -1 else 1
+        kind = 216
+        bound = 3
         run invoke = do
           trace <- newIORef []
           code <- invoke (\step -> do
             seen <- readIORef trace
             modifyIORef' trace (++[fromIntegral step])
             pure $ if length seen==fault then -1 else
-              if step `elem` [3,10,11] || yes (fromIntegral step) then 1 else 0)
+              if step == 3 || yes (fromIntegral step) then 1 else 0)
           seen <- readIORef trace
           pure (code,seen)
     direct <- run (\action -> validate (Workflow.CommandFlow bound (\phase result ->
-      validate (Bmm.TemplateCommitmentFlow envelope phase result)) action))
+      validate (Bmm.TemplateCommitmentFlow phase result)) action))
     abi <- run (\action -> bracket (wrapMatchFact (\_ -> action)) freeHaskellFunPtr $ \callback ->
       elements_hs_parent_replay_run kind callback nullPtr)
     actualBound <- elements_hs_parent_replay_store_checked kind maxBound 0
@@ -2132,45 +1036,6 @@ templateSelectionOrder = forAll ((,,) <$> arbitrary <*> arbitrary <*> choose (-1
           [(3,flag authenticated),(if authenticated then 4 else 5,1)] else []
     in commandTrace 215 5 (\phase result -> validate (Bmm.TemplateSelectionFlow phase result))
       script fault (if native && not authenticated then 0 else 1)
-
-templateBudgetOrder :: Property
-templateBudgetOrder = forAll ((,,,,) <$> elements [0,1,2 :: Word64] <*> elements [0,1,2 :: Word64] <*>
-  elements [minBound,-1,0,1,10,maxBound :: Int64] <*> elements [minBound,-1,0,1,10,maxBound :: Int64] <*>
-  vectorOf 4 (frequency [(1,arbitrary),(3,elements [0,1,63,64,65,maxBound])])) $
-  \(enabled,loaded,height,activation,fields) -> ioProperty $ do
-    let f = toInteger (fields !! 0)
-        fc = toInteger (fields !! 1)
-        d = toInteger (fields !! 2)
-        dc = toInteger (fields !! 3)
-        pending = f-fc+d-dc
-        expected | enabled==0 = (0,0)
-                 | enabled/=1 = (-1,0)
-                 | height<=activation = (0,0)
-                 | loaded==0 = (1,0)
-                 | loaded/=1 = (-1,0)
-                 | fc>f || dc>d = (2,0)
-                 | pending>64 = (3,0)
-                 | otherwise = (0,fromInteger (64-pending))
-        planned = [0 :: Word32] ++ if enabled/=1 || height<=activation then [] else
-          [1] ++ if loaded/=1 then [] else [2,3,4,5]
-        run invoke = do
-          trace <- newIORef []
-          result <- invoke (\step -> do
-            modifyIORef' trace (++[step])
-            pure $ case step of { 0 -> enabled; 1 -> loaded; _ -> fields !! (fromIntegral step-2) })
-          seen <- readIORef trace
-          pure (result,seen)
-    direct <- run (validate . Exchange.TemplateBudget height activation)
-    abi <- run (\action -> bracket (makeCursorEffect (\_ step a b field ->
-      if a/=0 || b/=0 then pure (-1) else action step >>= poke field >> pure 1)) freeHaskellFunPtr $ \callback ->
-      allocaArray 2 $ \out -> do
-        pokeArray out [99,77]
-        code <- elements_hs_template_budget height activation out callback nullPtr
-        values <- peekArray 2 out
-        pure (code,values))
-    missing <- alloca $ \out -> elements_hs_template_budget height activation out nullFunPtr nullPtr
-    pure $ conjoin [direct===(expected,planned),abi===((fst expected,
-      [if fst expected<0 then 99 else snd expected,77]),planned),missing=== -1]
 
 templateAdmissionOrder :: Property
 templateAdmissionOrder = forAll ((,) <$> vectorOf 8 arbitrary <*> choose (-1,8 :: Int)) $ \(flags,fault) -> ioProperty $
@@ -2220,26 +1085,6 @@ peginConfirmationPolicy = forAll gen $ \(mode,height,configured,flags,fault) -> 
       frequency [(1,arbitrary),(3,elements [0,1,6,100,maxBound])] <*>
       frequency [(1,pure (replicate 10 True)),(1,pure (replicate 8 True ++ [False,False])),(3,vectorOf 10 arbitrary)] <*>
       choose (-1,16 :: Int)
-
-productionIdentityOrder :: Property
-productionIdentityOrder = forAll (choose (-1,107 :: Int)) $ \failure -> ioProperty $ do
-  let ends = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,21,25,28,33,40,49,54,58,65,71,81,87,90,102,108]
-      wanted = if failure<0 then 0 else 1 + length (takeWhile (<=failure) ends)
-      planned = [0..if failure<0 then 107 else failure]
-      run invoke = do
-        trace <- newIORef []
-        code <- invoke (\step -> do
-          modifyIORef' trace (++[step])
-          pure (step/=failure))
-        seen <- readIORef trace
-        pure (fromIntegral code :: Int,seen)
-  direct <- run (validate . Exchange.ProductionIdentity)
-  abi <- run (\readFact -> bracket (wrapIdentityWrite (\_ step -> do
-    accepted <- readFact (fromIntegral step)
-    pure (if accepted then 1 else 0))) freeHaskellFunPtr $ \callback ->
-      elements_hs_production_identity callback nullPtr)
-  missing <- elements_hs_production_identity nullFunPtr nullPtr
-  pure $ conjoin [direct===(wanted,planned),abi===direct,missing=== -1]
 
 withdrawalHistoryOrder :: Property
 withdrawalHistoryOrder = forAll ((,) <$> resize 12 (listOf (frequency [(1,pure Nothing),(4,Just <$> choose (0,20 :: Word64))]))
@@ -2358,32 +1203,6 @@ bundleEventOrder = forAll ((,,,) <$> arbitrary <*> arbitrary <*> choose (0,2) <*
       (\phase reply -> validate (Withdrawal.BundleEventFlow clearing phase reply)) script fault
       (if clearing || rejection==0 then 1 else -1)
 
-authenticatedHeightOrder :: Property
-authenticatedHeightOrder = forAll ((,) <$> arbitrary <*> choose (-1,10 :: Int)) $
-  \((supplied,nonzero,fetched,emptyError),fault) -> ioProperty $
-    let flag value = if value then 1 else 0
-        script = [(1,flag supplied)] ++ if supplied then
-          [(2,flag nonzero),(if nonzero then 4 else 3,1)]
-          else [(5,flag fetched)] ++ if fetched then [(9,1),(10,flag nonzero)]
-          else [(6,flag emptyError),(if emptyError then 7 else 8,1)]
-    in commandTraceWith (const [2,maxBound]) 262 10
-      (\phase reply -> validate (Exchange.AuthenticatedHeightFlow phase reply)) script fault
-      (if nonzero && (supplied || fetched) then 1 else 0)
-
-exportReconstructOrder :: Property
-exportReconstructOrder = forAll ((,,,) <$> elements [0,1,2,255,maxBound :: Word32]
-  <*> elements [0,1,2,255,maxBound :: Word32] <*> arbitrary <*> choose (-1,9 :: Int)) $
-  \(expected,working,(appended,root,count),fault) -> ioProperty $
-    let flag value = if value then 1 else 0
-        prefix = [(1,fromIntegral expected)] ++
-          (if expected==1 then [(2,fromIntegral working)] ++ [(3,1) | working==0] else [])
-        script = prefix ++ [(if expected==1 then 5 else 4,flag appended)] ++
-          if not appended then [(9,1)] else [(6,flag root)] ++
-            if not root then [(8,1)] else [(7,flag count)] ++ [(8,1) | not count]
-        invalid phase = if phase `elem` [1,2] then [] else [2,maxBound]
-    in commandTraceWith invalid 261 9 (\phase reply -> validate (Exchange.ExportReconstructFlow phase reply))
-      script fault (if appended && root && count then 1 else -1)
-
 parentReportOrder :: Property
 parentReportOrder = forAll ((,,) <$> arbitrary <*> elements [0,1,maxBound :: Word32]
   <*> choose (-1,14 :: Int)) $ \((native,checkpoint,effective,context,regtest,matching),height,fault) -> ioProperty $
@@ -2395,36 +1214,8 @@ parentReportOrder = forAll ((,,) <$> arbitrary <*> elements [0,1,maxBound :: Wor
         suffix = if not established then [] else [(12,fromIntegral height)] ++ if height==0 then [(14,1)]
           else [(13,flag matching)] ++ [(14,1) | not matching]
         invalid phase = if phase `elem` [9,12] then [] else [2,maxBound]
-    in commandTraceWith invalid 260 14 (\phase reply -> validate (Exchange.ParentReportFlow phase reply))
+    in commandTraceWith invalid 260 14 (\phase reply -> validate (NodeRules.ParentReportFlow phase reply))
       (prefix++suffix) fault (if established && height/=0 && matching then 1 else -1)
-
-exportSnapshotOrder :: Property
-exportSnapshotOrder = forAll ((,,) <$> arbitrary <*> arbitrary <*> choose (-1,5 :: Int)) $
-  \(initializing,(first,second),fault) -> ioProperty $
-    let flag value = if value then 1 else 0
-        script = if initializing then [(1,flag first)] ++
-          if first then [(2,1)] else [(3,flag second),(if second then 5 else 4,1)]
-          else [(1,flag first)] ++ if not first then [] else [(2,flag second)] ++ [(3,1) | not second]
-        expected = if initializing then (if first || second then 1 else -1)
-          else if not first then 0 else if second then 1 else -1
-        next = if initializing then Exchange.ExportInitialize else Exchange.ExportRecheck
-    in commandTrace (if initializing then 292 else 293) (if initializing then 5 else 3)
-      (\phase reply -> validate (next phase reply)) script fault expected
-
-capitalReportOrder :: Property
-capitalReportOrder = forAll ((,,,,) <$> arbitrary <*> elements [0,3,4,5,maxBound :: Word32]
-  <*> vectorOf 3 (elements [0,1,2,3,4,255,maxBound :: Word32])
-  <*> vectorOf 3 arbitrary <*> choose (-1,11 :: Int)) $ \((enabled,present),version,modes,flags,fault) -> ioProperty $
-    let flag value = if value then 1 else 0
-        replies = [version,flag (flags !! 0),flag (flags !! 1)] ++ modes ++ [flag (flags !! 2)]
-        valid = [version `elem` [4,5],flags !! 0,flags !! 1] ++ zipWith (<=) modes [2,3,1] ++ [flags !! 2]
-        passed = length (takeWhile id valid)
-        script = [(1,flag enabled)] ++ if not enabled then [] else [(2,flag present)] ++
-          if not present then [(3,1)] else
-            take (passed+1) (zip [4..10] (map fromIntegral replies)) ++ [(11,1) | passed<7]
-        invalid phase = if phase `elem` [4,7,8,9] then [] else [2,maxBound]
-    in commandTraceWith invalid 259 11 (\phase reply -> validate (Exchange.CapitalReportFlow phase reply))
-      script fault (if not enabled then 0 else if present && passed==7 then 1 else -1)
 
 parentRequestOrder :: Property
 parentRequestOrder = forAll ((,) <$> arbitrary <*> choose (-1,5 :: Int)) $ \((hasError,slot,success),fault) -> ioProperty $
@@ -2576,125 +1367,6 @@ blockAdmissionOrder kind bound flow = forAll ((,) <$> masks <*> choose (-1,fromI
       base <- elements [0,maxBound,clearBit maxBound 2]
       bit <- choose (0,31)
       pure (base `xor` (1 `shiftL` bit)))]
-
-singletonRecoveryOrder :: Property
-singletonRecoveryOrder = forAll ((,,,) <$> arbitrary <*> resize 6 arbitrary <*> arbitrary <*> choose (-1,40 :: Int)) $
-  \(zero,rows,(live,root),fault) -> ioProperty $
-  let flag value = if value then 1 else 0
-      scan [] = ([(1,0)],True)
-      scan ((matches,input):rest) =
-        let prefix = [(1,1),(2,flag zero)] ++ [(3,flag matches) | zero]
-            (tailTrace,success) = scan rest
-        in if not zero || not matches then (prefix ++ [(6,1)] ++ tailTrace,success)
-           else (prefix ++ [(4,flag input),(if input then 5 else 9,1)],input)
-      (scanned,recovered) = scan rows
-      script = scanned ++ if not recovered then [] else
-        [(7,flag live)] ++ if not live then [(10,1)] else [(8,flag root)] ++ [(11,1) | not root]
-  in commandTrace 251 11 (\phase reply -> validate (Exchange.SingletonRecoveryFlow phase reply))
-       script fault (if recovered && live && root then 1 else 0)
-
-incrementalScanOrder :: Property
-incrementalScanOrder = forAll ((,,) <$> gates <*> rows <*> choose (-1,80 :: Int)) $ \(enabled,candidates,fault) -> ioProperty $
-  let flag value = if value then 1 else 0
-      prefix xs = take (length (takeWhile (==1) (map snd xs))+1) xs
-      candidate facts = [(9,1)] ++ prefix (zip [10..16] (map flag facts)) ++
-        (if and (take 4 facts) then [(if and facts then 19 else 18,1)] else []) ++ [(20,1)]
-      script = prefix (zip [1..8] (map flag enabled)) ++
-        (if and enabled then concatMap candidate candidates ++ [(9,0)] else [])
-  in commandTrace 255 20 (\phase reply -> validate (Exchange.IncrementalScanFlow phase reply)) script fault 1
-  where
-    gates = frequency [(1,pure (replicate 8 True)),(1,vectorOf 8 arbitrary)]
-    rows = frequency [(1,elements [[replicate 7 True,replicate 4 True++[False,True,True]],
-                                  [replicate 7 True,False:replicate 6 True]]),
-                      (3,choose (0,5) >>= \count -> vectorOf count (vectorOf 7 arbitrary))]
-
-expectedContextOrder :: Property
-expectedContextOrder = once $ ioProperty $ fmap conjoin $ sequence
-  [ let path = (if activation then [1,2,3,4,5,6,7,23,24] else 1:[10..22]) :: [Int]
-        errors = [(5,9),(6,9),(23,28),(24,28)] ++ [(step,30) | step <- [11..13]] ++
-          [(step,29) | step <- [18..22]]
-        selected = if failed<0 then path else takeWhile (/=failed) path ++ [failed] ++
-          maybe [] pure (lookup failed errors)
-        action step = (fromIntegral step,if step==1 then (if activation then 1 else 0)
-                       else if step==failed then 0 else 1)
-    in commandTrace 254 30 (\phase reply -> validate (Exchange.ExpectedContextFlow phase reply))
-      (map action selected) fault (if failed<0 then 1 else 0)
-  | activation <- [False,True], failed <- (-1):if activation then [3,4,5,6,23,24] else [10..22],
-    fault <- [-1..30] ]
-
-headerLifecycleOrder :: Property
-headerLifecycleOrder = once $ ioProperty $ fmap conjoin $ sequence
-  [ let fact step = testBit mask (step-1)
-        action step = (fromIntegral step,if fact step then 1 else 0)
-        active = [3] ++ if not (fact 3) then [] else
-          [4] ++ if not (fact 4) then [] else [5] ++ [6 | fact 5]
-        path = 1 : if fact 1 then active else [2]
-        accepted = if not (fact 1) then fact 2 else
-          fact 3 && fact 4 && (if fact 5 then fact 6 else not preparation)
-    in commandTrace (if preparation then 253 else 252) 6
-      (\phase reply -> validate (Exchange.HeaderLifecycleFlow preparation phase reply))
-      (map action path) fault (if accepted then 1 else 0)
-  | preparation <- [False,True], mask <- [0..63 :: Int], fault <- [-1..6] ]
-
-disconnectPreflightOrder :: Property
-disconnectPreflightOrder = forAll ((,) <$> vectorOf 12 arbitrary <*> choose (-1,18 :: Int)) $ \(facts,fault) -> ioProperty $
-  let fact index = facts !! index
-      flag value = if value then 1 else 0
-      trackers = [(7,flag (fact 4))] ++ if not (fact 4) then [] else
-        [(8,flag (fact 5))] ++ if not (fact 5) then [(9,1)] else
-        [(10,flag (fact 6))] ++ if not (fact 6) then [] else
-        [(11,flag (fact 7))] ++ if not (fact 7) then [] else
-        [(12,flag (fact 8))] ++ if not (fact 8) then [(14,1)] else
-        [(13,flag (fact 9))] ++ if not (fact 9) then [(14,1)] else
-        [(15,flag (fact 10))] ++ [(16,flag (fact 11)) | fact 10]
-      parent = [(3,flag (fact 2))] ++ [(4,flag (fact 3)) | fact 2] ++
-        if fact 2 && not (fact 3) then [(5,1)] else [(6,1)] ++ trackers
-      script = [(1,flag (fact 0))] ++ if not (fact 0) then [] else
-        [(2,flag (fact 1))] ++ if not (fact 1) then [(5,1)] else parent
-      accepted = fact 1 && (not (fact 2) || fact 3) && and (take 6 (drop 4 facts))
-      expected = if not (fact 0) then 1 else if not accepted then 0
-                 else if not (fact 10) then 2 else if fact 11 then 1 else 0
-  in commandTrace 250 16 (\phase reply -> validate (Exchange.DisconnectPreflightFlow phase reply)) script fault expected
-
-connectionPreflightOrder :: Property
-connectionPreflightOrder = forAll ((,) <$> vectorOf 12 arbitrary <*> choose (-1,16 :: Int)) $ \(facts,fault) -> ioProperty $
-  let fact index = facts !! index
-      flag value = if value then 1 else 0
-      commit = [(17,1)]
-      candidate = take 4 (drop 6 facts)
-      candidateTrace = take (length (takeWhile id candidate)+1) (zip [8..11] (map flag candidate)) ++
-        if and candidate then commit else [(12,1)]
-      stateTrace = if fact 4 then [(7,flag (fact 5))] ++ if fact 5 then commit else candidateTrace
-        else [(13,flag (fact 10))] ++ if fact 10 then commit else [(14,flag (fact 11)),(if fact 11 then 15 else 16,1)]
-      script = [(1,flag (fact 0))] ++ if not (fact 0) then [] else
-        [(2,flag (fact 1))] ++ if not (fact 1) then [] else
-        [(3,flag (fact 2))] ++ if fact 2 then [(4,flag (fact 3))] ++ [(5,1) | not (fact 3)]
-        else [(6,flag (fact 4))] ++ stateTrace
-      accepted = if fact 2 then fact 3 else if fact 4 then fact 5 || and candidate else fact 10
-      expected = if not (fact 0) then 0 else if not (fact 1) then 1 else if accepted then 2 else 0
-  in commandTrace 249 17 (\phase reply -> validate (Exchange.ConnectionPreflightFlow phase reply)) script fault expected
-
-capitalDecodeOrder :: Property
-capitalDecodeOrder = forAll ((,) <$> arbitrary <*> choose (-1,8 :: Int)) $ \((identity,root,parsed,bound),fault) -> ioProperty $
-  let flag value = if value then 1 else 0
-      script = [(1,flag identity)] ++ if not identity then [] else
-        [(2,flag root)] ++ if not root then [(3,1)] else
-        [(4,flag parsed)] ++ if not parsed then [(5,1)] else
-        [(6,flag bound)] ++ [(if bound then 8 else 7,1)]
-  in commandTrace 247 8 (\phase reply -> validate (Exchange.CapitalDecodeFlow phase reply))
-       script fault (if identity && root && parsed && bound then 1 else 0)
-
-frozenProfileOrder :: Property
-frozenProfileOrder = forAll ((,,,) <$> arbitrary <*> arbitrary <*> resize 8 arbitrary <*> choose (-1,40 :: Int)) $ \(network,canonical,arguments,fault) -> ioProperty $
-  let flag value = if value then 1 else 0
-      scan [] = [(4,0)]
-      scan ((present,matches):rest) = [(4,1),(5,flag present)] ++ [(6,flag matches) | present] ++
-        if present && not matches then [(7,1)] else [(8,1)] ++ scan rest
-      script = [(1,flag network)] ++ if not network then [] else
-        [(2,flag canonical)] ++ if not canonical then [(3,1)] else scan arguments
-      accepted = not network || canonical && all (\(present,matches) -> not present || matches) arguments
-  in commandTrace 246 8 (\phase reply -> validate (Exchange.FrozenProfileFlow phase reply))
-       script fault (if accepted then 1 else -1)
 
 producerPreparationOrder :: Property
 producerPreparationOrder = once $ ioProperty $ fmap conjoin $ sequence
@@ -2983,7 +1655,7 @@ childCheckpointOrder = forAll ((,) <$> frequency [(1,pure (replicate 15 True)),(
   let yes step = flags !! (step-1)
       checks [] = []
       checks ((step,err):rest) = step : if yes step then checks rest else [err]
-      afterSnapshot = checks [(5,17),(6,17),(8,18),(11,19),(12,19),(13,19),(14,19),(15,19)]
+      afterSnapshot = checks [(8,18),(11,19),(12,19),(13,19),(14,19),(15,19)]
       before = if not (yes 1) then [1,16] else if not (yes 2) then [1,2,16]
         else [1,2,3] ++ if yes 3 then [4] ++ if yes 4 then afterSnapshot else [16] else afterSnapshot
       effects step = case step of 8 -> [7,8]; 11 -> [9,10,11]; _ -> [step]
@@ -3007,19 +1679,26 @@ templateParentOrder = forAll ((,) <$> vectorOf 11 arbitrary <*> choose (-1,12 ::
 
 parentReplayBounds :: Property
 parentReplayBounds = once $ ioProperty $ do
-  let expected = [9,9,9,9,9,9,9,9,9,9,9,66,38,14,14,26,24,18,49,28,16,33,9,9,9,9,9,9,44,15,9,9,9,9,9,9,9,9,9,9,9,9,9,14,18,26,33,28,9,9,9,9,17,9,9,9,14,9,12,9,18,15,9,9,9,9,11,19,22,9,9,12,9,16,10,9,9,9,9,9,10,9,13,15,25,9,9,27,9,9,9,9,9,43,23,31,18,18,9,9,9,9,19,9,9,9,9,9,9,9,9,9,9,9,23,9,12,11,9,24,9,17,11,23,9,9] :: [Int32]
+  let catalogue = [9,9,9,9,9,9,9,9,9,9,9,66,38,14,14,26,24,18,49,28,16,33,9,9,9,9,9,9,44,15,9,9,9,9,9,9,9,9,9,9,9,9,9,14,18,26,33,28,9,9,9,9,17,9,9,9,14,9,12,9,18,15,9,9,9,9,11,19,22,9,9,12,9,16,10,9,9,9,9,9,10,9,13,15,25,9,9,27,9,9,9,9,9,43,23,31,18,18,9,9,9,9,19,9,9,9,9,9,9,9,9,9,9,9,23,9,12,11,9,24,9,17,11,23,9,9] ++ [22,9,9,11,8,7,14,-1,16,18,13,5,7,11,10,6,5,12,21,10,7,10,14,12,11,8,17,29,19,10,17,17,11,8,6,12,74,45,15,64,10,15,15,13,9,12,12,10,12,7,5,10,8,4,26,11,18,46,10,6,4,4,13,22,11,21,5,2,11,14,26,12,15,5,11,4,8,14,8,19,7,13,12,12] :: [Int32]
+      retired = [129..131] ++ [149..176] ++ [183,188,189,198,199,200,209,212,217,246,247] ++
+        [249..255] ++ [259,261,262,263,266,269,271,272,274,276,278,289,290,292,293,295,323,326]
+      expected = [if kind `elem` retired then -1 else bound | (kind,bound) <- zip [0..] catalogue]
   actual <- mapM (\kind -> elements_hs_parent_replay_store_checked kind maxBound 0) [0..209]
-  invalid <- mapM (\kind -> elements_hs_parent_replay_store_checked kind maxBound 0) [329,330,maxBound]
-  retired <- sequence [elements_hs_parent_replay_store_checked kind phase reply |
-    kind <- [198..200], phase <- [0..16] ++ [maxBound], reply <- [0,1,2,maxBound]]
-  let activeBounds = take 129 actual ++ [11] ++ take 53 (drop 130 actual) ++ [46] ++
-        take 14 (drop 184 actual) ++ [15,5,11] ++ drop 201 actual
+  invalid <- mapM (\kind -> elements_hs_parent_replay_store_checked kind maxBound 0) [335,maxBound]
+  rejected <- sequence [elements_hs_parent_replay_store_checked kind phase reply |
+    kind <- retired, phase <- [0,1,16,maxBound], reply <- [0,1,2,maxBound]]
+  calls <- newIORef ([] :: [Word32])
+  outcomes <- bracket (wrapMatchFact (\_ step -> modifyIORef' calls (++[step]) >> pure 1)) freeHaskellFunPtr $ \callback ->
+    mapM (\kind -> elements_hs_parent_replay_run kind callback nullPtr) retired
+  trace <- readIORef calls
   malformed <- mapM (\kind -> elements_hs_parent_replay_store_checked kind maxBound 1) [0..209]
-  unchangedTransitions <- sequence [do
+  unchanged <- sequence [do
     old <- elements_hs_parent_replay_store kind phase result
     new <- elements_hs_parent_replay_store_checked kind phase result
-    pure (old==new) | kind <- [0..166], phase <- [0..85], result <- [0..3]]
-  pure $ conjoin [retired===replicate 216 (-1), take 3 (drop 198 actual)===replicate 3 (-1), activeBounds===(expected++[22,9,9,11,8,7,14,-1,16,18,13,5,7,11,10,6,5,12,21,10,7,10,14,12,11,8,17,29,19,10,17,17,11,8,6,12,74,45,15,64,10,15,15,13,9,12,12,10,12,7,5,10,8,4,26,11,18,46,10,6,4,4,13,22,11,21,5,2,11,14,26,12,15,5,11,4,8,14,8,19,7,13,12,12]), invalid===replicate 3 (-1), malformed===replicate 210 (-1), property (and unchangedTransitions)]
+    pure (old==new) | kind <- [0..209], phase <- [0..85], result <- [0..3]]
+  pure $ conjoin [actual===expected, invalid===replicate 2 (-1),
+    rejected===replicate (length retired*16) (-1), outcomes===replicate (length retired) (-1),
+    trace===[], malformed===replicate 210 (-1), property (and unchanged)]
 
 recoveryComposedOrder :: Property
 recoveryComposedOrder = forAll ((,,) <$> choose (0,6 :: Int) <*> choose (0,4 :: Int) <*> choose (-1,180 :: Int)) $
@@ -3171,689 +1850,6 @@ recoveryPeerOrder = forAll generator $ \(peers,fault,admit,validShape) -> ioProp
   where generator = (,,,) <$> resize 4 (listOf ((,,) <$> arbitrary <*> arbitrary <*>
           resize 4 (listOf ((,) <$> arbitrary <*> arbitrary)))) <*> choose (-1,60 :: Int) <*> arbitrary <*> arbitrary
 
-configurationCovenants :: Property
-configurationCovenants = forAll ((,) <$> vectorOf 18 arbitrary <*> choose (-1,24 :: Int)) $ \(facts,fault) -> ioProperty $ do
-  let guards = [(2,19),(3,19),(4,20),(6,20),(8,20),(10,20),(12,21),(16,22)]
-      script = case filter (\(step,_) -> not (facts !! (step-1))) guards of
-        [] -> [1..18]
-        (step,err):_ -> [1..step]++[err]
-      failed = fault>=0 && fault<length script
-      expected = map fromIntegral (if failed then take (fault+1) script else script)
-      run invoke = do
-        seen <- newIORef []
-        code <- invoke (\step -> do
-          previous <- readIORef seen
-          modifyIORef' seen (++[step])
-          pure $ if length previous==fault then -1 else
-            if step>18 || facts !! (fromIntegral step-1) then 1 else 0)
-        observed <- readIORef seen
-        pure (code,observed)
-  direct <- run (\action -> validate (Workflow.CommandFlow 22
-    (\phase reply -> validate (Exchange.ConfigurationCovenants phase reply)) action))
-  abi <- run (\action -> bracket (wrapMatchFact (\_ -> action)) freeHaskellFunPtr $ \callback ->
-    elements_hs_parent_replay_run 189 callback nullPtr)
-  let result = if failed then -1 else if last script>18 then 1 else 0
-  pure $ conjoin [direct === (result,expected),abi === (result,expected)]
-
-configurationTransactions :: Property
-configurationTransactions = forAll ((,,) <$> vectorOf 5 arbitrary <*> elements [0,1,2,3,4,maxBound :: Word32] <*>
-  choose (-1,14 :: Int)) $ \(facts,version,fault) -> ioProperty $ do
-    let yes value = if value then 1 else 0
-        replies = [yes (facts !! 0),yes (facts !! 1),1,version,
-          yes (facts !! 2),yes (facts !! 3),1,yes (version==3),yes (facts !! 4)]
-        script | not (facts !! 0) = [1,10]
-               | not (facts !! 1) = [1,2,10]
-               | version/=2 && version/=3 = [1,2,3,4,11]
-               | not (facts !! 2) = [1,2,3,4,5,12]
-               | not (facts !! 3) = [1,2,3,4,5,6,12]
-               | version==2 = [1..8]
-               | not (facts !! 4) = [1..9]++[13]
-               | otherwise = [1..9]
-        failed = fault>=0 && fault<length script
-        expected = if failed then take (fault+1) script else script
-        run invoke = do
-          seen <- newIORef []
-          code <- invoke (\step -> do
-            previous <- readIORef seen
-            modifyIORef' seen (++[step])
-            pure $ if length previous==fault then -1 else if step>=10 then 0 else fromIntegral (replies !! (fromIntegral step-1)))
-          observed <- readIORef seen
-          pure (code,observed)
-    direct <- run (\action -> validate (Workflow.CommandFlow 13
-      (\phase reply -> validate (Exchange.ConfigurationTransactions phase reply)) action))
-    abi <- run (\action -> bracket (wrapMatchFact (\_ -> action)) freeHaskellFunPtr $ \callback ->
-      elements_hs_parent_replay_run 188 callback nullPtr)
-    let result = if failed then -1 else if last script>=10 then 1 else 0
-    pure $ conjoin [direct === (result,expected),abi === (result,expected)]
-
-successorScanTransitions :: Property
-successorScanTransitions = forAll ((,) <$> choose (0,14 :: Word32) <*> choose (0,3 :: Word32)) $ \(phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked 161 phase result
-  let expected | phase==0 = 1
-               | phase>12 || result>1 = -1
-               | result==0 = case phase of
-                   1 -> 7
-                   2 -> 6
-                   3 -> 6
-                   4 -> 6
-                   5 -> 8
-                   6 -> -1
-                   7 -> -12
-                   8 -> -1
-                   9 -> -12
-                   _ -> -13
-               | otherwise = case phase of
-                   5 -> -11
-                   6 -> 1
-                   7 -> 9
-                   8 -> 6
-                   12 -> -10
-                   _ -> fromIntegral phase+1
-  pure (actual===expected)
-
-headerFlowTransitions :: Property
-headerFlowTransitions = forAll ((,,) <$> choose (0,2 :: Word32) <*> choose (0,13 :: Word32) <*> choose (0,3 :: Word32)) $ \(mode,phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked (158+mode) phase result
-  let count = if mode==0 then 11 else if mode==1 then 8 else 6
-      expected | phase==0 = 1
-               | phase>count || result>1 = -1
-               | result==0 = -11
-               | phase==count = -10
-               | otherwise = fromIntegral phase+1
-  pure (actual===expected)
-
-carryIdentityAbi :: Property
-carryIdentityAbi = forAll ((,,) <$> arbitrary <*> vectorOf 9 (vectorOf 32 arbitrary) <*> choose (-1,14 :: Int)) $ \(incremental,expected,changed) -> ioProperty $ do
-  let initial = take 3 (drop (if incremental then 3 else 0) expected) ++ drop 6 expected ++ expected
-      identities = [if i==changed then map (`xor` 1) identityBytes else identityBytes | (i,identityBytes) <- zip [0..] initial]
-      pairs = zip [0..5] ((if incremental then [9,10,11] else [6,7,8]) ++ [12,13,14])
-      matches = all (\(a,b) -> identities !! a == identities !! b) pairs
-  withArray (concat identities) $ \input -> do
-    actual <- elements_hs_exchange_identity_relation (if incremental then 8 else 7) 15 input
-    bad <- sequence [elements_hs_exchange_identity_relation mode count ptr |
-      (mode,count,ptr) <- [(7,14,input),(8,16,input),(7,15,nullPtr),(9,15,input)]]
-    pure (conjoin [actual === (if matches then 0 else 1),bad === replicate 4 (-1)])
-
-capitalContextTransitions :: Property
-capitalContextTransitions = forAll ((,,) <$> arbitrary <*> choose (0,19 :: Word32) <*> choose (0,3 :: Word32)) $ \(incremental,phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked (if incremental then 157 else 156) phase result
-  let start = if incremental then 7 else 1
-      expected | phase==0 = fromIntegral start
-               | phase>17 || result>1 || phase<start || (not incremental && phase>=7 && phase<=12) || (incremental && phase==17) = -1
-               | result==0 = if phase<=start+1 then -11 else if phase==start+2 then -12 else -13
-               | phase==(if incremental then 16 else 17) = -10
-               | phase==start+5 = 13
-               | otherwise = fromIntegral phase+1
-  pure (actual===expected)
-
-successorBindingAbi :: Property
-successorBindingAbi = forAll arbitrary $ \incremental ->
-  forAll (vectorOf (if incremental then 1627 else 850) arbitrary) $ \values ->
-  forAll (chooseInt (-1,length values-1)) $ \changed -> ioProperty $ do
-    let offsets=if incremental then [36,100,132,164] else [68,132,164,196]
-        scalarOffsets=if incremental then [1284,1292,1300] else [228,236]
-        hashes=concat [take 32 (drop offset values) | offset <- offsets]
-        context=take 3 ([foldl (\n b -> n*256+fromIntegral b) 0 (take 8 (drop offset values)) |
-                        offset <- scalarOffsets] ++ [maxBound]) :: [Word64]
-        mutated=[if i==changed then byte `xor` 1 else byte | (i,byte) <- zip [0..] values]
-        matches=all (\(start,width) -> changed<start || changed>=start+width)
-          ([(offset,32) | offset <- offsets] ++ [(offset,8) | offset <- scalarOffsets])
-        profile=if incremental then 1 else 0
-        size=fromIntegral (length values)
-    withArray mutated $ \v -> withArray hashes $ \h -> withArray context $ \c -> do
-      actual <- elements_hs_exchange_successor_binding profile size v h c
-      bad <- sequence [elements_hs_exchange_successor_binding p n a b d |
-        (p,n,a,b,d) <- [(2,size,v,h,c),(maxBound,size,v,h,c),(profile,0,v,h,c),
-          (profile,size-1,v,h,c),(profile,size+1,v,h,c),(profile,maxBound,nullPtr,h,c),
-          (profile,size,nullPtr,h,c),(profile,size,v,nullPtr,c),(profile,size,v,h,nullPtr)]]
-      let check input identities scalars=validate (Exchange.SuccessorBinding incremental input identities scalars)
-      pure $ conjoin [actual===(if matches then 0 else 1),bad===replicate 9 (-1),
-        check B.empty (B.pack hashes) context===(-1),check (B.pack mutated) B.empty context===(-1),
-        check (B.pack mutated) (B.pack hashes) []===(-1)]
-
-activationPredecessorTransitions :: Property
-activationPredecessorTransitions = forAll ((,) <$> choose (0,12 :: Word32) <*> choose (0,3 :: Word32)) $ \(phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked 155 phase result
-  let expected | phase==0 = 1
-               | phase>10 || result>1 = -1
-               | result==0 = if phase<=8 then -11 else -12
-               | phase==10 = -10
-               | otherwise = fromIntegral phase+1
-  pure (actual===expected)
-
-reservedInputsOrder :: Property
-reservedInputsOrder = forAll arbitrary $ \enabled ->
-  forAll (resize 20 (listOf (chooseInt (0,15)))) $ \inputTags -> ioProperty $ do
-    cursor <- newIORef (0 :: Int)
-    history <- newIORef ([] :: [Word32])
-    let action :: Word32 -> IO Word32
-        action step = do
-            modifyIORef' history (++[step])
-            index <- readIORef cursor
-            fact <- case step of
-              1 -> pure enabled
-              2 -> pure (index < length inputTags)
-              3 -> pure (testBit (inputTags !! index) 0)
-              4 -> pure (testBit (inputTags !! index) 1)
-              5 -> pure (testBit (inputTags !! index) 2)
-              6 -> pure (testBit (inputTags !! index) 3)
-              7 -> modifyIORef' cursor (+1) >> pure True
-              _ -> fail "unexpected reserved-input action"
-            pure (if fact then 1 else 0)
-        run phase result = do
-          next <- elements_hs_parent_replay_store_checked 266 phase result
-          if next < 0 then pure (negate next-10) else
-            action (fromIntegral next) >>= run (fromIntegral next)
-        scan [] = (0,[2])
-        scan (tag:rest)
-          | testBit tag 0 = advance [2,3,7]
-          | testBit tag 1 = (1,[2,3,4])
-          | testBit tag 2 = (2,[2,3,4,5])
-          | testBit tag 3 = (2,[2,3,4,5,6])
-          | otherwise = advance [2,3,4,5,6,7]
-          where advance prefix = let (code,steps)=scan rest in (code,prefix++steps)
-        (expectedCode,expectedSteps) = if enabled then scan inputTags else (0,[])
-    actualCode <- run 0 0
-    actualSteps <- readIORef history
-    writeIORef cursor 0
-    writeIORef history []
-    runtimeCode <- bracket (wrapMatchFact (\_ step -> fromIntegral <$> action step)) freeHaskellFunPtr $ \callback ->
-      elements_hs_parent_replay_run 266 callback nullPtr
-    runtimeSteps <- readIORef history
-    bound <- elements_hs_parent_replay_store_checked 266 maxBound 0
-    malformed <- mapM (\phase -> elements_hs_parent_replay_store_checked 266 phase 2) [1..8]
-    pure $ conjoin [actualCode===expectedCode,actualSteps===(1:expectedSteps),
-      runtimeCode===actualCode,runtimeSteps===actualSteps,bound===7,malformed===replicate 8 (-1)]
-
-explicitCreationsTransitions :: Property
-explicitCreationsTransitions = forAll ((,) <$> choose (0,21 :: Word32) <*> choose (0,3 :: Word32)) $ \(phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked 154 phase result
-  let expected | phase==0 = 1
-               | phase>19 || result>1 = -1
-               | otherwise = case phase of
-                   1 -> if result==0 then 6 else 2
-                   6 -> if result==0 then 12 else 7
-                   12 -> if result==0 then 16 else 13
-                   16 -> if result==0 then -10 else 17
-                   7 -> if result==0 then 8 else 9
-                   9 -> if result==0 then 10 else 11
-                   5 -> if result==0 then -1 else 1
-                   11 -> if result==0 then -1 else 6
-                   15 -> if result==0 then -1 else 12
-                   19 -> if result==0 then -1 else 16
-                   _ -> if result==0 then -11 else fromIntegral phase+1
-  pure (actual===expected)
-
-publicIssuanceTransitions :: Property
-publicIssuanceTransitions = forAll ((,) <$> choose (0,31 :: Word32) <*> choose (0,3 :: Word32)) $ \(phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked 153 phase result
-  let expected | phase==0 = 1
-               | phase>29 || result>1 = -1
-               | phase==24 = if result==0 then -10 else 25
-               | phase==25 = if result==0 then 28 else 26
-               | phase==26 = if result==0 then 29 else 27
-               | phase==27 = if result==0 then -1 else 24
-               | phase==28 = if result==0 then -11 else 26
-               | phase==29 = if result==0 then -11 else 27
-               | result==0 = -11
-               | otherwise = fromIntegral phase+1
-  pure (actual===expected)
-
-hashArgumentsTransitions :: Property
-hashArgumentsTransitions = forAll ((,,) <$> arbitrary <*> choose (0,22 :: Word32) <*> arbitrary) $ \(direct,fault,malformed) -> ioProperty $ do
-  seen <- newIORef []
-  let accepted=fault==0 || (not malformed && direct && fault>=14 && fault<=19)
-      readText index = do
-        modifyIORef' seen (++[2*index])
-        pure $ if index+1/=fault then C.replicate 64 '1' else if malformed then C.pack "bad" else C.replicate 64 '0'
-      publish index payload = do
-        if payload/=B.replicate 32 (if index+1==fault then 0 else 17) then error "wrong hash bytes" else pure ()
-        modifyIORef' seen (++[2*index+1])
-  actual <- validate (Exchange.HashArguments direct readText publish)
-  observed <- readIORef seen
-  absent <- elements_hs_configuration_hashes 0 nullFunPtr nullPtr
-  invalid <- elements_hs_configuration_hashes 2 nullFunPtr nullPtr
-  pure $ conjoin [actual===(if accepted then 0 else 4*fromIntegral fault+(if malformed then 1 else 2)),
-    observed===[0..if accepted then 43 else 2*fault-2],absent===(-1),invalid===(-1)]
-
-materialNameParity :: Property
-materialNameParity = forAll ((,,,) <$> arbitrary <*> elements ["","blk","rev","chainstate","Blk","xblk"] <*>
-    resize 40 (listOf (arbitrary `suchThat` (/=47))) <*> elements ["",".dat",".DAT",".dat.bak","."]) $
-    \(chainstates,prefix,middle,suffix) -> ioProperty $ do
-  let name=C.pack prefix <> B.pack middle <> C.pack suffix
-      text=C.unpack name
-      expected = if chainstates then "chainstate" `List.isPrefixOf` text
-        else ("blk" `List.isPrefixOf` text || "rev" `List.isPrefixOf` text) && ".dat" `List.isSuffixOf` text
-  B.useAsCStringLen name $ \(ptr,size) -> do
-    actual <- elements_hs_material_name (if chainstates then 1 else 0) (fromIntegral size) (castPtr ptr)
-    invalid <- sequence [elements_hs_material_name 2 (fromIntegral size) (castPtr ptr),
-      elements_hs_material_name 0 maxBound (castPtr ptr),elements_hs_material_name 0 0 nullPtr]
-    pure $ conjoin [actual===(if expected then 1 else 0),invalid===replicate 3 (-1)]
-
-materialDirectoryWorkflow :: Property
-materialDirectoryWorkflow = forAll ((,) <$> arbitrary <*> resize 12 (listOf ((,,) <$> arbitrary <*> arbitrary <*> arbitrary))) $ \(exists,entries) -> ioProperty $ do
-  let prepend prefix (suffix,result) = (prefix++suffix,result)
-      scan [] = ([3],-10)
-      scan ((typed,named,material):rest)
-        | not typed = prepend [3,4,7] (scan rest)
-        | not named = prepend [3,4,5,7] (scan rest)
-        | material = ([3,4,5,6],-11)
-        | otherwise = prepend [3,4,5,6,7] (scan rest)
-      expected = if exists then prepend [1,2] (scan entries) else ([1],-10)
-      walk :: Int -> Word32 -> Int -> [Int] -> IO ([Int],Int32)
-      walk 0 _ _ seen = pure (seen,-999)
-      walk budget phase offset seen = do
-        let (typed,named,material) = entries !! offset
-            answer = case phase of
-              0 -> False
-              1 -> exists
-              3 -> offset < length entries
-              4 -> typed
-              5 -> named
-              6 -> material
-              _ -> True
-        next <- elements_hs_parent_replay_store_checked 175 phase (if answer then 1 else 0)
-        if next<=0 then pure (seen,next)
-        else if next>7 then pure (seen,-998)
-        else walk (budget-1) (fromIntegral next) (offset+if phase==7 then 1 else 0) (seen++[fromIntegral next])
-  actual <- walk 100 0 0 []
-  invalid <- sequence [elements_hs_parent_replay_store_checked 175 phase 2 | phase <- [1..8]]
-  pure $ conjoin [actual===expected,invalid===replicate 8 (-1)]
-
-materialLocationWorkflow :: Property
-materialLocationWorkflow = forAll (choose (0,31 :: Int)) $ \mask -> ioProperty $ do
-  let walk :: Word32 -> [Word32] -> IO ([Word32],Int32)
-      walk phase seen = do
-        next <- elements_hs_parent_replay_store_checked 176 phase
-          (if phase/=0 && testBit mask (fromIntegral phase-1) then 1 else 0)
-        if next<=0 then pure (seen,next)
-        else if next>5 || length seen>=5 then pure (seen,-999)
-        else walk (fromIntegral next) (seen++[fromIntegral next])
-      firstMatch = head ([index | index<-[1..5],testBit mask (index-1)]++[5])
-  actual <- walk 0 []
-  invalid <- sequence [elements_hs_parent_replay_store_checked 176 phase 2 | phase <- [1..6]]
-  pure $ conjoin [actual===([1..fromIntegral firstMatch],if mask==0 then -10 else -11),invalid===replicate 6 (-1)]
-
-foreign import ccall "wrapper" wrapIdentityWrite :: Deposit.ReadCtipOpcode -> IO (FunPtr Deposit.ReadCtipOpcode)
-
-identityWriteWorkflow :: Property
-identityWriteWorkflow = forAll arbitrary $ \(opened,wrote,committed,closed,renamed) -> ioProperty $ do
-  let expected | not opened = ([1,2],-10)
-               | not wrote = ([1,3,5,6],-10)
-               | not committed = ([1,3,4,5,6],-10)
-               | not closed = ([1,3,4,7,8],-10)
-               | not renamed = ([1,3,4,7,9,10],-10)
-               | otherwise = ([1,3,4,7,9,11,12],-11)
-      answer phase = case phase of
-              0 -> False
-              1 -> opened
-              3 -> wrote
-              4 -> committed
-              7 -> closed
-              9 -> renamed
-              _ -> True
-      walk :: Int -> Word32 -> [Int] -> IO ([Int],Int32)
-      walk 0 _ seen = pure (seen,-999)
-      walk budget phase seen = do
-        next <- elements_hs_parent_replay_store_checked 174 phase (if answer phase then 1 else 0)
-        if next<=0 then pure (seen,next)
-        else if next>12 then pure (seen,-998)
-        else walk (budget-1) (fromIntegral next) (seen++[fromIntegral next])
-  actual <- walk 20 0 []
-  effects <- newIORef []
-  combined <- bracket (wrapIdentityWrite (\_ action -> do
-    modifyIORef' effects (++[fromIntegral action])
-    pure (if answer action then 1 else 0))) freeHaskellFunPtr $ \callback ->
-      elements_hs_identity_write callback nullPtr
-  observed <- readIORef effects
-  missing <- elements_hs_identity_write nullFunPtr nullPtr
-  invalid <- sequence [elements_hs_parent_replay_store_checked 174 phase 2 | phase <- [1..13]]
-  pure $ conjoin [actual===expected,invalid===replicate 13 (-1),observed===fst expected,
-    combined===(-10-snd expected),missing===(-1),
-    length (filter (`elem` [5,7]) (fst actual))===(if opened then 1 else 0)]
-
-identityWriteCallbackFault :: Property
-identityWriteCallbackFault = forAll ((,) <$> choose (1,12 :: Word32) <*> elements [-1,2]) $ \(fault,code) -> ioProperty $ do
-  effects <- newIORef []
-  actual <- bracket (wrapIdentityWrite (\_ action -> do
-    modifyIORef' effects (++[action])
-    pure (if action==fault then code else 1))) freeHaskellFunPtr $ \callback ->
-      elements_hs_identity_write callback nullPtr
-  observed <- readIORef effects
-  let success = [1,3,4,7,9,11,12]
-      reached = fault `elem` success
-  pure $ conjoin [actual===(if reached then -1 else 1),
-    observed===(if reached then takeWhile (/=fault) success++[fault] else success)]
-
-foreign import ccall "wrapper" wrapIdentityHash :: CustodyHash -> IO (FunPtr CustodyHash)
-
-identityRecordEncoding :: Property
-identityRecordEncoding = forAll ((,,,) <$> resize 40 (listOf arbitrary) <*> vectorOf 64 arbitrary <*>
-    vectorOf 32 arbitrary <*> arbitrary) $ \(network,hashes,digest,fault) -> ioProperty $ do
-  seen <- newIORef []
-  let hex octets = concatMap (\byte -> [digits !! fromIntegral (byte `div` 16),digits !! fromIntegral (byte `mod` 16)]) (reverse octets)
-      digits = "0123456789abcdef"
-      prefix = C.pack "ecx-consensus-datadir-v3\nnetwork=" <> B.pack network <> C.pack
-        ("\ngenesis="++hex (take 32 hashes)++"\nfingerprint="++hex (drop 32 hashes)++"\n")
-      expected = B.unpack (prefix <> C.pack ("checksum="++hex digest++"\n"))
-      capacity = length network+258
-      callback _ kind size input output = do
-        preimage <- B.packCStringLen (castPtr input,fromIntegral size)
-        modifyIORef' seen (++[(kind,preimage)])
-        pokeArray output digest
-        pure (if fault then -1 else 0)
-  bracket (wrapIdentityHash callback) freeHaskellFunPtr $ \effect ->
-    withArray (network++[0]) $ \name -> withArray hashes $ \identities ->
-    withArray (replicate (capacity+2) (0xa5 :: Word8)) $ \buffer -> alloca $ \written -> do
-      poke written 999
-      invalid <- elements_hs_configuration_identity (fromIntegral (length network)) name identities effect nullPtr
-        (fromIntegral capacity-1) (buffer `plusPtr` 1) written
-      missing <- sequence [elements_hs_configuration_identity size namePtr hashPtr hashEffect nullPtr
-        (fromIntegral capacity) outPtr writtenPtr | (size,namePtr,hashPtr,hashEffect,outPtr,writtenPtr) <-
-        [(fromIntegral (length network),nullPtr,identities,effect,buffer,written),
-         (fromIntegral (length network),name,nullPtr,effect,buffer,written),
-         (fromIntegral (length network),name,identities,nullFunPtr,buffer,written),
-         (fromIntegral (length network),name,identities,effect,nullPtr,written),
-         (fromIntegral (length network),name,identities,effect,buffer,nullPtr),
-         (maxBound,name,identities,effect,buffer,written)]]
-      actual <- elements_hs_configuration_identity (fromIntegral (length network)) name identities effect nullPtr
-        (fromIntegral capacity) (buffer `plusPtr` 1) written
-      count <- peek written
-      output <- peekArray (capacity+2) buffer
-      calls <- readIORef seen
-      pure $ conjoin [invalid===(-1),missing===replicate 6 (-1),actual===(if fault then -1 else 0),
-        count===(if fault then 999 else fromIntegral capacity),calls===[(0,prefix)],
-        output===(if fault then replicate (capacity+2) 0xa5 else [0xa5]++expected++[0xa5])]
-
-identityCoinsWorkflow :: Property
-identityCoinsWorkflow = forAll (resize 5 (listOf ((,,,) <$> arbitrary <*> arbitrary <*> arbitrary <*>
-    resize 4 (listOf arbitrary)))) $ \states -> ioProperty $ do
-  let prepend prefix (suffix,result) = (prefix++suffix,result)
-      expected [] = ([1],-11)
-      expected ((exchange,bmm,best,heads):rest)
-        | exchange = ([1,2,4],-10)
-        | bmm = ([1,2,3,4],-10)
-        | not best = ([1,2,3,5],-10)
-        | otherwise = prepend [1,2,3,5,6] (recovery heads rest)
-      recovery [] rest = prepend [7,10] (expected rest)
-      recovery (valid:heads) rest
-        | valid = prepend [7,8,9] (recovery heads rest)
-        | otherwise = ([7,8],-10)
-      walk :: Int -> Word32 -> Int -> Int -> [Int] -> IO ([Int],Int32)
-      walk 0 _ _ _ seen = pure (seen,-999)
-      walk budget phase state headIndex seen = do
-        let (exchange,bmm,best,heads) = states !! state
-            answer = case phase of
-              0 -> False
-              1 -> state < length states
-              2 -> exchange
-              3 -> bmm
-              5 -> best
-              7 -> headIndex < length heads
-              8 -> heads !! headIndex
-              _ -> True
-        next <- elements_hs_parent_replay_store_checked 173 phase (if answer then 1 else 0)
-        if next<=0 then pure (seen,next)
-        else if next>10 then pure (seen,-998)
-        else walk (budget-1) (fromIntegral next) (state+if phase==10 then 1 else 0)
-          (if phase==6 then 0 else headIndex+if phase==9 then 1 else 0) (seen++[fromIntegral next])
-  actual <- walk 250 0 0 0 []
-  invalid <- sequence [elements_hs_parent_replay_store_checked 173 phase 2 | phase <- [1..11]]
-  pure $ conjoin [actual===expected states,invalid===replicate 11 (-1)]
-
-identityHistoryWorkflow :: Property
-identityHistoryWorkflow = forAll ((,,,) <$> arbitrary <*> arbitrary <*> arbitrary <*>
-    resize 12 (listOf ((,,) <$> arbitrary <*> arbitrary <*> arbitrary))) $ \(ancestry,absent,found,headers) -> ioProperty $ do
-  let kind = if ancestry then 172 else 171
-      available = found && not (null headers)
-      height (_,_,high) = high
-      prepend prefix (suffix,result) = (prefix++suffix,result)
-      end | ancestry = ([3,8]++[12 | height (head headers)],if height (head headers) then -10 else -11)
-          | otherwise = ([3],-11)
-      scan [] = end
-      scan ((namespace,special,high):rest)
-        | namespace = ([3,4,11],-10)
-        | special = ([3,4,5,11],-10)
-        | not ancestry && high = ([3,4,5,8,12],-10)
-        | otherwise = prepend ([3,4,5]++[8 | not ancestry]++[7]) (scan rest)
-      expected | not ancestry = scan headers
-               | absent = ([1],-11)
-               | not available = ([1,2,10],-10)
-               | otherwise = prepend [1,2] (scan headers)
-      walk :: Int -> Word32 -> Int -> [Int] -> IO ([Int],Int32)
-      walk 0 _ _ seen = pure (seen,-999)
-      walk budget phase offset seen = do
-        let answer = case phase of
-              0 -> False
-              1 -> absent
-              2 -> available
-              3 -> offset < length headers
-              4 -> let (namespace,_,_) = headers !! offset in namespace
-              5 -> let (_,special,_) = headers !! offset in special
-              8 -> height (headers !! if ancestry then 0 else offset)
-              _ -> True
-        next <- elements_hs_parent_replay_store_checked kind phase (if answer then 1 else 0)
-        if next<=0 then pure (seen,next)
-        else if next>12 then pure (seen,-998)
-        else walk (budget-1) (fromIntegral next) (offset+if phase==7 then 1 else 0) (seen++[fromIntegral next])
-  actual <- walk 100 0 0 []
-  invalid <- sequence [elements_hs_parent_replay_store_checked kind phase result |
-    (phase,result) <- [(6,0),(9,0),(13,0)]++[(phase,2) | phase<-[1..12]]]
-  pure $ conjoin [actual===expected,invalid===replicate 15 (-1)]
-
-identityAuditWorkflow :: Property
-identityAuditWorkflow = forAll (resize 12 (listOf ((,,) <$> arbitrary <*> arbitrary <*> arbitrary))) $ \headers -> ioProperty $ do
-  let expected [] = ([1,9],-11 :: Int32)
-      expected ((parent,bmm,exchange):rest)
-        | not parent = prepend [1,2,8] (expected rest)
-        | not bmm = ([1,2,3,4],-10)
-        | not exchange = ([1,2,3,5,6],-10)
-        | otherwise = prepend [1,2,3,5,7,8] (expected rest)
-      prepend prefix (suffix,result) = (prefix++suffix,result)
-      walk :: Int -> Word32 -> Int -> [Int] -> IO ([Int],Int32)
-      walk 0 _ _ seen = pure (seen,-999)
-      walk budget phase offset seen = do
-        let answer = case phase of
-              0 -> False
-              1 -> offset < length headers
-              2 -> let (parent,_,_) = headers !! offset in parent
-              3 -> let (_,bmm,_) = headers !! offset in bmm
-              5 -> let (_,_,exchange) = headers !! offset in exchange
-              _ -> True
-        next <- elements_hs_parent_replay_store_checked 170 phase (if answer then 1 else 0)
-        if next<=0 then pure (seen,next)
-        else if next>9 then pure (seen,-998)
-        else walk (budget-1) (fromIntegral next) (offset+if phase==8 then 1 else 0) (seen++[fromIntegral next])
-  actual <- walk 100 0 0 []
-  invalid <- sequence [elements_hs_parent_replay_store_checked 170 phase 2 | phase <- [1..10]]
-  pure $ conjoin [actual===expected headers,invalid===replicate 10 (-1)]
-
-identityBindingWorkflow :: Property
-identityBindingWorkflow = forAll (vectorOf 13 arbitrary) $ \facts -> ioProperty $ do
-  let fact action = facts !! (action-1)
-      finish :: [Int] -> Bool -> ([Int],Int32)
-      finish actions accepted = (actions,if accepted then -11 else -10)
-      checks prefix [] = finish prefix True
-      checks prefix (action:rest)
-        | fact action = checks (prefix++[action]) rest
-        | otherwise = finish (prefix++[action]) False
-      expected
-        | not (fact 1) = finish [1] False
-        | not (fact 2) = finish [1,2] True
-        | fact 3 = finish [1,2,3] True
-        | fact 4 = checks [1,2,3,4] [5,6]
-        | not (fact 7) && fact 8 = finish [1,2,3,4,7,8,9] False
-        | otherwise = checks ([1,2,3,4,7]++[8 | not (fact 7)]) [10,11,13,12]
-      walk 0 _ seen = pure (seen,-999)
-      walk budget phase seen = do
-        next <- elements_hs_parent_replay_store_checked 169 phase
-          (if phase==0 then 0 else if phase==9 || fact (fromIntegral phase) then 1 else 0)
-        if next<=0 then pure (seen,next)
-        else if next>13 then pure (seen,-998)
-        else walk (budget-1 :: Int) (fromIntegral next) (seen++[fromIntegral next])
-  actual <- walk 20 0 []
-  invalid <- sequence [elements_hs_parent_replay_store_checked 169 phase 2 | phase <- [1..14]]
-  pure $ conjoin [actual===expected,invalid===replicate 14 (-1)]
-
-identityFileWorkflow :: Property
-identityFileWorkflow = forAll ((,) <$> arbitrary <*> vectorOf 15 arbitrary) $ \(reset,facts) -> ioProperty $ do
-  let fact action = facts !! (action-1)
-      finish :: [Int] -> Bool -> ([Int],Int32)
-      finish actions accepted = (actions,if accepted then -11 else -10 :: Int32)
-      expected
-        | reset && not (fact 1) = finish [1] True
-        | reset && fact 2 = finish [1,2] True
-        | otherwise = let prefix = (if reset then [1,2] else []) ++ [3]
-                      in if not (fact 3) then finish prefix False
-                         else if not (fact 4) then finish (prefix++[4]) True
-                         else decide (prefix++[4,5])
-      decide prefix
-        | fact 5 && reset = finish (prefix++[14]) (fact 14)
-        | fact 5 && not (fact 9) = finish (prefix++[9,10]) False
-        | fact 5 = finish (prefix++[9,11]++[12 | not (fact 11)]) (fact 11)
-        | reset = finish (prefix++[6]++[15 | fact 6]) (not (fact 6))
-        | not (fact 6) = finish (prefix++[6,8]) (fact 8)
-        | otherwise = finish (prefix++[6,7]++[13 | fact 7]) (not (fact 7))
-      kind = if reset then 168 else 167
-      walk 0 _ seen = pure (seen,-999)
-      walk budget phase seen = do
-        next <- elements_hs_parent_replay_store_checked kind phase
-          (if phase==0 then 0 else if phase `elem` [10,12,13,15] || fact (fromIntegral phase) then 1 else 0)
-        if next<=0 then pure (seen,next)
-        else if next>15 then pure (seen,-998)
-        else walk (budget-1 :: Int) (fromIntegral next) (seen++[fromIntegral next])
-  actual <- walk 20 0 []
-  bound <- elements_hs_parent_replay_store_checked kind maxBound 0
-  bad <- sequence [elements_hs_parent_replay_store_checked kind phase result |
-    (phase,result) <- [(16,0),(maxBound,1)]++[(phase,2) | phase<-[1..15]]]
-  pure $ conjoin [actual===expected,bound===15,bad===replicate 17 (-1)]
-
-configurationBindingTransitions :: Property
-configurationBindingTransitions = forAll ((,) <$> choose (0,12 :: Word32) <*> choose (0,3 :: Word32)) $ \(phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked 166 phase result
-  let expected | phase==0 = 1
-               | phase>8 || result>1 = -1
-               | result==0 = 65536+256+(if phase==1 then 9 else 10)
-               | phase==8 = -10
-               | otherwise = fromIntegral phase+1
-  pure (actual===expected)
-
-startupDeploymentTransitions :: Property
-startupDeploymentTransitions = forAll ((,) <$> choose (0,66 :: Word32) <*> choose (0,3 :: Word32)) $ \(phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked 165 phase result
-  let expected | phase==0 = 1
-               | phase>53 || result>1 = -1
-               | phase==11 = if result==1 then 18 else 12
-               | result==1 = if phase==53 then -10 else fromIntegral phase+1
-               | phase `elem` [6,10,24,31,38] = -11
-               | otherwise = 65536+256+head [code | (limit,code) <- [(5,54),(9,55),(17,56),(23,57),(30,58),(36,59),(37,60),(39,61),(44,62),(52,63),(53,64)],phase<=limit]
-  pure (actual===expected)
-
-frozenAdmissionTransitions :: Property
-frozenAdmissionTransitions = forAll ((,) <$> choose (0,17 :: Word32) <*> choose (0,3 :: Word32)) $ \(phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked 164 phase result
-  let expected | phase==0 = 1
-               | phase>11 || result>1 = -1
-               | phase==2 = if result==1 then 3 else 7
-               | phase==5 = if result==1 then 6 else 7
-               | result==1 = if phase==11 then -10 else fromIntegral phase+1
-               | phase `elem` [1,3,7,10,11] = -11
-               | otherwise = 65536+256+(if phase==4 then 12 else if phase==6 then 13 else if phase==8 then 14 else 15)
-  pure (actual===expected)
-
-capitalProjectionTransitions :: Property
-capitalProjectionTransitions = forAll ((,) <$> choose (0,47 :: Word32) <*> choose (0,3 :: Word32)) $ \(phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked 163 phase result
-  let reject | phase==2 = 36
-             | phase==4 = 37
-             | phase==7 = 38
-             | phase==10 = 39
-             | phase<=14 = 40
-             | phase==17 = 41
-             | phase<=21 = 42
-             | phase<=24 = 43
-             | phase==25 = 44
-             | otherwise = 45
-      expected | phase==0 = 1
-               | phase>35 || result>1 = -1
-               | phase==3 = if result==1 then 4 else 7
-               | phase==8 = if result==1 then 9 else 12
-               | phase==16 = if result==1 then 17 else 30
-               | phase==30 = if result==1 then 31 else 32
-               | result==1 = if phase `elem` [6,11,29,35] then -10 else
-                   if phase==31 then 33 else if phase==32 then 34 else fromIntegral phase+1
-               | phase `elem` [9,28,33,34] = -1
-               | phase `elem` [1,5,6,11,15,22,29,31,32,35] = -11
-               | otherwise = 65536+256+reject
-  pure (actual===expected)
-
-genesisAdmissionTransitions :: Property
-genesisAdmissionTransitions = forAll ((,) <$> choose (0,76 :: Word32) <*> choose (0,3 :: Word32)) $ \(phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked 162 phase result
-  let errorAction | phase==2 = 65
-                  | phase==4 = 66
-                  | phase<=14 = 67
-                  | phase<=22 = 68
-                  | phase==23 = 69
-                  | phase<=40 = 70
-                  | phase==41 = 71
-                  | phase<=53 = 72
-                  | phase==55 = 73
-                  | otherwise = 74
-      expected | phase==0 = 1
-               | phase>64 || result>1 = -1
-               | phase==3 = if result==1 then 4 else 5
-               | phase==24 = if result==1 then 26 else 25
-               | result==1 = if phase==64 then -10 else fromIntegral phase+1
-               | phase `elem` [1,54] = -11
-               | phase `elem` [5,42,64] = -1
-               | otherwise = 65536+256+errorAction
-  pure (actual===expected)
-
-issuanceTransitions :: Property
-issuanceTransitions = forAll ((,,) <$> arbitrary <*> choose (0,19 :: Word32) <*> choose (0,3 :: Word32)) $ \(opening,phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked (if opening then 152 else 151) phase result
-  let count = if opening then 17 else 8
-      expected | phase==0 = 1
-               | phase>count || result>1 = -1
-               | result==0 = -11
-               | phase==count = -10
-               | otherwise = fromIntegral phase+1
-  pure (actual===expected)
-
-blockSourcesTransitions :: Property
-blockSourcesTransitions = forAll ((,) <$> choose (0,13 :: Word32) <*> choose (0,3 :: Word32)) $ \(phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked 150 phase result
-  let expected | phase==0 = 1
-               | result>1 = -1
-               | otherwise = case phase of
-                   1 -> if result==1 then 2 else 11
-                   2 -> if result==1 then 3 else 10
-                   6 -> if result==1 then 7 else 10
-                   7 -> if result==1 then 8 else 9
-                   9 -> if result==1 then 6 else -1
-                   10 -> if result==1 then 1 else -1
-                   11 -> if result==1 then -11 else -1
-                   _ | phase `elem` [3,4,5,8] -> if result==0 then -10 else fromIntegral phase+1
-                     | otherwise -> -1
-  pure (actual===expected)
-
-sourceTransactionTransitions :: Property
-sourceTransactionTransitions = forAll ((,) <$> choose (0,14 :: Word32) <*> choose (0,3 :: Word32)) $ \(phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked 149 phase result
-  let expected | phase==0 = 1
-               | result>1 = -1
-               | otherwise = case phase of
-                   1 -> if result==1 then 2 else 12
-                   2 -> if result==1 then 3 else 11
-                   6 -> if result==1 then 7 else 8
-                   11 -> if result==1 then 1 else -1
-                   12 -> if result==1 then -11 else -10
-                   _ | phase `elem` [3,4,5,7,8,9,10] ->
-                         if result==0 then -10 else if phase `elem` [7,8] then 9 else fromIntegral phase+1
-                     | otherwise -> -1
-  pure (actual===expected)
-
 parentReplayAdmissionTransitions :: Property
 parentReplayAdmissionTransitions = forAll ((,) <$> choose (0,24 :: Word32) <*> choose (0,3 :: Word32)) $ \(phase,result) -> ioProperty $ do
   actual <- elements_hs_parent_replay_store_checked 126 phase result
@@ -3877,26 +1873,10 @@ parentReplayAdmissionTransitions = forAll ((,) <$> choose (0,24 :: Word32) <*> c
   pure (actual===expected)
 
 parentReplayStageTransitions :: Property
-parentReplayStageTransitions = forAll ((,,) <$> elements [127,128,130,131] <*> choose (0,11 :: Word32) <*> choose (0,3 :: Word32)) $ \(kind,phase,result) -> ioProperty $ do
+parentReplayStageTransitions = forAll ((,,) <$> elements [127,128] <*> choose (0,11 :: Word32) <*> choose (0,3 :: Word32)) $ \(kind,phase,result) -> ioProperty $ do
   actual <- elements_hs_parent_replay_store_checked kind phase result
   let branch yes no = if result==1 then yes else if result==0 then no else -1
       expected = case phase of
-        p | kind==131 -> case p of
-          0 -> 1
-          1 -> if result==1 then 2 else -1
-          2 -> branch 4 65539
-          4 -> branch 5 65542
-          5 -> branch 7 65542
-          7 -> branch (-11) (-10)
-          _ -> -1
-        p | kind==130 -> case p of
-          0 -> 1
-          1 -> branch 2 65539
-          2 -> branch 4 65539
-          4 -> branch 6 65541
-          6 -> branch 7 (-11)
-          7 -> branch (-11) 65544
-          _ -> -1
         0 -> 1
         p | kind==128 && p>=1 && p<=9 -> branch (if p==9 then -11 else fromIntegral p+1) (-10)
         p | p>=1 && p<=5 -> branch (fromIntegral p+1) (-10)
@@ -3905,16 +1885,6 @@ parentReplayStageTransitions = forAll ((,,) <$> elements [127,128,130,131] <*> c
         p | p==8 || p==9 -> branch (-11) (-10)
         _ -> -1
   pure (actual===expected)
-
-usddGenesisTransitions :: Property
-usddGenesisTransitions = forAll arbitrary $ \(phase,result) -> ioProperty $ do
-  actual <- elements_hs_parent_replay_store_checked 129 phase result
-  bound <- elements_hs_parent_replay_store_checked 129 maxBound 0
-  calls <- newIORef (0 :: Int)
-  rejected <- bracket (wrapMatchFact (\_ _ -> modifyIORef' calls (+1) >> pure 1)) freeHaskellFunPtr $
-    \callback -> elements_hs_parent_replay_run 129 callback nullPtr
-  observed <- readIORef calls
-  pure $ conjoin [actual === -1, bound === -1, rejected === -1, observed === 0]
 
 parentReplayTipTransitions :: Property
 parentReplayTipTransitions = forAll ((,) <$> choose (0,52 :: Word32) <*> choose (0,2 :: Word32)) $ \(phase,result) -> ioProperty $ do
@@ -5698,13 +3668,6 @@ bmmFingerprintParity = forAll gen $ \(seed,mode,fault,writeFault) -> ioProperty 
     gen :: Gen (Word64, Word64, Word64, Word64)
     gen = (,,,) <$> arbitrary <*> elements [0,1,2,maxBound] <*>
       frequency [(4,pure 0),(1,choose (1,180))] <*> elements [0,1]
-data ExchangeFingerprintFixture = ExchangeFingerprintFixture [Word64] [[Word8]]
-instance Bmm.FingerprintSource ExchangeFingerprintFixture where
-  fingerprintNumber (ExchangeFingerprintFixture numbers _) group index
-    | group == 0 = pure (numbers !! fromIntegral index)
-    | otherwise = error "unexpected fingerprint group"
-  fingerprintBytes (ExchangeFingerprintFixture _ blobs) index = pure (blobs !! fromIntegral index)
-
 data PoisonedFingerprint = PoisonedFingerprint
 instance Bmm.FingerprintSource PoisonedFingerprint where
   fingerprintNumber _ _ _ = pure 0
@@ -5713,44 +3676,8 @@ instance Bmm.FingerprintSource PoisonedFingerprint where
 fingerprintFinalization :: Property
 fingerprintFinalization = once $ ioProperty $ do
   outcomes <- sequence [try (Bmm.encodeFingerprint format PoisonedFingerprint)
-    :: IO (Either SomeException [Word8]) | format <- [Bmm.BmmFormat,Bmm.ExchangeFormat,Bmm.ActivationFormat]]
+    :: IO (Either SomeException [Word8]) | format <- [Bmm.BmmFormat]]
   pure (property (all isLeft outcomes))
-
-activationFingerprintEncoding :: Property
-activationFingerprintEncoding = forAll ((,,,) <$> vectorOf 8 arbitrary <*> vectorOf 3 (resize 40 arbitrary) <*>
-  vectorOf 44 (vectorOf 32 arbitrary) <*> choose (3,46 :: Int)) $ \(numbers,prefix,hashes,badIndex) -> ioProperty $ do
-    let fields = zipWith (\i value -> if i==4 || i==7 then value else value `mod` (if i==5 then 256 else 4294967296)) [0..7 :: Int] numbers
-        blobs = prefix ++ hashes
-        n width index = wordBE width (fields !! index)
-        raw index = B.pack (blobs !! index)
-        expected = B.concat ([raw 0,raw 1] ++ map (n 4) [0..3] ++ [raw 2] ++ map raw [3..45] ++ [n 8 4,n 1 5,n 4 6,raw 46,n 8 7])
-        malformed = take badIndex blobs ++ [take 31 (blobs !! badIndex)] ++ drop (badIndex+1) blobs
-    actual <- Bmm.encodeFingerprint Bmm.ActivationFormat (ExchangeFingerprintFixture fields blobs)
-    badHash <- try (Bmm.encodeFingerprint Bmm.ActivationFormat (ExchangeFingerprintFixture fields malformed)) :: IO (Either SomeException [Word8])
-    badNumbers <- sequence [try (Bmm.encodeFingerprint Bmm.ActivationFormat
-      (ExchangeFingerprintFixture (take i fields ++ [if i==5 then 256 else 4294967296] ++ drop (i+1) fields) blobs))
-      :: IO (Either SomeException [Word8]) | i <- [0,1,2,3,5,6]]
-    pure (conjoin [B.pack actual === expected,property (isLeft badHash && all isLeft badNumbers)])
-
-exchangeFingerprintEncoding :: Property
-exchangeFingerprintEncoding = forAll ((,,) <$> vectorOf 40 arbitrary <*>
-  vectorOf 67 (resize 40 arbitrary) <*> elements [0,1]) $ \(numbers,blobs,mode) -> ioProperty $ do
-    let fields = take 37 numbers ++ [mode, numbers !! 38,numbers !! 39 `mod` 2]
-        n width index = wordBE width (fields !! index)
-        raw index = B.pack (blobs !! index)
-        sizedBlob width index = wordBE width (fromIntegral (B.length (raw index))) <> raw index
-        expected = B.concat $
-          map (n 4) [0..9] ++ map (n 8) [10..20] ++
-          [raw 0,n 4 21,raw 1,n 4 22,raw 2,n 4 23] ++
-          map (sizedBlob 8) [3..8] ++ map (n 1) [24..26] ++
-          [raw 9,sizedBlob 4 10,raw 11,raw 12,raw 13,n 4 27,raw 14,n 4 28] ++
-          map raw [15..18] ++ [sizedBlob 4 19,raw 20,n 1 29,n 1 30,n 4 31,sizedBlob 8 21,sizedBlob 8 22] ++
-          map (n 4) [32..35] ++ [sizedBlob 8 23] ++ map raw [24..62] ++
-          [n 8 36,n 1 37,wordBE 4 (if mode == 1 then fields !! 38 else 0),n 1 39] ++ map raw [63..66]
-    actual <- Bmm.encodeFingerprint Bmm.ExchangeFormat (ExchangeFingerprintFixture fields blobs)
-    rejected <- try (Bmm.encodeFingerprint Bmm.ExchangeFormat
-      (ExchangeFingerprintFixture (take 37 fields ++ [2,0]) blobs)) :: IO (Either SomeException [Word8])
-    pure (conjoin [B.pack actual === expected, property (isLeft rejected)])
 
 foreign import ccall unsafe reference_signet_validation :: Ptr Word64 -> Ptr Word64 -> IO Int32
 foreign import ccall unsafe reference_bmm_sighash_plan :: Int32 -> Word32 -> Word64 -> IO Int32
@@ -6145,37 +4072,6 @@ grpcPlanFfiBounds = once $ ioProperty $ allocaBytes 128 $ \out -> do
   after <- peekArray 128 out
   pure $ conjoin [invalid===(-1),missing===(-1),short===(-1),after===replicate 128 0xaa]
 
-activationAnchorOrder :: Property
-activationAnchorOrder = forAll ((,,) <$> frequency
-  [(1,vectorOf 28 arbitrary),(3,elements [[i/=rejected | i <- [1..28 :: Int]] | rejected <- [0..28]])]
-  <*> arbitrary <*> choose (-1,28 :: Int)) $ \(flags,nonNullBid,fault) -> ioProperty $ do
-  let yes step = flags !! (step-1)
-      fact step = (fromIntegral step,if yes step then 1 else 0)
-      throughFailure [] = []
-      throughFailure (step:rest) = fact step : if yes step then throughFailure rest else []
-      eligible = all yes [1..17]
-      copied = all yes [18..20]
-      script = throughFailure [1..17] ++ if not eligible then [] else
-        throughFailure [18..20] ++ [(21,1) | copied] ++ [(22,1),fact 23] ++
-        if not (yes 23) then [] else [(24,if copied && nonNullBid then 1 else 0)] ++
-        if not (copied && nonNullBid) then [] else [(25,1),fact 26] ++
-        if not (yes 26) then [] else [fact 27] ++ [(28,1) | yes 27]
-  commandTrace 272 28 (\phase reply -> validate (Exchange.ActivationAnchorFlow phase reply))
-    script fault (if fst (last script)==28 then 1 else 0)
-
-bondContextOrder :: Property
-bondContextOrder = forAll ((,,) <$> choose (0,3) <*> frequency
-  [(1,vectorOf 16 arbitrary),(3,elements [[i/=rejected | i <- [1..16 :: Int]] | rejected <- [0..16]])]
-  <*> choose (-1,17 :: Int)) $ \(identityMask,flags,fault) -> ioProperty $ do
-  let replies = [(step,if step==3 then identityMask else if yes then 1 else 0) |
-        (step,yes) <- zip [1..16] flags]
-      prefix = takeWhile ((/=0) . snd) replies
-      accepted = length prefix==16
-      script = if accepted then replies else prefix ++ [replies !! length prefix,(17,0)]
-      invalid step = if step==3 then [4,maxBound] else [2,maxBound]
-  commandTraceWith invalid 271 17 (\phase reply -> validate (Exchange.BondContextFlow phase reply))
-    script fault (if accepted then 1 else 0)
-
 nativeWithdrawalSubmissionOrder :: Property
 nativeWithdrawalSubmissionOrder = forAll ((,) <$> arbitrary <*> choose (-1,8 :: Int)) $ \((present,transaction,detailed),fault) -> ioProperty $ do
   let flag value = if value then 1 else 0
@@ -6504,144 +4400,7 @@ indexedCallbackBoundary = once $ ioProperty $ do
   where callbackNull = nullFunPtr :: FunPtr ProofBuildEffect
 
 foreign import ccall "wrapper" makeStateTransitionEffect :: StateTransitionEffect -> IO (FunPtr StateTransitionEffect)
-stateTransitionWorkflow :: Property
-stateTransitionWorkflow = forAll generator $ \(rows,fault) -> ioProperty $ do
-  seen <- newIORef []
-  state <- newIORef (0 :: Int)
-  let action step index = do
-        modifyIORef' seen (++[(step,index)])
-        if step == 2 then writeIORef state 1 else if step == 7 then writeIORef state 2 else pure ()
-        let (oldCount,newCount,mask,authority) = rows !! fromIntegral index
-        pure $ if step == fault && step `notElem` [1,8] then 2 else case step of
-          1 -> oldCount
-          8 -> newCount
-          2 -> 1
-          3 -> if testBit mask 0 then 1 else 0
-          4 -> if testBit mask 1 then 1 else 0
-          5 -> if testBit mask 2 then 1 else 0
-          6 -> if authority then 1 else 0
-          7 -> 1
-          _ -> error "unexpected transition action"
-      chooseTransition index selected history remaining = case remaining of
-        [] -> case selected of
-          Nothing -> (0,history ++ [(2,0)])
-          Just chosen -> shape chosen 3 history
-        (old,_,_,_):rest ->
-          let trace = history ++ [(1,index)]
-          in if old == 0 then chooseTransition (index+1) selected trace rest
-             else if old == 1 && selected == Nothing then chooseTransition (index+1) (Just index) trace rest
-             else (1,trace)
-      shape chosen step history =
-        let (_,_,mask,authority) = rows !! fromIntegral chosen
-            trace = history ++ [(step,chosen)]
-        in if step < 6 then
-             if testBit mask (fromIntegral step-3) then shape chosen (step+1) trace
-             else (if step < 5 then 2 else 3,trace)
-           else if not authority then (4,trace)
-           else suffix (chosen+1) (trace ++ [(7,chosen)]) (drop (fromIntegral chosen+1) rows)
-      suffix _ history [] = (0,history)
-      suffix index history ((_,newCount,_,_):rest) =
-        let trace = history ++ [(8,index)]
-        in if newCount /= 0 then (5,trace) else suffix (index+1) trace rest
-      (normal,normalTrace) = chooseTransition 0 Nothing [] rows
-      (beforeFault,afterFault) = break (\(step,_) -> step == fault && step `notElem` [1,8]) normalTrace
-      (expectedCode,expectedTrace) = if null afterFault then (normal,normalTrace)
-        else (-1,beforeFault ++ take 1 afterFault)
-      expectedState = if any ((==7) . fst) expectedTrace then 2 else if any ((==2) . fst) expectedTrace then 1 else 0
-      count = fromIntegral (length rows)
-  direct <- try (validate (Exchange.StateTransition count action)) :: IO (Either SomeException Int32)
-  directTrace <- readIORef seen
-  directState <- readIORef state
-  writeIORef seen []
-  writeIORef state 0
-  bracket (makeStateTransitionEffect (\_ -> action)) freeHaskellFunPtr $ \callback -> do
-    code <- elements_hs_exchange_transition count callback nullPtr
-    observed <- readIORef seen
-    observedState <- readIORef state
-    absent <- elements_hs_exchange_transition count nullFunPtr nullPtr
-    pure $ conjoin [either (const (-1)) id direct === expectedCode,directTrace === expectedTrace,
-      directState === expectedState,code === expectedCode,observed === expectedTrace,
-      observedState === expectedState,absent === (-1)]
-  where
-    counts = elements [0,0,0,1,2,maxBound :: Word64]
-    generator = (,) <$> resize 8 (listOf ((,,,) <$> counts <*> counts <*>
-      elements [0,1,3,7 :: Word32] <*> arbitrary)) <*> elements [0,0,0,2,3,4,5,6,7]
-
 foreign import ccall "wrapper" makeCursorEffect :: CursorEffect -> IO (FunPtr CursorEffect)
-
-stateWorkflowParity :: Property
-stateWorkflowParity = forAll generator $ \(kind,rows,tracked) -> ioProperty $ do
-  let count = fromIntegral (length rows)
-      run interpreter = do
-        seen <- newIORef []
-        published <- newIORef (0 :: Int)
-        let action step index item = do
-              modifyIORef' seen (++[(step,index,item)])
-              when (kind == 2 && step == 1) (writeIORef published 1)
-              when (kind == 3 && step == 2) (writeIORef published 1)
-              when (kind == 3 && step == 7) (writeIORef published 2)
-              let (before,after,shape,authority) = rows !! fromIntegral index
-                  yes value = if value then 1 else 0
-              pure $ if step >= 64 then yes (authority !! fromIntegral (step-64))
-                else if kind == 2 then yes (tracked !! fromIntegral step)
-                else case step of
-                  1 -> fromIntegral (length before)
-                  8 -> fromIntegral (length after)
-                  17 -> yes (before !! fromIntegral item)
-                  24 -> yes (after !! fromIntegral item)
-                  3 -> yes (not (null before))
-                  4 -> yes (head before)
-                  5 -> yes shape
-                  2 -> 1
-                  7 -> 1
-                  _ -> error "unexpected state workflow action"
-        code <- interpreter action
-        trace <- readIORef seen
-        output <- readIORef published
-        pure (code,trace,output)
-      reference native = do
-        failure <- newIORef (0 :: Int)
-        let authority successor index = validate (Exchange.Authority successor (\field ->
-              (==1) <$> native (64+fromIntegral field) index 0))
-            check successor index = do
-              code <- authority successor index
-              writeIORef failure code
-              pure (code == 0)
-            action step index
-              | step == 1 || step == 8 = do
-                  inputs <- native step index 0
-                  fromIntegral <$> Workflow.countMatches inputs (\i -> fromIntegral <$> native (16+step) index i)
-              | step == 6 = (\accepted -> if accepted then 1 else 0) <$> check True index
-              | otherwise = native step index 0
-            coin 1 = native 1 0 0 >> check False 0
-            coin step = (==1) <$> native (fromIntegral step) 0 0
-        code <- if kind < 2 then do
-                  result <- authority (kind==1) 0
-                  pure (if result==0 then 0 else fromIntegral result+100)
-                else if kind == 2 then do
-                  result <- validate (Exchange.TransactionShape 24 coin)
-                  pure (if result==0 then 0 else fromIntegral result+200)
-                else validate (Exchange.StateTransition count action)
-        rejection <- readIORef failure
-        pure (if rejection/=0 then 100+fromIntegral rejection else code)
-  expected <- run reference
-  direct <- run (validate . Exchange.StateWorkflow kind count)
-  actual <- run $ \action -> bracket (makeCursorEffect (\_ step index item out ->
-    action step index item >>= poke out >> pure 1)) freeHaskellFunPtr $ \callback ->
-      elements_hs_exchange_state_workflow kind count callback nullPtr
-  missing <- elements_hs_exchange_state_workflow kind count nullFunPtr nullPtr
-  invalid <- elements_hs_exchange_state_workflow 4 count nullFunPtr nullPtr
-  pure (conjoin [direct === expected,actual === expected,missing === -1,invalid === -1])
-  where
-    generator = do
-      kind <- elements [0,1,2,3,3,3]
-      n <- choose (1,6)
-      let matches = frequency [(4,pure False),(1,pure True)]
-      rows <- vectorOf n ((,,,) <$> resize 4 (listOf matches) <*> resize 4 (listOf matches) <*>
-        arbitrary <*> vectorOf 8 (frequency [(8,pure True),(1,pure False)]))
-      available <- arbitrary
-      root <- arbitrary
-      pure (kind,rows,[available,True,root])
 
 cursorTransportAbi :: Property
 cursorTransportAbi = forAll gen $ \(status,code,payload) -> ioProperty $ do
@@ -6676,153 +4435,6 @@ cursorTransportAbi = forAll gen $ \(status,code,payload) -> ioProperty $ do
   where
     gen = (,,) <$> elements [-1,0,1,2,maxBound] <*>
       elements [-2,-1,0,1,3,maxBound] <*> arbitrary
-
-cursorDerivationWorkflow :: Property
-cursorDerivationWorkflow = forAll generator $ \(rows,flags,priorForced,priorDeposit,matchesTransaction,fault) -> ioProperty $ do
-  seen <- newIORef []
-  let action step tx index = do
-        modifyIORef' seen (++[(step,tx,index)])
-        if step == fault then pure (-1,0,0) else case step of
-          1 -> pure (1,fromIntegral (length (rows !! fromIntegral tx)),0)
-          2 -> let (tag,f,d) = rows !! fromIntegral tx !! fromIntegral index
-               in pure (if tag < 0 then 0 else if tag == 0 then 1 else 2,f,d)
-          3 -> pure (1,0,0)
-          4 -> pure (if matchesTransaction then 1 else 0,0,0)
-          _ -> error "unexpected cursor action"
-      scan tx index found history remaining = case remaining of
-        [] -> visit (tx+1) found history
-        (tag,f,d):rest ->
-          let trace = history ++ [(2,tx,index)]
-          in if tag < 0 then (Left 4,trace)
-             else if tag == 0 then scan tx (index+1) found trace rest
-             else case found of
-               Just _ -> (Left 5,trace)
-               Nothing -> scan tx (index+1) (Just (f,d)) (trace ++ [(3,tx,index)]) rest
-      visit tx found history
-        | tx < fromIntegral (length rows) = scan tx 0 found (history ++ [(1,tx,0)]) (rows !! fromIntegral tx)
-        | otherwise =
-            let changed = testBit flags 0
-                trace = history ++ [(4,0,0) | changed && found /= Nothing]
-                result = case (changed,found) of
-                  (False,Nothing) -> Right (priorForced,priorDeposit)
-                  (False,Just _) -> Left 2
-                  (True,Nothing) -> if testBit flags 1 && priorForced == 0 && priorDeposit == 0
-                                    then Right (0,0) else Left 1
-                  (True,Just pair@(f,d)) -> if not matchesTransaction || f < priorForced || d < priorDeposit then Left 3 else Right pair
-            in (result,trace)
-      (normal,normalTrace) = if flags > 3 then (Left (-1),[]) else visit 0 Nothing []
-      (beforeFault,afterFault) = break (\(step,_,_) -> step == fault) normalTrace
-      expected = if null afterFault then (normal,normalTrace) else (Left (-1),beforeFault ++ take 1 afterFault)
-      count = fromIntegral (length rows)
-  direct <- validate (Exchange.CursorDerivation count flags priorForced priorDeposit action)
-  directTrace <- readIORef seen
-  writeIORef seen []
-  withArray [17,19] $ \output -> bracket (makeCursorEffect (\_ step tx index fields -> do
-    (code,a,b) <- action step tx index
-    pokeArray fields [a,b]
-    pure code)) freeHaskellFunPtr $ \callback -> do
-      code <- elements_hs_exchange_derive_cursors count flags priorForced priorDeposit output callback nullPtr
-      actual <- peekArray 2 output
-      absent <- elements_hs_exchange_derive_cursors count flags priorForced priorDeposit output nullFunPtr nullPtr
-      noOutput <- elements_hs_exchange_derive_cursors count flags priorForced priorDeposit nullPtr callback nullPtr
-      observed <- readIORef seen
-      let (result,trace) = expected
-      pure $ conjoin [(direct,directTrace) === expected,observed === trace,
-        code === either fromIntegral (const 0) result,
-        actual === either (const [17,19]) (\(f,d) -> [f,d]) result,
-        absent === (-1),noOutput === (-1)]
-  where
-    cursorAmounts = elements [0,1,3,maxBound-1,maxBound :: Word64]
-    generator = (,,,,,) <$> resize 5 (listOf (resize 5 (listOf ((,,) <$>
-      elements [-1,0,0,0,1 :: Int] <*> cursorAmounts <*> cursorAmounts)))) <*>
-      elements [0,1,2,3,4 :: Word32] <*> cursorAmounts <*> cursorAmounts <*> arbitrary <*>
-      elements [0,0,0,0,1,2,3,4]
-
-inboxSourcesOrder :: Property
-inboxSourcesOrder = once $ ioProperty $ do
-  let initial = Exchange.InboxTotals 2 3 0 False
-      flatten (Exchange.InboxTotals forced deposits work parent) = (forced,deposits,work,parent)
-      check mask = do
-        trace <- newIORef []
-        let action step _ _ = modifyIORef' trace (++[step]) >> pure (if step == 7 then 0 else 1)
-        case Exchange.inboxSources mask of
-          Left _ -> pure (counterexample "valid source mask rejected" False)
-          Right sources -> do
-            result <- runExceptT (Exchange.appendInbox (Exchange.InboxRequest action) 0 sources initial)
-            seen <- readIORef trace
-            let forced = testBit mask 0
-                deposit = testBit mask 1
-            pure $ conjoin [fmap flatten result === Right
-              (2+if forced then 1 else 0,3+if deposit then 1 else 0,if forced then 1 else 0,mask /= 0),
-              seen === ([6 | mask /= 0] ++ [step | forced,step <- [7,8]] ++ [9 | deposit])]
-  valid <- mapM check [0..3]
-  pure $ conjoin (valid ++ [Exchange.inboxSources 0 === Right [],
-    Exchange.inboxSources 3 === Right [Exchange.ForcedSource,Exchange.DepositSource],
-    property (isLeft (Exchange.inboxSources 4)), property (isLeft (Exchange.inboxSources maxBound))])
-
-inboxDerivationWorkflow :: Property
-inboxDerivationWorkflow = forAll generator $ \(rows,initialForced,initialDeposits,parentOk,fault) -> ioProperty $ do
-  seen <- newIORef []
-  retained <- newIORef (0 :: Int)
-  let action step tx output = do
-        modifyIORef' seen (++[(step,tx,output)])
-        if step == fault then pure (-1) else case step of
-          1 -> pure (fromIntegral (length (rows !! fromIntegral tx)))
-          2 -> pure (parsed (fst (entry tx output)))
-          3 -> writeIORef retained (fst (entry tx output)-1) >> pure 1
-          4 -> pure (parsed (snd (entry tx output)))
-          6 -> pure (if parentOk then 1 else 0)
-          7 -> fromIntegral <$> readIORef retained
-          _ -> pure 1
-      entry tx output = rows !! fromIntegral tx !! fromIntegral output
-      parsed n = if n < 0 then 0 else if n == 0 then 1 else 2
-      prefix leading (code,trailing) = (code,leading ++ trailing)
-      scan tx index forced deposit history outputs = case outputs of
-        [] -> Right (forced,deposit,history)
-        (f,d):rest ->
-          let readForced = history ++ [(2,tx,index)]
-              readDeposit = readForced ++ [(3,tx,index) | f > 0] ++ [(4,tx,index)]
-              nextForced = if f > 0 then Just (f-1) else forced
-          in if f < 0 then Left (1,readForced)
-             else if f > 0 && forced /= Nothing then Left (2,readForced)
-             else if d < 0 then Left (1,readDeposit)
-             else if d > 0 && deposit then Left (3,readDeposit)
-             else scan tx (index+1) nextForced (deposit || d > 0)
-               (readDeposit ++ [(5,tx,index) | d > 0]) rest
-      visit tx forced deposits work parent
-        | tx == fromIntegral (length rows) = (0,[(10,forced-initialForced,deposits-initialDeposits)])
-        | otherwise = case scan tx 0 Nothing False [(1,tx,0)] (rows !! fromIntegral tx) of
-            Left failed -> failed
-            Right (kind,deposit,trace) -> prefix trace $
-              if kind == Nothing && not deposit then visit (tx+1) forced deposits work parent
-              else if not parent then prefix [(6,tx,0)] $
-                if parentOk then append tx forced deposits work kind deposit else (1,[])
-              else append tx forced deposits work kind deposit
-      append tx forced deposits work kind deposit =
-        let next f w
-              | not deposit = visit (tx+1) f deposits w True
-              | deposits == maxBound = (5,[])
-              | otherwise = prefix [(9,tx,0)] (visit (tx+1) f (deposits+1) w True)
-        in case kind of
-          Nothing -> next forced work
-          Just k
-            | forced == maxBound -> (4,[])
-            | otherwise -> prefix [(7,tx,0)] $
-                let cost = if k == 0 then 1 else if k == 1 then 64 else 0
-                in if k > 2 then (6,[]) else if work+cost > (64 :: Int) then (7,[])
-                   else prefix [(8,tx,0)] (next (forced+1) (work+cost))
-      (normal,normalTrace) = visit 0 initialForced initialDeposits 0 False
-      (faultPrefix,faultSuffix) = break (\(step,_,_) -> step == fault) normalTrace
-      expected = if null faultSuffix then (normal,normalTrace) else (-1,faultPrefix ++ take 1 faultSuffix)
-  result <- execute (Exchange.InboxRequest action) (Exchange.deriveInbox (fromIntegral (length rows)) initialForced initialDeposits)
-  observed <- readIORef seen
-  missing <- elements_hs_exchange_derive_inbox 0 initialForced initialDeposits nullFunPtr nullPtr
-  pure $ conjoin [(result,observed) === expected,missing === (-1)]
-  where
-    generator = (,,,,) <$> resize 6 (listOf (resize 6 (listOf ((,) <$>
-      elements [-1,0,0,0,1,2,3,4 :: Int] <*> elements [-1,0,0,1 :: Int])))) <*>
-      elements [0,64,maxBound-1,maxBound] <*> elements [0,64,maxBound-1,maxBound] <*>
-      arbitrary <*> elements (replicate 10 0 ++ [1..10])
 
 bmmSubmissionWorkflow :: Property
 bmmSubmissionWorkflow = forAll generator $ \(bid,limit,rows,effect) -> ioProperty $ do
@@ -7849,8 +5461,8 @@ policyCallBoundary = once $ ioProperty $ do
 
 productionStages :: Property
 productionStages = forAllBlind (elements
-  [([(13,2),(11,6),(12,6)],[1,2,13,3,4,5,6,11,12,7,8,9,10],
-    [(1,101),(2,102),(13,102),(3,103),(6,106),(11,111),(12,112),(7,107)],
+  [([(13,2)],[1,2,13,3,4,5,6,7,8,9,10],
+    [(1,101),(2,102),(13,102),(3,103),(6,106),(7,107)],
     Bmm.NativeProduction,elements_hs_bmm_native_production),
    ([(19,1),(20,2),(15,3),(16,6),(17,9),(18,10)],[1,19,2,20,3,15,4,5,6,16,7,8,9,17,10,18,11,12,13,14],
     [(1,101),(19,101),(2,102),(20,102),(3,103),(15,115),(4,104),
@@ -7964,83 +5576,6 @@ bmmRewardAdmission = forAll (vectorOf 5 (elements [-1,0,1,2])) $ \facts -> ioPro
                | otherwise = -1
   missing <- elements_hs_bmm_reward_address nullFunPtr nullPtr
   pure (conjoin [actual === expected,observed === [1..fromIntegral (min 5 (passed+1))],missing === -1])
-
-exchangeEnvelopePayload :: Property
-exchangeEnvelopePayload = forAll ((,,,) <$> arbitrary <*> vectorOf 32 arbitrary <*>
-  resize 512 (listOf arbitrary) <*> elements [-1,0,1 :: Int]) $ \(height,checkpointBytes,body,delta) -> ioProperty $ do
-    let size = length body
-        capacity = size+45
-        expected = [69,67,88,77,1] ++ little height ++ checkpointBytes ++ little (fromIntegral size) ++ body
-        little :: Word32 -> [Word8]
-        little value = [fromIntegral (value `shiftR` shift) | shift <- [0,8,16,24]] :: [Word8]
-        valid = size /= 0 && delta == 0
-        sentinel = replicate (capacity+2) 0xa5
-    withArray checkpointBytes $ \checkpoint -> withArray body $ \input -> withArray sentinel $ \output -> do
-      code <- elements_hs_exchange_envelope_payload height checkpoint (fromIntegral size) input
-        (fromIntegral (capacity+delta)) output
-      observed <- peekArray (capacity+2) output
-      let direct = validate (Exchange.EnvelopePayload height (B.pack checkpointBytes) (B.pack body))
-      pure $ conjoin [code === (if size==0 then 1 else if valid then 0 else -1),
-        observed === (if valid then expected ++ [0xa5,0xa5] else sentinel),
-        direct === (if size==0 then Nothing else Just (B.pack expected))]
-
-exchangeEnvelopePayloadBounds :: Property
-exchangeEnvelopePayloadBounds = once $ ioProperty $ withArray (replicate 64 0xa5) $ \output -> do
-  codes <- mapM (\size -> elements_hs_exchange_envelope_payload 0 nullPtr size nullPtr 0 output)
-    [0,100001,maxBound]
-  missing <- elements_hs_exchange_envelope_payload 0 nullPtr 1 nullPtr 46 output
-  absent <- elements_hs_exchange_envelope_payload 0 output 1 output 46 nullPtr
-  observed <- peekArray 64 output
-  pure $ conjoin [codes === [1,1,1],missing === -1,absent === -1,observed === replicate 64 0xa5,
-    validate (Exchange.EnvelopePayload 0 B.empty (B.singleton 0)) === Nothing,
-    validate (Exchange.EnvelopePayload 0 (B.replicate 32 0) (B.replicate 100001 0)) === Nothing]
-
-exchangeEnvelopeScan :: Property
-exchangeEnvelopeScan = forAll generator $ \(inactive,exists,coinbase,rows,flags,checks,fault) -> ioProperty $ do
-  let yes b = if b then 1 else 0
-      prefix steps (code,rest) = (code,steps++rest)
-      checked [] = (0,[])
-      checked ((step,ok,code):rest) = prefix [(step,yes ok)] (if ok then checked rest else (code,[]))
-      finish found = prefix [(4,0),(14,flags)] $
-        case [0,3,0,3,0,0,0,3,1,4,2,4,1,1,2,4] !! (fromIntegral flags + if found then 8 else 0) of
-          0 -> (0,[])
-          4 -> checked (zipWith3 (,,) [15..17] checks [3,3,8])
-          code -> (code+4,[])
-      scan found [] = finish found
-      scan found (row:rest) = prefix ((4,1):scriptReads) $
-        if passed < 5 then prefix [(13,1)] (scan found rest)
-        else if found then (2,[])
-        else prefix [(10,yes (row !! 5))] $
-          if not (row !! 5) then (3,[]) else prefix [(11,yes (row !! 6))] $
-            if not (row !! 6) then (4,[]) else prefix [(12,1),(13,1)] (scan True rest)
-        where passed = length (takeWhile id (take 5 row))
-              scriptReads = zip [5..] (map yes (take (min 5 (passed+1)) row))
-      (wanted,script) = prefix [(0,yes inactive)] $
-        if inactive then (0,[]) else prefix [(1,yes exists)] $
-          if not exists then (1,[]) else prefix [(2,yes coinbase)] $
-            if not coinbase then (1,[]) else prefix [(3,1)] (scan False rows)
-      failed = fault >= 0 && fault < length script
-      expectedSteps = map fst (if failed then take (fault+1) script else script)
-      run invoke = do
-        seen <- newIORef []
-        code <- invoke (\step -> do
-          previous <- readIORef seen
-          modifyIORef' seen (++[step])
-          let index = length previous
-          if index == fault || index >= length script || fst (script !! index) /= step
-            then pure (-1) else pure (snd (script !! index)))
-        observed <- readIORef seen
-        pure (code,observed)
-  direct <- run (validate . Exchange.EnvelopeScan)
-  abi <- run (\action -> bracket (wrapPolicyEffect (\_ -> action)) freeHaskellFunPtr $ \callback ->
-    elements_hs_exchange_envelope_scan callback nullPtr)
-  missing <- elements_hs_exchange_envelope_scan nullFunPtr nullPtr
-  let expected = (if failed then -1 else wanted,expectedSteps)
-  pure $ conjoin [direct === expected,abi === expected,missing === -1]
-  where
-    good = frequency [(3,pure True),(1,pure False)]
-    generator = (,,,,,,) <$> arbitrary <*> good <*> good <*> resize 6 (listOf (vectorOf 7 good))
-      <*> choose (0,7) <*> vectorOf 3 good <*> choose (-1,60 :: Int)
 
 depositStateWorkflowParity :: Property
 depositStateWorkflowParity = forAll ((,,) <$> elements [0,11,19,27 :: Word32] <*>
@@ -8182,78 +5717,12 @@ wholeM4Voting = forAll generator $ \(flags,votes,vote,active,upvote,missing) -> 
     generator = (,,,,,) <$> elements [0,1,3,5,9,13,16] <*> resize 8 (listOf (elements [0,1,49,50,51,65534,65535 :: Word16]))
       <*> elements [0,1,7,65534,65535 :: Word16] <*> arbitrary <*> arbitrary <*> arbitrary
 
-wholeEnvelopeValidation :: Property
-wholeEnvelopeValidation = forAll ((,,) <$> choose (0,18 :: Int) <*> arbitrary <*> arbitrary) $ \(failure,duplicate,inactive) -> ioProperty $ do
-  seen <- newIORef []
-  let commitment = B.replicate 32 8
-      anchor = B.replicate 32 9
-      out locking = wordLE 8 0 <> B.singleton (fromIntegral (B.length locking)) <> locking
-      body = wordLE 4 2 <> B.pack [0,4] <> B.concat (map out [B.empty,B.pack [106,32] <> commitment,B.empty,B.pack [106,37,80,88,83,84,1] <> anchor]) <> wordLE 4 0
-      payload = C.pack "ECXM" <> B.singleton 1 <> wordLE 4 42 <> B.replicate 32 7 <> wordLE 4 (fromIntegral (B.length body)) <> body
-      context = B.replicate 32 1 <> B.replicate 32 2 <> B.replicate 32 3
-      expectedAnchor = anchor <> B.pack [1,24] <> B.take 32 context <> wordBE 4 42 <> B.take 32 (B.drop 32 context) <> commitment <> B.drop 64 context
-      script = if inactive then [] else [0,1,2] ++ if duplicate then [1] else [3..13]
-      callback step index frame = do
-        modifyIORef' seen (++[step])
-        if fromIntegral step == failure then ioError (userError "injected native failure") else case step of
-          0 -> pure (wordLE 8 (if duplicate then 2 else 1))
-          1 -> pure (if index == 0 then payload else B.take 5 payload)
-          2 -> if frame == payload then pure (B.singleton 1) else ioError (userError "canonical payload changed")
-          3 -> pure (B.singleton 3)
-          12 -> pure context
-          13 -> if frame == expectedAnchor then pure (B.singleton 1) else ioError (userError "anchor changed")
-          _ | step >= 4 && step <= 11 && frame == payload -> pure (B.singleton 1)
-          _ -> ioError (userError "unexpected envelope stage")
-      failed = fromIntegral failure `elem` script
-      expectedTrace = if failed then takeWhile (/= fromIntegral failure) script ++ [fromIntegral failure] else script
-  result <- try (validate (Exchange.EnvelopeWorkflow inactive callback)) :: IO (Either SomeException Int32)
-  trace <- readIORef seen
-  pure $ conjoin [trace === expectedTrace, case result of
-    Left _ -> property failed
-    Right code -> conjoin [property (not failed),code === if duplicate && not inactive then 2 else 0]]
-
-exchangeSnapshotOrder :: Property
-exchangeSnapshotOrder = forAll ((,) <$> choose (0,14 :: Int) <*> arbitrary) $ \(passed,throws) -> ioProperty $ do
-  trace <- newIORef []
-  direct <- try (validate (Exchange.SnapshotContext (\step -> do
-    modifyIORef' trace (++[step])
-    if step == passed && throws then ioError (userError "snapshot read") else pure (step < passed))))
-      :: IO (Either SomeException Int)
-  seen <- readIORef trace
-  abiTrace <- newIORef []
-  bracket (wrapPolicyEffect (\_ step -> do
-    modifyIORef' abiTrace (++[fromIntegral step :: Int])
-    pure (if fromIntegral step < passed then 1 else 0))) freeHaskellFunPtr $ \callback -> do
-      actual <- elements_hs_exchange_snapshot callback nullPtr
-      observed <- readIORef abiTrace
-      missing <- elements_hs_exchange_snapshot nullFunPtr nullPtr
-      let expected | passed == 14 = 0
-                   | passed < 4 = 1
-                   | passed < 7 || passed == 13 = 2
-                   | otherwise = 3
-          stages = [0..min 13 passed]
-      pure $ conjoin [actual === fromIntegral expected,seen === stages,observed === stages,
-        missing === -1,case direct of
-          Left _ -> property (throws && passed < 14)
-          Right code -> conjoin [property (not throws || passed == 14),code === expected]]
-
 credentialRecordOrder :: Property
 credentialRecordOrder = forAll ((,,) <$> arbitrary <*> arbitrary <*> choose (-1,3 :: Int)) $ \(readOk,valid,fault) -> ioProperty $ do
   let script = [(1,if readOk then 1 else 0)] ++ if not readOk then [] else
         [(2,if valid then 1 else 0)] ++ [(3,1) | not valid]
   commandTrace 273 3 (\phase reply -> validate (Bmm.CredentialRecordFlow phase reply))
     script fault (if readOk && valid then 1 else 0)
-
-legacyMarkerOrder :: Property
-legacyMarkerOrder = forAll ((,) <$> arbitrary <*> choose (-1,6 :: Int)) $
-  \((marked,frame,envelope,payload),fault) -> ioProperty $ do
-    let bit flag = if flag then 1 else 0
-        prefix steps (rest,status) = (steps ++ rest,status)
-        (script,outcome) = prefix [(1,bit marked)] $ if not marked then ([],1) else
-          prefix [(2,bit frame)] $ if not frame then ([(3,0)],0) else
-            prefix [(4,bit envelope)] $ if not envelope then ([],0) else
-              prefix [(5,bit payload)] (if payload then ([(6,1)],1) else ([],0))
-    commandTrace 289 6 (\phase reply -> validate (Exchange.LegacyMarkerFlow phase reply)) script fault outcome
 
 startupParentOrder :: ParentReplay.StartupParentStage -> Property
 startupParentOrder stage = forAll ((,) <$> arbitrary <*> choose (-1,8 :: Int)) $
@@ -8294,7 +5763,6 @@ blockValidationOrder stage = forAll ((,) <$> arbitrary <*> choose (-1,9 :: Int))
           ParentReplay.CandidateSelfCheck -> (320,9)
           ParentReplay.BranchChoice -> (321,3)
           ParentReplay.StartupReconcile -> (322,6)
-          ParentReplay.ExchangeParent -> (323,6)
           ParentReplay.FinalBmm -> (324,8)
           ParentReplay.BmmFailure -> (325,5)
         (script,outcome) = case stage of
@@ -8313,10 +5781,6 @@ blockValidationOrder stage = forAll ((,) <$> arbitrary <*> choose (-1,9 :: Int))
           ParentReplay.StartupReconcile -> prefix [fact 1 a] $ if not a then ([(2,0)],0) else
             prefix [(3,1),fact 4 b] $ if not b then ([],0) else
               prefix [fact 5 c] $ if c then ([(6,0)],0) else ([],1)
-          ParentReplay.ExchangeParent -> prefix [fact 1 a] $ if not a then ([],0) else
-            prefix ([fact 2 b] ++ [fact 3 c | not b]) $ if not b && not c then ([],0) else
-              prefix [fact 4 d] $ if not d then ([],0) else
-                prefix [fact 5 e] ([(6,1) | e],0)
           ParentReplay.FinalBmm -> prefix [fact 1 a] $ if not a then ([],1) else
             prefix [fact 2 b] $ if not b then ([],1) else
               prefix [fact 3 c] $ if not c then ([(4,0)],0) else
@@ -8325,17 +5789,6 @@ blockValidationOrder stage = forAll ((,) <$> arbitrary <*> choose (-1,9 :: Int))
           ParentReplay.BmmFailure -> prefix [fact 1 a] $ if a then ([(2,0)],0) else
             ([fact 3 b,(if b then 4 else 5,0)],0)
     commandTrace kind limit (\phase reply -> validate (ParentReplay.BlockValidationFlow stage phase reply)) script fault outcome
-
-markerAuthenticationOrder :: Property
-markerAuthenticationOrder = forAll ((,) <$> arbitrary <*> choose (-1,6 :: Int)) $
-  \((context,required,key,signature),fault) -> ioProperty $ do
-    let bit flag = if flag then 1 else 0
-        prefix steps (rest,status) = (steps ++ rest,status)
-        (script,outcome) = prefix [(1,bit context)] $ if not context then ([(2,0)],0) else
-          prefix [(3,bit required)] $ if not required then ([],1) else
-            prefix [(4,bit key)] $ if not key then ([(6,0)],0) else
-              prefix [(5,bit signature)] (if signature then ([],1) else ([(6,0)],0))
-    commandTrace 290 6 (\phase reply -> validate (Exchange.MarkerAuthenticationFlow phase reply)) script fault outcome
 
 connectionStateOrder :: Property
 connectionStateOrder = forAll ((,) <$> arbitrary <*> choose (-1,12 :: Int)) $
@@ -8480,16 +5933,6 @@ blockDepositPreflightOrder = forAll ((,,) <$> arbitrary <*>
     commandTrace 282 19 (\phase reply -> validate (Deposit.BlockPreflightFlow phase reply))
       script fault outcome
 
-parentContextOrder :: Property
-parentContextOrder = forAll ((,,,) <$> arbitrary <*> arbitrary <*> arbitrary <*> choose (-1,7 :: Int)) $
-  \(elementsMode,native,available,fault) -> ioProperty $ do
-    let bit flag = if flag then 1 else 0
-        script = [(1,bit elementsMode)] ++ if not elementsMode then [(2,1)] else
-          [(3,bit native),(if native then 4 else 5,bit available),
-           (if available then 6 else 7,1)]
-    commandTrace 281 7 (\phase reply -> validate (Exchange.ParentContextFlow phase reply))
-      script fault 1
-
 explicitVoteOrder :: Property
 explicitVoteOrder = forAll ((,,) <$> arbitrary <*> choose (0,3) <*> choose (-1,5 :: Int)) $
   \(abstain,result,fault) -> ioProperty $ do
@@ -8535,22 +5978,6 @@ mempoolWitnessOrder = forAll ((,) <$> listOf arbitrary <*> choose (-1,80 :: Int)
     commandTrace 277 14 (\phase reply -> validate (Deposit.MempoolWitnessFlow phase reply))
       (scan inputs) fault 1
 
-capitalConnectionOrder :: Property
-capitalConnectionOrder = forAll ((,,) <$> arbitrary <*> listOf ((,) <$> arbitrary <*> arbitrary) <*>
-  choose (-1,40 :: Int)) $ \((enabled,active,parent,derived,checkOnly),transactions,fault) -> ioProperty $ do
-    let bit flag = if flag then 1 else 0
-        scan [] = [(5,0)]
-        scan ((hasInput,matches):rest) = [(5,1),(6,bit hasInput)] ++
-          (if hasInput then [(7,bit matches)] ++ [(8,1) | matches] else []) ++ [(9,1)] ++ scan rest
-        script = [(1,bit enabled)] ++ if not enabled then [] else
-          [(2,bit active)] ++ if not active then [] else
-          [(3,bit parent)] ++ if not parent then [(4,0)] else
-          scan transactions ++ [(10,bit derived)] ++ if not derived then [(11,0)] else
-          [(12,bit checkOnly)] ++ [(13,1) | not checkOnly]
-        success = not (enabled && active) || (parent && derived)
-    commandTrace 276 13 (\phase reply -> validate (Exchange.CapitalConnectionFlow phase reply))
-      script fault (bit success)
-
 peerBlockDispatchOrder :: Property
 peerBlockDispatchOrder = forAll ((,,) <$> elements [0,1,2,3,maxBound] <*> arbitrary <*> choose (-1,3 :: Int)) $
   \(outcome,present,fault) -> ioProperty $ do
@@ -8560,11 +5987,6 @@ peerBlockDispatchOrder = forAll ((,,) <$> elements [0,1,2,3,maxBound] <*> arbitr
           _ -> []
         invalid phase = if phase==1 then [] else [2,maxBound]
     commandTraceWith invalid 275 4 (\phase reply -> validate (Bmm.PeerBlockDispatchFlow phase reply)) script fault 1
-
-annexAccountingOrder :: Property
-annexAccountingOrder = forAll ((,) <$> arbitrary <*> choose (-1,2 :: Int)) $ \(enabled,fault) -> ioProperty $ do
-  commandTrace 274 2 (\phase reply -> validate (Bmm.AnnexAccountingFlow phase reply))
-    ([(1,if enabled then 1 else 0)] ++ [(2,1) | enabled]) fault 1
 
 credentialFileOrder :: Property
 credentialFileOrder = forAll ((,,,) <$> vectorOf 9 arbitrary <*> elements [0,1,2] <*>
@@ -8960,16 +6382,6 @@ withdrawalRpcVerify = forAll (vectorOf 9 arbitrary) $ \outcomes -> ioProperty $ 
   returnedErrors <- mapM (\phase -> elements_hs_parent_replay_store_checked 182 phase 1) [2,4,6,8,10,15,18]
   pure (conjoin [actual === model stages,malformed === replicate 18 (-1),
     failedEffects === replicate 2 (-1),returnedErrors === replicate 7 (-1)])
-
-withdrawalProofOrder :: Property
-withdrawalProofOrder = forAll ((,) <$> arbitrary <*> choose (-1,5 :: Int)) $
-  \((count,built,root,diagnostic),fault) -> ioProperty $
-    let flag value = if value then 1 else 0
-        script = [(1,flag count)] ++ if not count then [(2,1)] else
-          [(3,flag built)] ++ [(4,flag root) | built] ++
-          if built && root then [] else [(5,flag diagnostic),(if diagnostic then 6 else 7,1)]
-    in commandTrace 295 7 (\phase reply -> validate (Usdd.RpcProofFlow phase reply))
-      script fault (if count && built && root then 1 else -1)
 
 anchorOrdering :: Property
 anchorOrdering = forAll arbitrary $ \(different,heightLess,hashLess) ->
@@ -10532,949 +7944,7 @@ selectionParity = forAll gen $ \(phase,responses) -> ioProperty $
       result <- elements [responses,changed]
       pure (phase,result)
 
-usddAnnexPrefix :: [Word8]
-usddAnnexPrefix = [80,85,83,68,68,83,80,49,0,1,1,3,1,0,0,0,0,0,32,0,0,0,1] ++ replicate 64 1
-
-usddAnnexAbi :: Property
-usddAnnexAbi = forAll ((,) <$> edge [0,4,5,54,55,87,88,89,maxBound] <*> edge [0,54,87,88,maxBound]) $ \(size,limit) -> ioProperty $
-  withArray [1,1,1] $ \profile -> withArray usddAnnexPrefix $ \input -> do
-    actual <- elements_hs_usdd_annex size limit profile input
-    missingProfile <- elements_hs_usdd_annex size limit nullPtr input
-    missingInput <- elements_hs_usdd_annex size limit profile nullPtr
-    let expected | size < 5 = 1
-                 | size > limit = 2
-                 | size < 55 = 3
-                 | size /= 88 = 15
-                 | otherwise = 0
-    pure (conjoin [actual === expected, missingProfile === -1,
-      missingInput === if size == 0 then 1 else -1])
-
-usddProofGate :: Property
-usddProofGate = forAll ((,,) <$> edge [0..6] <*> arbitrary <*> arbitrary) $ \(identity,bmm,active) ->
-  let actual = validate (Usdd.ProofGate identity bmm active)
-      expected
-        | identity > 5 = -1
-        | identity /= 0 = fromIntegral identity + 1
-        | not bmm = 7
-        | not active = 8
-        | otherwise = 9
-  in actual === expected
-
-usddAdmissionAbi :: Property
-usddAdmissionAbi = forAll ((,,) <$> edge [0,1,2,3] <*> edge [0,1,2] <*> edge [0,1,2]) $ \(lane,bmm,active) -> ioProperty $
-  withArray [1,1,1] $ \profile -> withArray usddAnnexPrefix $ \input -> do
-    actual <- elements_hs_usdd_admission lane 88 88 profile input bmm active nullFunPtr nullPtr
-    pure $ actual === if lane /= 2 || bmm > 1 || active > 1 then -1
-      else if bmm == 0 then 7 else if active == 0 then 8 else 9
-
-usddStrongFacts :: Property
-usddStrongFacts = forAll ((,,) <$> oneof [elements [-1..16], arbitrary] <*> arbitrary <*> arbitrary) $ \(facts,bmm,active) -> ioProperty $ do
-  let annexPrefix = B.pack usddAnnexPrefix
-      expected | facts < 0 || facts > 15 = -1
-               | odd facts = 5
-               | odd (facts `div` 2) = 2
-               | odd (facts `div` 4) = 3
-               | odd (facts `div` 8) = 4
-               | not bmm = 7
-               | not active = 8
-               | otherwise = 9
-  actual <- validate (Usdd.Admission 1 (Usdd.Annex 88 88 [1,1,1] annexPrefix) bmm active (pure facts))
-  retired <- validate (Usdd.Admission 0 (Usdd.Annex 88 88 [1,1,1] annexPrefix) bmm active
-    (error "retired lane invoked identity callback"))
-  pure (conjoin [actual === expected, retired === -1])
-
-
-usddJournalOrder :: Property
-usddJournalOrder = forAll ((,,,) <$> elements [790,791,891,892,13115,13116] <*> arbitrary
-  <*> choose (0,12 :: Int) <*> vectorOf 32 arbitrary) $ \(size,heartbeat,fault,domain) -> ioProperty $ do
-  calls <- newIORef (0 :: Int)
-  let guest = B.replicate 32 3
-      digest = B.replicate 32 7
-      payload = B.pack ([0,2,82,if heartbeat then 4 else 1] ++ domain ++ replicate (size-36) 5)
-      valid = C.pack "USDDJNL1" <> B.pack [0,2,1] <> C.pack "SUCCESS!" <> B.singleton 1 <>
-        guest <> digest <> wordBE 4 (fromIntegral size) <> payload
-      mutate offset = B.take offset valid <> B.singleton (B.index valid offset `xor` 1) <> B.drop (offset+1) valid
-      offsets = [0,0,0,8,10,11,19,20,84,52,88,90]
-      input | fault == 1 = B.take 123 valid
-            | fault >= 2 && fault <= 11 = mutate (offsets !! fault)
-            | otherwise = valid
-      expected | fault /= 0 = Left ([0,1,2,3,4,5,6,7,8,9,3,10,7] !! fault)
-               | if heartbeat then size == 790 else size >= 892 && size <= 13115 = Right (B.pack domain)
-               | otherwise = Left 11
-  actual <- validate (Usdd.Journal 1 1 input (if fault == 12 then B.take 31 guest else guest)
-    (\body -> if body /= B.drop 88 input then error "wrong journal hash input"
-      else modifyIORef' calls (+1) >> pure digest))
-  count <- readIORef calls
-  pure (conjoin [actual === expected, count === if fault == 0 || fault >= 9 && fault <= 11 then 1 else 0])
-
-usddLegacyWorkflow :: Property
-usddLegacyWorkflow = forAll ((,,,,,,) <$> arbitrary <*> arbitrary <*> arbitrary
-  <*> elements [0,1,2,3,maxBound] <*> elements [0,31,32,33] <*> elements [0,2,9] <*> arbitrary) $
-  \(controllerOK,guestOK,journalOK,version,width,domainByte,zeroJournal) -> ioProperty $ do
-    calls <- newIORef (0 :: Int)
-    let controller = B.replicate 32 1
-        guest = B.replicate 32 3
-        digest = B.replicate 32 7
-        journalDomain = B.replicate 32 (if zeroJournal then 0 else 2)
-        domain = B.replicate width domainByte
-        payload = B.pack [0,2,82,4] <> journalDomain <> B.replicate 754 5
-        journal = C.pack "USDDJNL1" <> B.pack [0,2,1] <> C.pack "SUCCESS!" <> B.singleton 1 <>
-          guest <> digest <> wordBE 4 790 <> payload
-        expected | not controllerOK = 1
-                 | not guestOK = 2
-                 | not journalOK = 3
-                 | width /= 32 = 4
-                 | version == 1 = if domainByte == 0 then 4 else if domain == journalDomain then 0 else 5
-                 | version == 2 = if domainByte /= 0 then 4 else if zeroJournal then 5 else 0
-                 | otherwise = 4
-    actual <- validate (Usdd.LegacyRequest version 1 1
-      (if controllerOK then controller else B.empty) controller
-      (if guestOK then guest else B.empty) guest (if journalOK then journal else B.empty) domain
-      (\body -> if body /= payload then error "wrong legacy workflow hash input"
-        else modifyIORef' calls (+1) >> pure digest))
-    count <- readIORef calls
-    pure (conjoin [actual === expected, count === if controllerOK && guestOK && journalOK then 1 else 0])
-
-usddAccumulatorVersion :: Property
-usddAccumulatorVersion = once $ ioProperty $ do
-  results <- sequence [do
-    actual <- elements_hs_usdd_accumulator_version version
-    let expected | version>255 = -1
-                 | version==1 = 1
-                 | otherwise = 0
-    pure $ counterexample (show version) $ conjoin
-      [actual===expected,validate (Usdd.AccumulatorVersion version)===expected]
-    | version <- [0..256] ++ [maxBound]]
-  pure $ conjoin results
-
-usddAccumulator :: Property
-usddAccumulator = forAll ((,,,,) <$> edge [0,1,2,3,7,8,maxBound-1,maxBound] <*> elements [0,1,2]
-  <*> vectorOf 64 arbitrary <*> arbitrary <*> arbitrary) $ \(count,mode,values,clean,corrupt) -> ioProperty $ do
-    calls <- newIORef (0 :: Int)
-    let nodes = [B.replicate 32 (if clean && not (testBit count n) then 0 else value) | (n,value) <- zip [0..] values]
-        empties = [B.replicate 32 (fromIntegral n) | n <- [0..64 :: Int]]
-        leaf = B.replicate 32 117
-        branch a b = B.pack (B.zipWith (\x y -> 3*x+y) a b)
-        root n ns = foldl (\node depth -> if testBit n depth then branch (ns !! depth) node
-          else branch node (empties !! depth)) (head empties) [0..63]
-        originalRoot = root count nodes
-        suppliedRoot = if corrupt then B.map (`xor` 1) originalRoot else originalRoot
-        wire = suppliedRoot <> B.concat nodes
-        level = length (takeWhile (testBit count) [0..63])
-        carried = foldl (\node n -> branch (nodes !! n) node) leaf [0..level-1]
-        next = replicate level (B.replicate 32 0) ++ [carried] ++ drop (level+1) nodes
-        canonical = and [testBit count n || B.all (==0) node | (n,node) <- zip [0..] nodes]
-        expected | mode == 2 && count == maxBound = Nothing
-                 | mode == 1 && (not canonical || corrupt) = Nothing
-                 | mode == 2 = Just (count+1,root (count+1) next <> B.concat next)
-                 | otherwise = Just (count,originalRoot <> B.concat nodes)
-        digestAdapter preimage = if B.length preimage /= 65 || B.head preimage /= 1 then error "invalid accumulator preimage"
-          else modifyIORef' calls (+1) >> pure (branch (B.take 32 (B.drop 1 preimage)) (B.drop 33 preimage))
-    actual <- validate (Usdd.Accumulator mode count 1 wire (B.concat empties) leaf digestAdapter)
-    n <- readIORef calls
-    pure (conjoin [actual === expected,
-      n === if mode == 2 && count == maxBound || mode == 1 && not canonical then 0 else 64 + if mode == 2 then level else 0])
-
-usddAccumulatorBatch :: Property
-usddAccumulatorBatch = forAll ((,) <$> elements [0,1,7,maxBound-1,maxBound :: Word64]
-  <*> resize 4 (listOf arbitrary)) $ \(count,values) -> ioProperty $ do
-    let initial = B.replicate 2080 0
-        empty = B.replicate 2080 0
-        leaves = map (B.replicate 32) values
-        digest preimage = pure (B.take 32 (B.drop 1 preimage))
-        sequential cursor current [] = pure (True,cursor,current)
-        sequential cursor current (leaf:rest) = do
-          result <- validate (Usdd.Accumulator 2 cursor 1 current empty leaf digest)
-          case result of
-            Nothing -> pure (False,cursor,current)
-            Just (_,next) -> sequential (cursor+1) next rest
-    expected <- sequential count initial leaves
-    actual <- validate (Usdd.AccumulatorBatch count 1 initial empty (B.concat leaves) digest)
-    pure (actual === expected)
-
-usddCheckpoint :: Property
-usddCheckpoint = forAll ((,,) <$> choose (0,7 :: Int) <*> arbitrary <*> arbitrary) $ \(fault,version,slot) -> ioProperty $ do
-    calls <- newIORef []
-    let root = B.replicate 32 1
-        clean = root <> B.replicate 2048 0
-        before = case fault of
-          2 -> B.replicate 32 2 <> B.drop 32 clean
-          3 -> B.take 32 clean <> B.singleton 1 <> B.drop 33 clean
-          _ -> clean
-        after = if fault == 4 then B.replicate 32 2 <> B.drop 32 clean else clean
-        beforeCount = if fault == 5 then 1 else 0
-        afterCount = if fault == 6 then 1 else 0
-        genesis = B.replicate 32 (if fault == 1 then 0 else 7)
-        block = B.replicate 32 9
-        domain = B.pack [65,66,67]
-        profile = wordBE 4 version <> genesis <> block <> B.singleton slot <> domain
-        preimage = domain <> wordBE 4 version <> genesis <> B.singleton slot <> block <>
-          wordBE 8 beforeCount <> root <> wordBE 8 afterCount <> root
-        digest input = modifyIORef' calls (input:) >> pure
-          (if fault == 7 && B.length input /= 65 then B.replicate 32 0 else root)
-        expected = case fault of
-          0 -> Right root
-          1 -> Left 1
-          7 -> Left 3
-          _ -> Left 2
-        expectedCalls = case fault of
-          1 -> 0
-          3 -> 0
-          2 -> 64
-          0 -> 129
-          7 -> 129
-          _ -> 128
-    actual <- validate (Usdd.Checkpoint beforeCount afterCount 1 before after (B.replicate 2080 0) profile digest)
-    observed <- reverse <$> readIORef calls
-    pure (conjoin [actual === expected, length observed === expectedCalls,
-      if fault == 0 || fault == 7 then last observed === preimage else property True])
-
-usddClaimHashesAbi :: Property
-usddClaimHashesAbi = forAll (choose (0,2 :: Word32)) $ \mode -> forAll (choose (0,2 :: Int)) $ \failAt ->
-  forAll (vectorOf 69 (choose (0,254))) $ \rawConfig -> forAll (vectorOf 168 arbitrary) $ \payload -> ioProperty $ do
-    let config = [if (i==5 && mode/=1 && failAt==0) ||
-                       (i==0 && ((mode==1 && failAt==0) || (mode==2 && failAt==1))) then 255 else byte |
-                  (i,byte) <- zip [0 :: Int ..] rawConfig]
-        fingerprint = take 32
-        burn = take 32 (drop 5 config) ++ take 32 payload ++ take 36 (drop 96 payload)
-        leaf identifier = take 1 config ++ drop 37 config ++ take 4 (drop 1 config) ++
-                          take 96 payload ++ identifier ++ drop 132 payload
-        preimages = case mode of
-          0 -> [burn]
-          1 -> [leaf (take 32 (drop 96 payload))]
-          _ -> [burn,leaf (fingerprint burn)]
-        fails = failAt < length preimages
-        expected = concatMap fingerprint preimages
-    withArray config $ \profile -> withArray payload $ \input -> withArray (replicate 66 0xa5) $ \output -> do
-      calls <- newIORef []
-      pureResult <- try (validate (Usdd.ClaimHashes mode (B.pack config) (B.pack payload) (\value -> do
-        seen <- readIORef calls
-        modifyIORef' calls (++ [B.unpack value])
-        pure (if length seen==failAt then B.empty else B.take 32 value)))) :: IO (Either SomeException B.ByteString)
-      code <- elements_hs_usdd_claim_hashes mode 0 168 profile input (output `plusPtr` 1) referenceHasher
-      actual <- peekArray 66 output
-      invalid <- sequence [elements_hs_usdd_claim_hashes m 0 168 p i o h |
-        (m,p,i,o,h) <- [(3,profile,input,output,referenceHasher),(mode,nullPtr,input,output,referenceHasher),
-          (mode,profile,nullPtr,output,referenceHasher),(mode,profile,input,nullPtr,referenceHasher),(mode,profile,input,output,nullFunPtr)]]
-      preserved <- peekArray 66 output
-      seen <- readIORef calls
-      pure $ conjoin [code === (if fails then -1 else 0), invalid === replicate 5 (-1),
-        seen === take (failAt+1) preimages, preserved === actual,
-        either (const (property fails)) (\digest -> conjoin [property (not fails), B.unpack digest === expected]) pureResult,
-        actual === (if fails then replicate 66 0xa5 else [0xa5] ++ expected ++ replicate (65-length expected) 0xa5)]
-
-usddDerivePublication :: Property
-usddDerivePublication = forAll arbitrary $ \bad -> forAll arbitrary $ \zero ->
-  forAll arbitrary $ \missing -> forAll arbitrary $ \hashFailure -> ioProperty $ do
-    events <- newIORef []
-    critical <- newIORef (B.replicate 32 9)
-    let state = B.singleton (if bad then 1 else 0) <> B.replicate 2079 0
-        metadata = B.concat [B.singleton 0,B.replicate 4 0,B.replicate 32 (if missing then 0 else 1),
-          B.replicate 32 2,B.pack [24,3]]
-        effect action _ _ _ payload = do
-          modifyIORef' events (++ [action])
-          case action of
-            0 -> pure (0,B.empty)
-            5 -> pure (0,B.empty)
-            6 -> writeIORef critical (B.replicate 32 0) >> pure (fromIntegral (B.length metadata),metadata)
-            7 -> writeIORef critical payload >> pure (0,B.empty)
-            _ -> error "unexpected derive action"
-        checkpointHasher payload | B.length payload==150 = if hashFailure then error "checkpoint hash failed" else pure (B.replicate 32 1)
-                                 | otherwise = pure (B.replicate 32 0)
-        early = bad || zero
-        throws = not early && not missing && hashFailure
-        expectedCode | bad = 4
-                     | zero = 1
-                     | missing = 6
-                     | otherwise = 0
-    result <- try (validate (Usdd.DeriveBlock (Usdd.ApplyBlock 0 1 state (B.replicate 2080 0)
-      (Usdd.ExtractBlock zero (B.replicate 69 1) effect checkpointHasher)))) :: IO (Either SomeException Int)
-    observed <- readIORef events
-    digest <- readIORef critical
-    pure $ conjoin [observed === (if early then [7] else [0,5,5,6] ++ if missing || throws then [] else [7]),
-      digest === B.replicate 32 (if not early && not missing && not throws then 1 else 0),
-      either (const (property throws)) (\code -> conjoin [property (not throws),code===expectedCode]) result]
-
-usddApplyPublication :: Property
-usddApplyPublication = forAll (choose (0,4 :: Int)) $ \n ->
-  forAll arbitrary $ \nearFull -> forAll arbitrary $ \bad -> forAll arbitrary $ \zero -> ioProperty $ do
-    states <- newIORef []
-    claimCount <- newIORef (0 :: Int)
-    let first = if nearFull then maxBound-1 else 0
-        before = (if bad then B.singleton 1 else B.singleton 0) <> B.replicate 2079 0
-        input cursor = B.concat [wordLE 8 first,wordLE 8 cursor,wordLE 8 10,wordLE 8 10,wordLE 8 100,
-          B.pack [1,0,0,0,85,83,68,68,65,106,65,85,83,68,68,1],B.replicate 32 3,
-          B.replicate 20 4,wordBE 8 1,B.replicate 100 5]
-        effect action _ _ cursor payload = case action of
-          0 -> pure (1,B.empty)
-          1 -> pure (fromIntegral n+1,B.empty)
-          2 -> pure (67,B.pack [15,106])
-          3 -> modifyIORef' claimCount (+1) >> pure (0,B.empty)
-          4 -> pure (1,input cursor)
-          5 -> modifyIORef' states (++ [(cursor,payload)]) >> pure (0,B.empty)
-          _ -> error "unexpected apply action"
-        expectedCode | bad = 4
-                     | zero = 1
-                     | nearFull && n>2 = 3
-                     | nearFull && n>1 = 5
-                     | otherwise = 0
-        finished = expectedCode==0 || expectedCode==5
-        expectedCount = first + fromIntegral (if nearFull then min 1 n else n)
-    result <- validate (Usdd.ApplyBlock first 1 before (B.replicate 2080 0)
-      (Usdd.ExtractBlock zero (B.replicate 69 1) effect (\_ -> pure (B.replicate 32 0))))
-    observed <- readIORef states
-    extracted <- readIORef claimCount
-    pure $ conjoin [result === expectedCode,
-      extracted === (if bad || zero then 0 else if nearFull then min 2 n else n),
-      observed === (if finished then [(first,before),(expectedCount,B.replicate 2080 0)] else [])]
-
-usddBlockEligibility :: Property
-usddBlockEligibility = forAll (choose (0,31 :: Word8)) $ \flags ->
-  forAll (elements [0,66,67,68 :: Int64]) $ \size -> forAll (elements [0,106,255]) $ \opcode -> ioProperty $ do
-    candidateReads <- newIORef (0 :: Int)
-    let effect action _ _ _ _ = case action of
-          0 -> pure (1,B.empty)
-          1 -> pure (2,B.empty)
-          2 -> pure (size,B.pack [flags,opcode])
-          4 -> modifyIORef' candidateReads (+1) >> pure (-1,B.empty)
-          _ -> error "unexpected eligibility effect"
-        eligible = size==67 && flags==15 && opcode==106
-    result <- try (validate (Usdd.ExtractBlock False (B.replicate 69 0) effect
-      (\_ -> error "eligibility called hash"))) :: IO (Either SomeException Int)
-    count <- readIORef candidateReads
-    pure $ conjoin [count === (if eligible then 1 else 0),
-      either (const (property eligible)) (\code -> conjoin [property (not eligible),code===0]) result]
-
-usddBlockTraversal :: Property
-usddBlockTraversal = forAll (listOf (choose (0,2 :: Int))) $ \kinds ->
-  forAll (choose (0,length kinds+1)) $ \nullAt -> forAll arbitrary $ \zero -> ioProperty $ do
-    trace <- newIORef []
-    published <- newIORef []
-    let valid count = B.concat [wordLE 8 7,wordLE 8 count,wordLE 8 10,wordLE 8 10,wordLE 8 100,
-          B.pack [1,0,0,0,85,83,68,68,65,106,65,85,83,68,68,1],
-          B.replicate 32 3,B.replicate 20 4,wordBE 8 1,B.replicate 100 5]
-        callback action tx out count payload = do
-          modifyIORef' trace (++ [(action,tx,out,count)])
-          case action of
-            0 -> pure (fromIntegral (length kinds),B.empty)
-            1 -> pure (if fromIntegral tx==nullAt then 0 else 2,B.empty)
-            2 -> pure (if kinds !! fromIntegral tx==0 then 0 else 67,B.pack [15,106])
-            4 -> pure (1,
-                       if kinds !! fromIntegral tx==1 then B.take 51 (valid count) <> B.singleton 0 <> B.drop 52 (valid count) else valid count)
-            3 -> modifyIORef' published (++ [payload]) >> pure (0,B.empty)
-            _ -> error "unknown extraction action"
-        expected _ _ [] = []
-        expected tx count (kind:rest)
-          | tx==nullAt = [(1,fromIntegral tx,0,count)]
-          | otherwise = [(1,fromIntegral tx,0,count),(2,fromIntegral tx,0,count)] ++
-              (if kind/=0 then [(4,fromIntegral tx,0,count)] else []) ++
-              (if kind==2 then [(3,fromIntegral tx,0,count)] else []) ++
-              expected (tx+1) (if kind==2 then count+1 else count) rest
-        accepted = length (filter (==2) (take nullAt kinds))
-    code <- validate (Usdd.ExtractBlock zero (B.replicate 69 1) callback (pure . B.take 32))
-    observed <- readIORef trace
-    claims <- readIORef published
-    pure $ conjoin [code === (if zero then 1 else if nullAt<length kinds then 2 else 0),
-      observed === (if zero then [] else (0,0,0,0):expected 0 0 kinds),
-      length claims === (if zero then 0 else accepted), property (all ((==124) . B.length) claims)]
-
-usddExtractClaimAbi :: Property
-usddExtractClaimAbi = forAll (choose (1,100000 :: Word64)) $ \amount ->
-  forAll (choose (0,6 :: Int)) $ \fault -> ioProperty $ do
-    let le = B.unpack . wordLE 8
-        be = B.unpack . wordBE 8
-        first = if fault==1 then maxBound else 7
-        vault = replicate 32 (if fault==2 then 0 else 3)
-        recipient = replicate 20 4
-        script = [106,65,85,83,68,68,1] ++ vault ++ recipient ++ be amount
-        request = le first ++ le 1 ++ le (if fault==3 then 1 else amount*10) ++ le 10 ++ le 100000 ++
-          [1,0,0,0,85,83,68,68,65] ++ script
-        payload = request ++ replicate 32 5 ++ replicate 32 6 ++ replicate 32 7 ++ [0,0,0,9]
-        config = (if fault==6 then 255 else 1) : replicate 4 0 ++
-          (if fault==5 then 255 else 2) : replicate 63 0
-        extractionBytes = if fault==4 then take 51 payload ++ [0] ++ drop 52 payload else payload
-        expectedCode | fault==1 = 2
-                     | fault `elem` [2,3,4] = 1
-                     | fault>=5 = -1
-                     | otherwise = 0
-        callsExpected | expectedCode>0 = 0
-                      | fault==5 = 1
-                      | otherwise = 2
-        expected = le amount ++ vault ++ recipient ++ take 32 (drop 5 config) ++ [head config] ++ replicate 31 0
-    calls <- newIORef (0 :: Int)
-    direct <- try (validate (Usdd.ExtractClaim (B.pack config) (B.pack extractionBytes) (\value -> do
-      modifyIORef' calls (+1)
-      pure (if B.head value==255 then B.empty else B.take 32 value)))) :: IO (Either SomeException (Either Int B.ByteString))
-    seen <- readIORef calls
-    withArray config $ \profile -> withArray extractionBytes $ \input -> withArray (replicate 126 0xa5) $ \output -> do
-      code <- elements_hs_usdd_claim_hashes 4 0 216 profile input (output `plusPtr` 1) referenceHasher
-      actual <- peekArray 126 output
-      pure $ conjoin [code === expectedCode, seen === callsExpected,
-        actual === (if expectedCode==0 then [0xa5] ++ expected ++ [0xa5] else replicate 126 0xa5),
-        case direct of
-          Left _ -> property (expectedCode == -1)
-          Right (Left rejection) -> fromIntegral rejection === expectedCode
-          Right (Right result) -> conjoin [expectedCode === 0, B.unpack result === expected]]
-
-usddClaimPrefixAbi :: Property
-usddClaimPrefixAbi = forAll (choose (0,8 :: Int)) $ \count ->
-  forAll ((,,) <$> choose (0,count+1) <*> choose (0,count+1) <*> choose (0,3 :: Int)) $ \(index,bad,fault) -> ioProperty $ do
-    let config = (if fault==3 then 255 else 1) : replicate 68 0
-        leafResult = 1 : replicate 31 0
-        claim i = replicate 132 (fromIntegral (i+1)) ++
-          B.unpack (wordBE 8 (fromIntegral (index + if fault==1 && i==bad then i+1 else i))) ++ replicate 28 (fromIntegral (i+1))
-        record i = claim i ++ (if fault==2 && i==bad then 2 : replicate 31 0 else leafResult)
-        inputBytes = concatMap record [0..count-1]
-        expected | count==0 = 0
-                 | fault==3 = -1
-                 | (fault==1 || fault==2) && bad<count = 2
-                 | otherwise = 0
-        expectedCalls | fault==3 = min 1 count
-                      | fault==1 && bad<count = bad
-                      | fault==2 && bad<count = bad+1
-                      | otherwise = count
-        capacity = max 1 (count*32)
-    calls <- newIORef (0 :: Int)
-    direct <- try (validate (Usdd.ClaimPrefix (fromIntegral index) (B.pack config) (B.pack inputBytes) (\value -> do
-      modifyIORef' calls (+1)
-      pure (if fault==3 then B.empty else B.take 32 value)))) :: IO (Either SomeException (Either Int B.ByteString))
-    observed <- readIORef calls
-    overflow <- validate (Usdd.ClaimPrefix maxBound (B.pack config) (B.replicate 400 0)
-      (\_ -> error "overflowed claim range invoked hashing"))
-    withArray config $ \profile -> withArray inputBytes $ \input -> withArray (replicate (capacity+2) 0xa5) $ \output -> do
-      code <- elements_hs_usdd_claim_hashes 3 (fromIntegral index) (fromIntegral (length inputBytes)) profile input (output `plusPtr` 1) referenceHasher
-      actual <- peekArray (capacity+2) output
-      invalid <- elements_hs_usdd_claim_hashes 3 0 maxBound profile input output referenceHasher
-      preserved <- peekArray (capacity+2) output
-      pure $ conjoin [fromIntegral code === expected, observed === expectedCalls, invalid === -1, preserved === actual, overflow === Left 2,
-        actual === (if expected==0 then [0xa5] ++ concat (replicate count leafResult) ++ replicate (capacity+1-count*32) 0xa5 else replicate (capacity+2) 0xa5),
-        case direct of
-          Left _ -> expected === -1
-          Right (Left rejection) -> rejection === expected
-          Right (Right leaves) -> conjoin [expected === 0, B.unpack leaves === concat (replicate count leafResult)]]
-
-usddCheckpointAbi :: Property
-usddCheckpointAbi = ioProperty $ withArray (replicate 2080 (0 :: Word8)) $ \state ->
-  withArray (replicate 69 0) $ \profile -> withArray (replicate 32 165) $ \output -> do
-    rejected <- elements_hs_usdd_checkpoint 0 0 1 state state state profile 69 output referenceHasher
-    badPrefix <- elements_hs_usdd_checkpoint 0 0 256 state state state profile 69 output referenceHasher
-    short <- elements_hs_usdd_checkpoint 0 0 1 state state state profile 68 output referenceHasher
-    missing <- elements_hs_usdd_checkpoint 0 0 1 nullPtr state state profile 69 output referenceHasher
-    noHash <- elements_hs_usdd_checkpoint 0 0 1 state state state profile 69 output nullFunPtr
-    noOutput <- elements_hs_usdd_checkpoint 0 0 1 state state state profile 69 nullPtr referenceHasher
-    result <- peekArray 32 output
-    pure (conjoin [rejected === 1, badPrefix === -1, short === -1, missing === -1,
-      noHash === -1, noOutput === -1, result === replicate 32 165])
-
-usddEmptyRoots :: Property
-usddEmptyRoots = forAll ((,) <$> arbitrary <*> arbitrary) $ \(leafPrefix,nodePrefix) -> ioProperty $ do
-    calls <- newIORef []
-    let digest input = B.replicate 32 (B.foldl' (+) 0 input)
-        leaf = digest (B.singleton leafPrefix)
-        next node = digest (B.singleton nodePrefix <> node <> node)
-        roots = take 65 (iterate next leaf)
-        preimages = B.singleton leafPrefix : [B.singleton nodePrefix <> node <> node | node <- take 64 roots]
-    actual <- validate (Usdd.EmptyRoots leafPrefix nodePrefix (\input ->
-      modifyIORef' calls (input:) >> pure (digest input)))
-    observed <- reverse <$> readIORef calls
-    pure (conjoin [actual === B.concat roots, observed === preimages])
-
-usddAccumulatorAbi :: Property
-usddAccumulatorAbi = ioProperty $ withArray (replicate 2080 (165 :: Word8)) $ \state ->
-  withArray (replicate 2080 0) $ \empty -> withArray (replicate 32 0) $ \leaf -> do
-    overflow <- elements_hs_usdd_accumulator 2 maxBound 1 state empty leaf 1 referenceHasher
-    unsane <- elements_hs_usdd_accumulator 1 0 1 state empty leaf 1 referenceHasher
-    badMode <- elements_hs_usdd_accumulator 6 0 1 state empty leaf 1 referenceHasher
-    badEmptyPrefix <- elements_hs_usdd_accumulator 5 256 1 state empty leaf 0 referenceHasher
-    badEmptyLeaves <- elements_hs_usdd_accumulator 5 0 1 state empty leaf 1 referenceHasher
-    badPrefix <- elements_hs_usdd_accumulator 0 0 256 state empty leaf 1 referenceHasher
-    missing <- elements_hs_usdd_accumulator 0 0 1 nullPtr empty leaf 1 referenceHasher
-    noHash <- elements_hs_usdd_accumulator 0 0 1 state empty leaf 1 nullFunPtr
-    noLeaves <- elements_hs_usdd_accumulator 3 0 1 state empty leaf 0 referenceHasher
-    badIndex <- elements_hs_usdd_accumulator 3 1 1 state empty leaf 1 referenceHasher
-    tooLarge <- elements_hs_usdd_accumulator 3 0 1 state empty leaf maxBound referenceHasher
-    result <- peekArray 2080 state
-    pure (conjoin [overflow === 1, unsane === 1, badMode === -1, badPrefix === -1,
-      missing === -1, noHash === -1, noLeaves === 1, badIndex === 1, tooLarge === -1,
-      badEmptyPrefix === -1, badEmptyLeaves === -1, result === replicate 2080 165])
-
 foreign import ccall "&reference_accumulator_hash" accumulatorHasher :: FunPtr HashTransaction
-
-usddAccumulatorCountAbi :: Property
-usddAccumulatorCountAbi = once $ ioProperty $ do
-  checks <- sequence [withArray (replicate 2080 (165 :: Word8)) $ \state ->
-    withArray (replicate 2080 165) $ \legacy -> withArray (replicate 2080 0) $ \empty ->
-    withArray (replicate 64 51) $ \leaves -> withArray [123456 :: Word64] $ \cursor -> do
-      actual <- elements_hs_usdd_accumulator_count mode count 1 state empty leaves size accumulatorHasher cursor
-      old <- elements_hs_usdd_accumulator mode count 1 legacy empty leaves size accumulatorHasher
-      output <- peek cursor
-      stateResult <- peekArray 2080 state
-      oldBytes <- peekArray 2080 legacy
-      let complete = size <= maxBound-count
-          (status,next) = case mode of
-            0 -> (0,count)
-            1 -> (1,123456)
-            2 -> if count==maxBound then (1,123456) else (0,count+1)
-            3 -> if count>=size then (1,123456) else (0,count)
-            4 -> (if complete then 0 else 1,count + min size (maxBound-count))
-            _ -> if count>255 then (-1,123456) else (0,count)
-      pure $ counterexample (show (mode,count,size)) $
-        conjoin [actual===status,old===status,output===next,stateResult===oldBytes]
-    | (mode,count,size) <- [(m,c,1) | m <- [0,2], c <- [0,1,maxBound-1,maxBound]] ++
-        [(1,0,1),(3,0,1),(3,1,1),(3,0,0)] ++
-        [(4,c,n) | c <- [0,maxBound-1,maxBound], n <- [0,1,2]] ++ [(5,0,0),(5,255,0),(5,256,0)]]
-  missing <- withArray (replicate 2080 (165 :: Word8)) $ \state ->
-    withArray (replicate 2080 0) $ \empty -> withArray (replicate 32 0) $ \leaf -> do
-      result <- elements_hs_usdd_accumulator_count 0 0 1 state empty leaf 1 accumulatorHasher nullPtr
-      stateResult <- peekArray 2080 state
-      pure $ conjoin [result===(-1),stateResult===replicate 2080 165]
-  pure $ conjoin (missing:checks)
-
-usddInclusion :: Property
-usddInclusion = forAll (listOf1 arbitrary) $ \values -> forAll (choose (0,length values+1)) $ \index -> ioProperty $ do
-  calls <- newIORef (0 :: Int)
-  let nodes = map (B.replicate 32) values
-      empties = [B.replicate 32 (fromIntegral n) | n <- [0..64 :: Int]]
-      combine a b = B.pack (B.zipWith (\x y -> 3*x+y) a b)
-      step ns depth = [combine (ns !! offset) (if offset+1 < length ns then ns !! (offset+1) else empties !! depth)
-        | offset <- [0,2..length ns-1]]
-      layers = scanl step nodes [0..63]
-      siblings = [let sibling = (index `shiftR` depth) `xor` 1
-                      ns = layers !! depth
-                  in if sibling < length ns then ns !! sibling else empties !! depth | depth <- [0..63]]
-      expected = if index >= length nodes then Nothing else Just (head (last layers) <> B.concat siblings)
-      digestAdapter preimage = if B.length preimage /= 65 || B.head preimage /= 1 then error "bad proof hash input"
-        else modifyIORef' calls (+1) >> pure (combine (B.take 32 (B.drop 1 preimage)) (B.drop 33 preimage))
-      expectedCalls = if index >= length nodes then 0 else 64 + sum [length ns `div` 2 + length ns `mod` 2 | ns <- take 64 layers]
-  actual <- validate (Usdd.InclusionProof (fromIntegral index) 1 (B.concat empties) (B.concat nodes) digestAdapter)
-  n <- readIORef calls
-  pure (conjoin [actual === expected, n === expectedCalls])
-
-usddResource :: Property
-usddResource = forAll ((,,,,,,,) <$> elements [0,1,2,4,5,6] <*> elements [0,31,32,33]
-  <*> elements [0,32,33,34,65,4129,4130] <*> elements [0,190,191] <*> arbitrary
-  <*> elements [-1..6] <*> arbitrary <*> arbitrary) $
-  \(count,cmr,control,leaf,parameterized,result,strong,oversized) -> ioProperty $ do
-    calls <- newIORef (0 :: Int)
-    let prefix = B.pack ([80,85,83,68,68,83,80,49,0,1,1,if strong then 3 else 1,1,0,0,0,0,0,32,0,0,0,1] ++ replicate 64 1)
-        shapeOK = count == 5 && cmr == 32 && control `elem` [33,65,4129] && leaf `elem` [190,191]
-        eligible = count >= 2 && not oversized && (not parameterized || strong) && shapeOK && not parameterized
-        expected | count < 2 = 0
-                 | oversized = 7
-                 | parameterized && not strong = 5
-                 | not shapeOK = 9
-                 | parameterized = 1
-                 | result < 0 || result > 5 = -1
-                 | result == 0 = 1
-                 | otherwise = 1 + 2 ^ (result + 3)
-    actual <- validate (Usdd.Resource (Usdd.Annex 88 (if oversized then 87 else 88) [1,1,1] prefix)
-      count cmr control leaf parameterized (modifyIORef' calls (+1) >> pure result))
-    n <- readIORef calls
-    pure (conjoin [actual === expected, n === if eligible then 1 else 0])
-
--- Use the native hash double: unsafe callbacks must not reenter Haskell.
-usddLegacyHashBoundary :: Property
-usddLegacyHashBoundary = conjoin [check fault | fault <- [0..5 :: Int]]
-  where
-    check fault = counterexample ("legacy hash fault " ++ show fault) $ ioProperty $ do
-      let controller = B.replicate 32 1
-          guest = B.replicate 32 3
-          domain = B.replicate 32 2
-          payload = B.pack [if fault `elem` [1,3,4,5] then 255 else 0,2,82,4] <>
-            domain <> B.replicate 754 5
-          digest = if fault==2 then B.replicate 32 7 else B.take 32 payload
-          journal = C.pack (if fault==5 then "BAD!JNL1" else "USDDJNL1") <>
-            B.pack [0,2,1] <> C.pack "SUCCESS!" <> B.singleton 1 <>
-            guest <> digest <> wordBE 4 790 <> payload
-          fields = [controller,if fault==3 then B.replicate 32 9 else controller,
-            guest,if fault==4 then B.replicate 32 9 else guest,journal,domain,B.empty]
-          expected = [0,-1,3,1,2,3] !! fault
-      withMany B.useAsCString fields $ \pointers ->
-        withArray (map castPtr pointers) $ \inputs ->
-        withArray (map (fromIntegral . B.length) fields) $ \sizes ->
-        withArray [1,1,1,1,1] $ \profile ->
-        withArray [0,0,0,0] $ \shape -> do
-          result <- elements_hs_usdd_legacy 0 inputs sizes profile 100 0 0 shape referenceHasher
-          pure (result === expected)
-
-usddRawBoundary :: Property
-usddRawBoundary = forAll ((,,) <$> edge [0,1,2,3] <*> edge [0,1,2] <*> edge [0,1,2]) $ \(mode,bmm,active) -> ioProperty $
-  withArray [0 :: Word8] $ \byte -> withArray (replicate 7 byte) $ \pointers ->
-  withArray (replicate 7 0) $ \sizes -> withArray [1,1,1,1,1] $ \profile -> withArray [0,0,0,0] $ \shape -> do
-    actual <- elements_hs_usdd_legacy mode pointers sizes profile 100 bmm active shape referenceHasher
-    nullInput <- elements_hs_usdd_legacy 0 nullPtr sizes profile 100 0 0 shape referenceHasher
-    nullHash <- elements_hs_usdd_legacy 0 pointers sizes profile 100 0 0 shape nullFunPtr
-    nullShape <- elements_hs_usdd_legacy 2 pointers sizes profile 100 0 0 nullPtr referenceHasher
-    pokeElemOff sizes 0 maxBound
-    oversized <- elements_hs_usdd_legacy 0 pointers sizes profile 100 0 0 shape referenceHasher
-    pokeElemOff sizes 0 1
-    pokeElemOff pointers 0 nullPtr
-    missing <- elements_hs_usdd_legacy 0 pointers sizes profile 100 0 0 shape referenceHasher
-    pure (conjoin [actual === if mode > 2 || bmm > 1 || active > 1 then -1 else if mode == 0 then 3 else 0,
-      nullInput === -1, nullHash === -1, nullShape === -1, oversized === -1, missing === -1])
-
-ethereumClaimExtraction :: Property
-ethereumClaimExtraction = forAll generator $ \(first,count,amount,unitScale,explicit,fault,emptyVault,emptyRecipient) ->
-  let limit = 20000000000000
-      vault = B.replicate 32 (if emptyVault then 0 else 17)
-      recipient = B.replicate 20 (if emptyRecipient then 0 else 23)
-      header = case fault :: Int of
-        1 -> [105,65,85,83,68,68,1]
-        2 -> [106,64,85,83,68,68,1]
-        3 -> [106,65,86,83,68,68,1]
-        4 -> [106,65,85,83,68,68,2]
-        _ -> [106,65,85,83,68,68,1]
-      script = B.pack header <> vault <> recipient <> wordBE 8 amount
-      request = mconcat (map (wordLE 8) [first,count,fromIntegral explicit,unitScale,limit]) <>
-        wordLE 4 1 <> B.pack [85,83,68,68,65] <> script
-      productValue = toInteger amount * toInteger unitScale
-      expected
-        | fault /= 0 || explicit <= 0 || amount == 0 || amount > limit ||
-          productValue > toInteger (maxBound :: Word64) || productValue /= toInteger explicit = Right B.empty
-        | toInteger first + toInteger count > toInteger (maxBound :: Word64) = Left "USDD withdrawal claim index overflow"
-        | emptyVault || emptyRecipient = Right B.empty
-        | otherwise = Right (wordLE 8 amount <> vault <> recipient)
-  in withdrawal 12 0 request === expected
-  where
-    generator = do
-      first <- elements [0,1,maxBound-1,maxBound :: Word64]
-      count <- elements [0,1,2,maxBound :: Word64]
-      amount <- elements [0,1,2,20000000000000,20000000000001,maxBound :: Word64]
-      unitScale <- elements [1,100,maxBound :: Word64]
-      explicit <- frequency [(3,pure (fromIntegral (amount * unitScale) :: Int64)),(1,arbitrary)]
-      fault <- frequency [(4,pure 0),(1,choose (1,4 :: Int))]
-      emptyVault <- frequency [(4,pure False),(1,pure True)]
-      emptyRecipient <- frequency [(4,pure False),(1,pure True)]
-      pure (first,count,amount,unitScale,explicit,fault,emptyVault,emptyRecipient)
-
-foreign import ccall "wrapper" wrapUsddWitness :: ReadUsddWitness -> IO (FunPtr ReadUsddWitness)
-
-usddPolicyResources :: Property
-usddPolicyResources = forAll ((,,) <$> frequency [(4,pure 0),(4,choose (0,511)),(1,elements [-1,512 :: Int32])]
-  <*> choose (0,8) <*> (arbitrary :: Gen Word32)) $ \(flags,count,mask) -> ioProperty $ do
-    let run composed = do
-          observed <- newIORef []
-          let prefetch = modifyIORef' observed (++[(7,0)]) >> pure (flags,0)
-              action step index = modifyIORef' observed (++[(step,index)]) >>
-                pure (if testBit mask (fromIntegral step) then 1 else 0)
-          result <- if composed then validate (Usdd.PolicyResources count prefetch action)
-            else do
-              (resource,_) <- prefetch
-              code <- if resource<0 || resource>511 then pure (-1)
-                else validate (Usdd.PolicyWithActivation (fromIntegral resource) count action)
-              pure (code,0)
-          trace <- readIORef observed
-          pure (result,trace)
-    legacy <- run False
-    composed <- run True
-    pure (composed===legacy)
-
-usddResourceAdmission :: Property
-usddResourceAdmission = forAll generator $ \(package,flags,initial,lane,limit,rows) -> ioProperty $ do
-  let run composed = do
-        observed <- newIORef []
-        cached <- newIORef (maxBound :: Word64)
-        let classifyRow index = do
-              modifyIORef' observed (++[(9,index)])
-              let (resource,used,_,_) = rows !! fromIntegral index
-              writeIORef cached (fromIntegral resource)
-              pure (resource,used)
-            action step index
-              | step==(if package then 3 else 0) = snd <$> classifyRow index
-              | step==(if package then 4 else 1) = readIORef cached
-              | otherwise = do
-                  modifyIORef' observed (++[(step,index)])
-                  let (_,_,mask,weight) = rows !! fromIntegral index
-                  pure $ if step==5 then 1 else if not package then weight
-                    else if testBit mask (fromIntegral step) then 1 else 0
-            count = fromIntegral (length rows)
-        result <- if composed then validate (Usdd.ResourceAdmission package flags count initial lane limit classifyRow action)
-          else if package then validate (Usdd.PackageResources flags count initial lane action)
-          else validate (Usdd.BlockResources count lane limit action)
-        trace <- readIORef observed
-        pure (result,trace)
-  legacy <- run False
-  composed <- run True
-  pure (composed===legacy)
-  where
-    generator = (,,,,,) <$> arbitrary <*> choose (0,8) <*> edge [0,1,maxBound]
-      <*> edge [0,1,2,maxBound] <*> edge [0,1,100,maxBound]
-      <*> listOf ((,,,) <$> frequency [(8,choose (0,511)),(1,elements [-1,512 :: Int32])]
-        <*> edge [0,1,maxBound] <*> (choose (0,7) :: Gen Word32) <*> edge [0,1,100,maxBound])
-
-usddResourceBoundary :: Property
-usddResourceBoundary = once $ ioProperty $
-  withArray (replicate 7 nullPtr) $ \pointers -> withArray (replicate 7 0) $ \sizes ->
-  withArray [1,1,1,1,1] $ \profile -> withArray [0,0,0,0] $ \shape -> alloca $ \published -> do
-    seen <- newIORef []
-    let run count reader input hasher = do
-          poke published 99
-          writeIORef seen []
-          code <- elements_hs_usdd_resources count input sizes profile 100 shape published hasher reader nullPtr
-          used <- peek published
-          trace <- readIORef seen
-          pure (code,used,trace)
-    failures <- mapM (\status -> bracket (wrapUsddWitness (\_ index -> do
-      modifyIORef' seen (++[index])
-      pure (if index==1 then status else 1))) freeHaskellFunPtr $ \reader ->
-        run 3 reader pointers referenceHasher) [-1,0,2]
-    bracket (wrapUsddWitness (\_ index -> modifyIORef' seen (++[index]) >> pure 1)) freeHaskellFunPtr $ \reader -> do
-      valid <- run 3 reader pointers referenceHasher
-      empty <- run 0 reader pointers referenceHasher
-      missing <- sequence [run 1 nullFunPtr pointers referenceHasher, run 1 reader nullPtr referenceHasher,
-        run 1 reader pointers nullFunPtr]
-      pokeElemOff sizes 0 maxBound
-      oversized <- run 1 reader pointers referenceHasher
-      pokeElemOff sizes 0 1
-      nullField <- run 1 reader pointers referenceHasher
-      long <- validate (Usdd.ResourceScan 100000 (\_ -> pure 511))
-      pure (conjoin [failures===replicate 3 (-1,99,[0,1]), valid===(0,0,[0,1,2]), empty===(0,0,[]),
-        missing===replicate 3 (-1,99,[]), oversized===(-1,99,[0]), nullField===(-1,99,[0]), long===(511,100000)])
-
-usddResourceScan :: Property
-usddResourceScan = forAll (listOf (frequency [(8,choose (0,511)),(1,elements [-1,512,maxBound :: Int])])) $ \rows -> ioProperty $ do
-  observed <- newIORef []
-  result <- validate (Usdd.ResourceScan (fromIntegral (length rows)) (\index -> do
-    modifyIORef' observed (++[index])
-    pure (rows !! fromIntegral index)))
-  seen <- readIORef observed
-  let good = takeWhile (\flags -> flags>=0 && flags<=511) rows
-      complete = length good==length rows
-      wanted = if complete then (fromIntegral (foldr (.|.) 0 rows),fromIntegral (length (filter odd rows))) else (-1,0)
-      readCount = length good + if complete then 0 else 1
-  pure (result===wanted .&&. seen===map fromIntegral [0..readCount-1])
-
-usddPolicyComposition :: Property
-usddPolicyComposition = forAll generator $ \(flags,rows) -> ioProperty $ do
-  let run expanded = do
-        trace <- newIORef []
-        published <- newIORef (99 :: Word64)
-        let facts :: Word32 -> Word64 -> IO Word64
-            facts step index = do
-              modifyIORef' trace (++[(step,index)])
-              let (eligible,mask,enabled,reserved,weight) = rows !! fromIntegral index
-              if step>=17 && step<=30 then pure (if testBit mask (fromIntegral step-17) then 1 else 0)
-              else case step of
-                0 -> pure (if eligible then 1 else 0)
-                2 -> pure (if enabled then 1 else 0)
-                3 -> pure (if reserved then 1 else 0)
-                4 -> writeIORef published weight >> pure 1
-                _ -> error "unexpected composed policy read"
-            old step index = if step/=1 then facts step index else scan 17
-              where scan phase | phase==31 = pure 1
-                               | otherwise = facts phase index >>= \reply -> if reply==0 then pure 0 else scan (phase+1)
-        code <- if expanded then validate (Usdd.PolicyWithActivation flags (fromIntegral (length rows)) facts)
-          else validate (Usdd.PolicyWeight flags (fromIntegral (length rows)) old)
-        observed <- readIORef trace
-        weight <- readIORef published
-        pure (code,observed,weight)
-  legacy <- run False
-  composed <- run True
-  pure (composed===legacy)
-  where
-    generator = do
-      flags <- frequency [(3,pure 0),(1,choose (0,511))]
-      n <- choose (0,8)
-      rows <- vectorOf n ((,,,,) <$> arbitrary <*> (choose (0,16383) :: Gen Word32) <*> arbitrary <*> arbitrary <*> arbitrary)
-      pure (flags,rows)
-
-usddPolicyWeight :: Property
-usddPolicyWeight = forAll generator $ \(flags,rows) -> ioProperty $ do
-  trace <- newIORef []
-  published <- newIORef (99 :: Word64)
-  let early | testBit flags 1 || testBit flags 2 = 1
-            | testBit flags 3 = 2
-            | testBit flags 4 = 3
-            | testBit flags 5 = 4
-            | testBit flags 6 = 5
-            | testBit flags 7 = 6
-            | testBit flags 8 = 7
-            | otherwise = 0
-      oracle _ [] _ weight seen = (0,weight,seen)
-      oracle index ((eligible,activation,enabled,reserved,weight):rest) found previous seen =
-        let eligibleReads = seen++[(0,index)]
-            activationReads = eligibleReads++[(1,index)]
-            enabledReads = activationReads++[(2,index)]
-            reservedReads = enabledReads++[(3,index)]
-        in if not eligible then oracle (index+1) rest found previous eligibleReads
-           else if activation then oracle (index+1) rest found previous activationReads
-           else if not enabled then (1,previous,enabledReads)
-           else if not reserved then (1,previous,reservedReads)
-           else if found then (8,previous,reservedReads)
-           else oracle (index+1) rest True weight (reservedReads++[(4,index)])
-      action step index = do
-        modifyIORef' trace (++[(step,index)])
-        let (eligible,activation,enabled,reserved,weight) = rows !! fromIntegral index
-        case step of
-          0 -> pure (if eligible then 1 else 0)
-          1 -> pure (if activation then 1 else 0)
-          2 -> pure (if enabled then 1 else 0)
-          3 -> pure (if reserved then 1 else 0)
-          4 -> writeIORef published weight >> pure 1
-          _ -> error "unexpected policy callback"
-      (code,expectedWeight,expected) = if early/=0 then (early,99,[]) else oracle 0 rows False 99 []
-  result <- validate (Usdd.PolicyWeight flags (fromIntegral (length rows)) action)
-  observed <- readIORef trace
-  weight <- readIORef published
-  pure $ conjoin [result===code,observed===expected,weight===expectedWeight]
-  where
-    generator = do
-      flags <- frequency [(3,pure 0),(1,choose (0,511))]
-      n <- choose (0,8)
-      rows <- vectorOf n ((,,,,) <$> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary <*> arbitrary)
-      pure (flags,rows)
-
-usddPackageResources :: Property
-usddPackageResources = forAll generator $ \(config,rows,initial,lane) -> ioProperty $ do
-  trace <- newIORef []
-  let oracle _ [] accumulated seen = (0,fromInteger accumulated,seen)
-      oracle index ((pegin,final,scripts,amount,resource):rest) accumulated seen =
-        let peginReads = seen ++ [(0,index) | not (testBit config 0)]
-            finalReads = peginReads ++ [(1,index)]
-            scriptReads = finalReads ++ [(2,index) | testBit config 1]
-            resourceReads = scriptReads ++ [(step,index) | testBit config 2, step <- [3,4]]
-            next = accumulated + if testBit config 2 then toInteger amount else 0
-        in if not (testBit config 0) && pegin then (1,0,peginReads)
-           else if not final then (1,0,finalReads)
-           else if testBit config 1 && not scripts then (1,0,scriptReads)
-           else if testBit config 2 && (resource>1 || next>toInteger lane) then (1,0,resourceReads)
-           else oracle (index+1) rest next (resourceReads++[(5,index)])
-      action step index = do
-        modifyIORef' trace (++[(step,index)])
-        let (pegin,final,scripts,amount,resource) = rows !! fromIntegral index
-        pure $ case step of
-          0 -> if pegin then 1 else 0
-          1 -> if final then 1 else 0
-          2 -> if scripts then 1 else 0
-          3 -> amount
-          4 -> resource
-          5 -> 1
-          _ -> error "unexpected package callback"
-      (code,finalCount,expected) = oracle 0 rows (toInteger initial) []
-  result <- validate (Usdd.PackageResources config (fromIntegral (length rows)) initial lane action)
-  observed <- readIORef trace
-  pure $ conjoin [result===(code,finalCount),observed===expected]
-  where
-    number = frequency [(4,choose (0,3)),(1,elements [maxBound,maxBound-1])]
-    generator = do
-      config <- choose (0,7)
-      n <- choose (0,8)
-      rows <- vectorOf n ((,,,,) <$> arbitrary <*> arbitrary <*> arbitrary <*> number <*>
-        frequency [(3,pure 0),(1,choose (0,511))])
-      (,,,) config rows <$> number <*> number
-
-usddBlockResources :: Property
-usddBlockResources = forAll generator $ \(rows,lane,limit) -> ioProperty $ do
-  trace <- newIORef []
-  let oracle [] accumulated seen = (0,fromInteger accumulated,seen)
-      oracle ((additional,flags,weight):rest) accumulated seen =
-        let structural = if testBit flags 1 then 1 else if testBit flags 2 then 2 else if testBit flags 3 then 3 else 0
-            identity = if testBit flags 4 then 6 else if testBit flags 5 then 7 else if testBit flags 6 then 8 else if testBit flags 7 then 9 else if testBit flags 8 then 10 else 0
-            visited = seen ++ [0,1] ++ [2 | structural==0 && additional/=0]
-            next = accumulated + toInteger additional
-            rejection | structural/=0 = structural
-                 | additional/=0 && weight>limit = 4
-                 | next>toInteger lane = 5
-                 | otherwise = identity
-        in if rejection/=0 then (rejection,0,visited) else oracle rest next visited
-      action step index = do
-        modifyIORef' trace (++[step])
-        let (additional,flags,weight) = rows !! fromIntegral index
-        pure $ case step of
-          0 -> additional
-          1 -> flags
-          2 -> weight
-          _ -> error "unexpected resource callback"
-      (code,finalCount,expected) = oracle rows 0 []
-  result <- validate (Usdd.BlockResources (fromIntegral (length rows)) lane limit action)
-  observed <- readIORef trace
-  pure $ conjoin [result===(code,finalCount),observed===expected]
-  where
-    number = frequency [(4,choose (0,3)),(1,elements [maxBound,maxBound-1])]
-    generator = do
-      n <- choose (0,8)
-      rows <- vectorOf n ((,,) <$> number <*> frequency [(3,pure 0),(1,choose (0,511))] <*> number)
-      (,,) rows <$> number <*> number
-
-sourcePackage :: Property
-sourcePackage = forAll generator $ \(enabled,rows,selected,budget) -> ioProperty $ do
-  trace <- newIORef []
-  let scan [] accumulated seen = admit accumulated seen
-      scan ((ok,f,d):rest) accumulated seen
-        | not ok = (1,0,seen++[0])
-        | summed>toInteger (maxBound :: Word64) = (1,0,seen++[0,1,2])
-        | otherwise = scan rest summed (seen++[0,1,2])
-        where summed=accumulated+toInteger f+toInteger d
-      admit accumulated seen
-        | toInteger selected+accumulated>toInteger budget = (1,0,seen++[3,4])
-        | otherwise = (0,fromInteger (toInteger selected+accumulated),seen++[3,4]++concat (replicate (length rows) [5,6]))
-      (code,next,expected) = if enabled then scan rows 0 [] else admit 0 []
-      action step index = do
-        modifyIORef' trace (++[step])
-        let (ok,f,d)=rows !! fromIntegral index
-        pure $ case step of
-          0 -> if ok then 1 else 0
-          1 -> f
-          2 -> d
-          3 -> selected
-          4 -> budget
-          _ -> 1
-  result <- validate (Exchange.SourcePackage enabled (fromIntegral (length rows)) action)
-  observed <- readIORef trace
-  pure $ conjoin [result===(code,next),observed===expected]
-  where
-    number = frequency [(3,choose (0,10)),(1,elements [maxBound,maxBound-1])]
-    generator = do
-      enabled <- arbitrary
-      n <- choose (0,8)
-      rows <- vectorOf n ((,,) <$> arbitrary <*> number <*> number)
-      selected <- number
-      budget <- number
-      pure (enabled,rows,selected,budget)
-
-sourceSelection :: Property
-sourceSelection = forAll ((,,,) <$> arbitrary <*> arbitrary <*> arbitrary <*>
-  frequency [(1,pure [1,1,1,1,10,1,1,1,1]),(2,vectorOf 9 (elements [0,1,2,maxBound :: Word64]))]) $
-  \(enabled,modified,empty,fields) -> ioProperty $ do
-    let f step = fields !! step
-        rejected seen
-          | not modified = (1,0,seen)
-          | f 7/=1 = (-1,0,seen++[7])
-          | f 8/=1 = (-1,0,seen++[7,8])
-          | otherwise = (1,0,seen++[7,8])
-        admit added seen
-          | proposed>toInteger (f 4) = rejected budgetReads
-          | empty = (0,fromInteger proposed,budgetReads)
-          | f 5/=1 = (-1,0,budgetReads++[5])
-          | f 6/=1 = (-1,0,budgetReads++[5,6])
-          | otherwise = (0,fromInteger proposed,budgetReads++[5,6])
-          where proposed=toInteger (f 3)+added
-                budgetReads=seen++[3,4]
-        accumulated=toInteger (f 1)+toInteger (f 2)
-        (code,next,expected)
-          | not enabled || empty = admit 0 []
-          | f 0/=1 = rejected [0]
-          | accumulated>toInteger (maxBound :: Word64) = rejected [0,1,2]
-          | otherwise = admit accumulated [0,1,2]
-        count=if empty then 0 else 1
-        run invoke = do
-          trace <- newIORef []
-          result <- invoke (\step index -> do
-            modifyIORef' trace (++[(step,index)])
-            pure (f (fromIntegral step)))
-          seen <- readIORef trace
-          pure (result,seen)
-    direct <- run (\action -> validate (Exchange.SourceSelection modified (Exchange.SourcePackage enabled count action)))
-    abi <- run (\action -> bracket (makeCursorEffect (\_ step index unused field ->
-      if unused/=0 then pure (-1) else action step index >>= poke field >> pure 1)) freeHaskellFunPtr $ \callback ->
-      allocaArray 2 $ \out -> do
-        pokeArray out [99,77]
-        result <- elements_hs_source_selection (if enabled then 1 else 0) (if modified then 1 else 0) count out callback nullPtr
-        values <- peekArray 2 out
-        pure (result,values))
-    missing <- alloca $ \out -> elements_hs_source_selection 1 1 count out nullFunPtr nullPtr
-    pure $ conjoin [direct===((code,next),[(step,0) | step <- expected]),
-      abi===((code,[if code<0 then 99 else next,77]),[(step,0) | step <- expected]),missing=== -1]
 
 nextBlockHeight :: Property
 nextBlockHeight = forAll ((,) <$> elements [0,1,2,3,maxBound] <*>
@@ -11485,35 +7955,6 @@ nextBlockHeight = forAll ((,) <$> elements [0,1,2,3,maxBound] <*>
                | present == 1 && toInteger height < 2147483647 = fromInteger (toInteger height + 1)
                | otherwise = -2147483649
   pure $ conjoin [actual===expected,validate (Bmm.NextBlockHeight present height)===expected]
-
-trackerHeight :: Property
-trackerHeight = forAll ((,) <$> elements [0,1,2,maxBound] <*>
-  frequency [(1,elements [minBound,minBound+1,-1,0,1,maxBound]),(3,arbitrary)]) $ \(mode,height) -> ioProperty $ do
-  actual <- elements_hs_tracker_height mode height
-  let expected | mode==0 = fromInteger (max 0 (toInteger height))
-               | mode==1 && toInteger height > -2147483648 = fromInteger (toInteger height-1)
-               | otherwise = -2147483649
-  pure $ conjoin [actual===expected,validate (Exchange.TrackerHeight mode height)===expected]
-
-bondTreeOrder :: Property
-bondTreeOrder = forAll ((,) <$> arbitrary <*> choose (-1,6 :: Int)) $ \(second,fault) -> ioProperty $ do
-  let path :: [Word32]
-      path = if second then [1,2,3,4,5] else [1,2,6]
-      expected = take (if fault<0 then length path else fault+1) path
-      run invoke = do
-        trace <- newIORef []
-        code <- invoke (\step -> do
-          seen <- readIORef trace
-          modifyIORef' trace (++[fromIntegral step])
-          pure $ if length seen==fault then -1 else if step==2 && not second then 0 else 1)
-        seen <- readIORef trace
-        pure (code,seen)
-  direct <- run (\action -> validate (Workflow.CommandFlow 6 (\phase reply -> validate (Exchange.BondTreeFlow phase reply)) action))
-  abi <- run (\action -> bracket (wrapMatchFact (\_ -> action)) freeHaskellFunPtr $ \callback ->
-    elements_hs_parent_replay_run 326 callback nullPtr)
-  bound <- elements_hs_parent_replay_store_checked 326 maxBound 0
-  pure $ conjoin [abi===direct,snd direct===expected,bound===6,
-    fst direct===if fault>=0 && fault<length path then -1 else 0]
 
 extraNonce :: Property
 extraNonce = forAll ((,) <$> elements [0,1,2,maxBound] <*>
@@ -11532,701 +7973,6 @@ peerStrikes = forAll ((,) <$> choose (0,7) <*> frequency [(1,elements [0,1,maxBo
                | testBit flags 1 && count /= 0 = fromInteger (min 4294967295 (toInteger count + 1))
                | otherwise = 1
   pure (actual === expected)
-
-main :: IO ()
-main = do
-  results <- mapM (\(name,prop) -> putStrLn name >> quickCheckWithResult
-    stdArgs { maxSuccess = 10000, replay = Just (mkQCGen 20261009, 0) } prop) $ CustodyIdentityTests.properties ++ CustodyPolicyTests.properties ++ ForcedBlockTests.properties ++ ForcedOutputTests.properties ++ SignetSessionTests.properties ++ CommitmentTests.properties ++ BmmChainTests.properties ++ ProofSessionTests.properties ++ StateStorageTests.properties ++ BmmStateAccessTests.properties ++ BmmHeaderPolicyTests.properties ++ JournalWorkflowTests.properties ++ WalletWithdrawalTests.properties ++ BmmContextTests.properties ++ LocalBidTests.properties ++ ConfirmationDepthTests.properties ++ ReplayStoreTests.properties ++ ParentRpcTests.properties ++ ParentHeaderTests.properties ++ NativeDepositTests.properties ++
-    [("next block height / missing tip, signed boundaries and overflow",nextBlockHeight),
-     ("tracker height / clamp, predecessor, signed bounds and invalid mode",trackerHeight),
-     ("bond tree / lazy single-double composition, fault prefixes and ABI",bondTreeOrder),
-     ("extra nonce / parent reset, full-width increment and wrap",extraNonce),
-     ("source rejection / modified cleanup, faults and publication",sourceSelection),
-     ("fee-free selection / raw values, signed age and clock laziness",feeFreeSelectionValues),
-     ("fee-free selection / multi-row lazy reads and fault prefixes",feeFreeSelectionOrder),
-     ("template commitments / lazy BMM and authenticated envelope actions",templateCommitmentOrder),
-     ("template selection / reset, optional authentication and publication",templateSelectionOrder),
-     ("template source budget / signed activation, shared rule and publication",templateBudgetOrder),
-     ("template admission / replay fence precedes mandatory native validity",templateAdmissionOrder),
-     ("template parent / authentication, fallback and publication order",templateParentOrder),
-     ("child checkpoint / pre-flush checks, cursor ordering and failures",childCheckpointOrder),
-     ("checkpoint metadata / lazy reads, precedence and failures",checkpointMetadataOrder),
-     ("checkpoint records / prefix boundaries, lazy decoders and failures",checkpointKeyOrder),
-     ("BMM RPC authentication / ordered effects and no early publication",bmmRpcAuthenticationOrder),
-     ("BMM RPC source / lazy native and legacy selection",bmmRpcSourceOrder),
-     ("generated block preparation / mode selection and failure precedence",blockPreparationOrder),
-     ("withdrawal history / continuity, monotonicity and selected blocks",withdrawalHistoryOrder),
-     ("child preflight / lazy cancellation and fault order",childPreflightOrder),
-     ("periodic reverification / activation survives warm-up and refresh rejection",reverificationOrder),
-     ("sync preflight / first rejection and fault order",syncPreflightOrder),
-     ("sync loop / shutdown, sleep interruption and fault order",syncLoopOrder),
-     ("bid parent / fetch ordering and stale rejection",bidParentOrder),
-     ("wallet command / timeout, stderr fallback and JSON admission",walletCommandOrder),
-     ("mined commitment / slot before null hash before lookup",minedPreflightOrder),
-     ("configured slot / missing before mismatched identity",configuredSlotOrder),
-     ("mempool sweep / epoch fence before publication or locked traversal",mempoolSweepPreflightOrder),
-     ("parent RPC host / lazy numeric lookup and family selection",parentRpcHostOrder),
-     ("unknown full block / preflight before index mutation",blockAdmissionOrder 312 22 Bmm.FullBlockPreflight),
-     ("indexed full block / BMM then deposits before anchor publication",blockAdmissionOrder 313 31 Bmm.BlockAnchorAdmission),
-     ("stored full block / durable anchor and notification order",blockAdmissionOrder 314 11 Bmm.BlockAnchorPublication),
-     ("BMM cache routing / cached, indexed and negative paths",cacheRoutingOrder),
-     ("required facts / proposal, snapshot and marker ordering",requiredFactsOrder),
-     ("native deposit admission / ordered checks, status and unavailable publication",nativeDepositAdmissionOrder),
-     ("bid input / default selection and parse publication ordering",bidInputOrder),
-     ("funded submission and template creation / admission and reporting order",fundedSubmissionOrder),
-     ("BMM wait probes / lazy status classification",waitProbeOrder),
-     ("reward wallets / first spendable private wallet",rewardWalletOrder),
-     ("producer preparation / signed, nonce, witness and rejection order",producerPreparationOrder),
-     ("producer routing / exactly one native or ECX path",producerRoutingOrder),
-     ("producer acceptance / reject once without changing the result",producerAcceptanceOrder),
-     ("frozen profile / network, override order and partial application",frozenProfileOrder),
-     ("capital decode / admission order and deferred publication",capitalDecodeOrder),
-     ("connection preflight / supplied height, BMM fallback and incomplete candidate",connectionPreflightOrder),
-     ("incremental activation scan / guarded last-match assignment",incrementalScanOrder),
-     ("parent request / reset optional error slot and exception boundary",parentRequestOrder),
-     ("bundle event / verification errors and final-event clearing",bundleEventOrder),
-     ("capital report / identity, mode bounds and fee-pool rejection order",capitalReportOrder),
-     ("export snapshot / seed selection and bounded reorg recheck",exportSnapshotOrder),
-     ("parent report / native, authenticated and isolated-regtest context selection",parentReportOrder),
-     ("bond export / profile transition, append and projection check ordering",exportReconstructOrder),
-     ("authenticated parent height / lookup, diagnostics and publication ordering",authenticatedHeightOrder),
-     ("expected state / activation and continuation context ordering",expectedContextOrder),
-     ("header lifecycle / validation, preparation and publication ordering",headerLifecycleOrder),
-     ("disconnect preflight / parent height and ordered tracker validation",disconnectPreflightOrder),
-     ("singleton recovery / first match, missing inputs and prior coin binding",singletonRecoveryOrder),
-     ("production identity / first mismatch, ordered reads and null callback",productionIdentityOrder),
-     ("pegin confirmation policy / pinned identity order and height boundary",peginConfirmationPolicy),
-     ("startup arguments / ordered native-width reads, effects and rejection",startupArgsOrder),
-     ("USDD policy resources / classification precedes lazy policy reads",usddPolicyResources),
-     ("USDD resource admission / block and package composition parity",usddResourceAdmission),
-     ("USDD resource boundary / callbacks, canaries and long scan",usddResourceBoundary),
-     ("USDD resource scan / flags, counts and invalid-read prefix",usddResourceScan),
-     ("USDD composed activation / legacy outcomes, effects and publication",usddPolicyComposition),
-     ("USDD policy weight / error order, activation bypass and partial publication",usddPolicyWeight),
-     ("USDD package resources / staged predicates and private accumulation",usddPackageResources),
-     ("USDD block resources / ordered reads and Integer lane oracle",usddBlockResources),
-     ("source package / checked totals and admission before publication",sourcePackage),
-     ("peer rejection / edge identity and saturating strikes",peerStrikes),
-     ("domain ABI / scalar and pointer roundtrip",abiRoundTrip),
-     ("domain ABI / rejection before effects",abiRejectsBeforeEffects),
-     ("domain ABI / signed canonicality before effects",abiSignedCanonical),
-     ("domain ABI / exceptions preserve result canary",abiExceptionsPreserveResult),
-     ("family ABI / section isolation, canonical arguments and no effects on rejection",abiFamilyRouting),
-     ("exchange inbox arithmetic / Integer oracle",exchangeArithmetic),
-     ("exchange inbox ABI / canary and invalid projections",exchangeAbi),
-     ("exchange processed cursors / ABI and decision table",cursorAbi),
-     ("exchange authority / ordered reads and exceptions",authorityOrder),
-     ("exchange forced body / ABI parity and bounds",forcedAbi),
-     ("exchange output profile / lazy reads and exceptions",profileOrder),
-     ("exchange tranche / partial work, bounds and read count",trancheParity),
-     ("exchange tracker / phased reads and invalid modes",trackerOrder),
-     ("exchange configuration / disabled mode and precedence",configurationOrder),
-     ("exchange header phases / read order and exceptions",headerOrder),
-     ("exchange parent target / bounds and lazy fallback",parentTarget),
-     ("exchange connection / commitments before reserved coins",connectionOrder),
-     ("exchange disconnect / ordered effects and failure prefixes",disconnectOrder),
-     ("exchange availability / guarded index reads",availabilityOrder),
-     ("exchange source markers / state and ABI outputs",sourceMarkerAbi),
-     ("exchange M6 preimage / framing, commitments and ABI bounds",m6Abi),
-     ("exchange invalid phases / full word range and lazy reader",invalidPhaseLazy),
-     ("exchange envelope requirement / exhaustive truth table and invalid ABI",envelopeRequirementAbi),
-     ("exchange checkpoint / lazy read and error ordering",checkpointOrder),
-     ("exchange snapshot / ordered tracker, context and coin admission",exchangeSnapshotOrder),
-     ("M6 envelope payload / frozen layout and bounded publication",exchangeEnvelopePayload),
-     ("M6 envelope payload / invalid lengths and missing pointers",exchangeEnvelopePayloadBounds),
-     ("M6 envelope scan / candidate order, duplicate precedence and bounded callbacks",exchangeEnvelopeScan),
-     ("M6 whole workflow / exact anchor, duplicate precedence and failure boundaries",wholeEnvelopeValidation),
-     ("parent messages / ordered M1-M4 composition, errors and fault prefixes",wholeReplayMessages),
-     ("parent messages / framing rejects before later effects",replayMessageFraming),
-     ("M4 whole workflow / modes, saturation, lazy reads and publication",wholeM4Voting),
-     ("deposit state workflow / legacy decisions, publication order and exceptions",depositStateWorkflowParity),
-     ("exchange capital identity / byte offsets and ABI bounds",capitalIdentityAbi),
-     ("exchange genesis initialization / version, order and lazy failures",genesisInitializationOrder),
-     ("exchange deployment / version and blinder read ordering",deploymentOrder),
-     ("exchange frozen bounds / numeric boundaries and ABI shape",frozenBoundsAbi),
-     ("exchange distinct identities / pairwise oracle and ABI bounds",distinctAbi),
-     ("exchange identity zero sentinel / nonzero uniqueness and isolation",identitySentinelRules),
-     ("exchange proof roles / ordered missing and collision errors",proofIdentityOrder),
-     ("exchange bond settings / lazy argument and failure order",bondSettingsOrder),
-     ("configuration transactions / ordered publication and private/public branches",configurationTransactions),
-     ("configuration covenants / key, descriptor and checkpoint publication order",configurationCovenants),
-     ("pruned parent recovery / first full peer, service order and failed callbacks",recoveryPeerOrder),
-     ("pruned parent recovery / reply and header admission order",recoveryValidationOrder),
-     ("pruned parent recovery / outer deadline, retry and active-height order",recoveryBodyOrder),
-     ("pruned parent recovery / composed capabilities, retry trace and failure prefix",recoveryComposedOrder),
-     ("pruned parent recovery / null callback and invalid composed selector",recoveryComposedBoundary),
-     ("exchange oracle profile / decoding ABI and untouched failure output",oracleProfileAbi),
-     ("exchange Truthcoin profile / portable bytes and output canaries",truthProfileAbi),
-     ("exchange checkpoint profiles / independent modes and ABI canaries",checkpointProfileAbi),
-     ("exchange base and availability profiles / exact bytes and canaries",identityProfileAbi),
-     ("exchange matcher and accumulator profiles / metadata and ABI canaries",matcherAccumulatorAbi),
-     ("exchange frozen tail / ordered validation and no output writes",frozenTailAbi),
-     ("exchange bond profile / bounded ABI and no output writes",bondProfileAbi),
-     ("exchange configuration identities / ordered ABI",configurationIdentitiesAbi),
-     ("deployment blinder identities / independent ordered oracle",blinderIdentityOrder),
-     ("deployment identity pipeline / independent ordered oracle",deploymentIdentityOrder),
-     ("frozen identity groups / independent ordered oracle",frozenIdentityOrder),
-     ("activation facts / exact join and tuple presence",activationFactBinding),
-     ("runtime identities / proof and matcher configuration",runtimeIdentityBinding),
-     ("deployment outputs / classification and short circuit",deploymentOutputScan),
-     ("resumable issuance / bounded transitions",issuanceTransitions),
-     ("genesis admission / resumable transitions",genesisAdmissionTransitions),
-     ("capital projection / resumable transitions",capitalProjectionTransitions),
-     ("frozen admission / resumable transitions",frozenAdmissionTransitions),
-     ("startup deployment / resumable transitions",startupDeploymentTransitions),
-     ("configuration binding / ordered network identity checks",configurationBindingTransitions),
-     ("deployment identity file / independent effect-prefix oracle",identityFileWorkflow),
-     ("deployment binding / independent ordered effect oracle",identityBindingWorkflow),
-     ("deployment header audit / iteration and error precedence",identityAuditWorkflow),
-     ("deployment history / tree versus ancestry ordering",identityHistoryWorkflow),
-     ("deployment coins / trackers, best block and recovery head order",identityCoinsWorkflow),
-     ("deployment identity record / exact bytes, callback and output bounds",identityRecordEncoding),
-     ("deployment atomic write / durability order and single close",identityWriteWorkflow),
-     ("deployment write callback / errors stop later effects",identityWriteCallbackFault),
-     ("material directory / ordered predicates and early match",materialDirectoryWorkflow),
-     ("material locations / first match skips later filesystem access",materialLocationWorkflow),
-     ("material filenames / byte predicates and ABI bounds",materialNameParity),
-     ("hash arguments / ordered zero-policy selection",hashArgumentsTransitions),
-     ("public issuance / bounded loop transitions",publicIssuanceTransitions),
-     ("bond inbox domains / exact labels and separation",bondInboxDomainCatalog),
-     ("bond hash arguments / unique roles and optional pricing group",bondConfigurationArgumentCatalog),
-     ("explicit creations / null branches and scan transitions",explicitCreationsTransitions),
-     ("reserved inputs / disabled mode, pegin bypass, precedence and short circuit",reservedInputsOrder),
-     ("activation predecessor / ordered root and script binding",activationPredecessorTransitions),
-     ("capital context / finite and incremental checks",capitalContextTransitions),
-     ("successor binding / public-value offsets, finite height and ABI bounds",successorBindingAbi),
-     ("capital carry / profile-selected identities and ABI bounds",carryIdentityAbi),
-     ("header flow / resumable phase boundaries",headerFlowTransitions),
-     ("successor scan / branches and ABI boundaries",successorScanTransitions),
-     ("exchange custodian registry / ordered missing and duplicate errors",registryAbi),
-     ("exchange required identities / mode exclusions and lazy first failure",requiredIdentityOrder),
-     ("exchange physical inputs / ordered mode-sensitive reads",physicalOrder),
-     ("exchange singleton selection / independent cumulative-count oracle",spendSelection),
-     ("exchange transaction shape / guarded ordered reads",transactionShapeOrder),
-     ("exchange runtime settings / priority and lazy height",runtimeSettingsOrder),
-     ("exchange activation settings / network, completeness and lazy reads",activationSettingsOrder),
-     ("evaluator source / private non-frozen selection and callback faults",evaluatorSourceOrder),
-     ("evaluator identity / build flags, exact hex and ABI bounds",evaluatorIdentityAbi),
-     ("configuration field parser / byte ABI, lengths and canaries",configurationFieldAbi),
-     ("payment URI / selection, admission and invalid ABI",paymentUriAbi),
-     ("address aliases / network, parent exclusion, prefix and invalid ABI",addressAliasAbi),
-     ("network selection / names, precedence and invalid ABI",networkSelectionAbi),
-     ("context presence / absent, complete, partial and invalid counts",contextPresenceAbi),
-     ("Bond marker policy / candidate and framed shape parity",bondMarkerPolicyAbi),
-     ("Return marker / arbitrary four-byte magic and ABI rejection",returnMarkerAbi),
-     ("Witness annex / short circuit order and callback failures",witnessAnnexOrder),
-     ("Peer admission / request lookup, sync backoff and callback order",peerAdmissionOrder),
-     ("Journal verifier / input, availability and verification order",journalVerifierOrder),
-     ("Rust custody / ABI buffers, receipt count and short circuit",custodyVerifierAbi),
-     ("Rust custody / wrapped receipt size rejects before callback",custodyCountOverflow),
-     ("Standardness gates / network, output exceptions and resource bounds",standardnessGateAbi),
-     ("Taproot witness policy / leaf, key path and annex parity",taprootWitnessPolicyAbi),
-     ("deposit input limit / nested traversal, cap and callback failures",depositInputLimitAbi),
-     ("cursor transport / shared reads, reset, publication and null guards",cursorTransportAbi),
-     ("Transaction weight / exception isolation, limits and unsigned bounds",transactionWeightAbi),
-     ("CTV admission / flag precedence, stack shapes and invalid ABI",ctvAdmissionAbi),
-     ("SP1 verifier startup / ordered short circuit and malformed replies",verifierStartupOrder),
-     ("SP1 verifier identity / Rust FFI and lazy startup ordering",verifierIdentityOrder),
-     ("activation shape / guarded reads and control-block boundaries",activationShapeOrder),
-     ("activation credit / budget boundaries and ordered callbacks",activationCreditOrder),
-     ("proposal description / frozen prefix and output boundaries",proposalDescriptionBoundaries),
-     ("startup bounds / signed price and initialization",startupBoundsAbi),
-     ("exchange genesis funding / fixed encoding and ABI canaries",genesisFundingAbi),
-     ("exchange genesis states / independent byte layout and ABI bounds",genesisStateAbi),
-     ("exchange genesis covenant / independent byte layout and ABI bounds",genesisCovenantAbi),
-     ("exchange taproot preimages / byte ordering, versions and ABI canaries",tapPreimageAbi),
-     ("USDD proof gate / identity precedence",usddProofGate),
-     ("USDD workflow / ABI bounds and callback-free lane",usddAdmissionAbi),
-     ("USDD strong identity / combined facts and error precedence",usddStrongFacts),
-     ("USDD journal / header precedence, hash ordering and payload bounds",usddJournalOrder),
-     ("USDD raw legacy workflow / identity before hash before deployment",usddLegacyWorkflow),
-     ("USDD raw native boundary / modes, nulls and lengths",usddRawBoundary),
-     ("USDD legacy hash / success, callback failure and rejection order",usddLegacyHashBoundary),
-     ("USDD resource admission / shape, precedence and identity effects",usddResource),
-     ("USDD accumulator / reference traversal, overflow and hash order",usddAccumulator),
-     ("USDD accumulator ABI / rejection preserves output",usddAccumulatorAbi),
-     ("USDD accumulator / version byte and invalid ABI",usddAccumulatorVersion),
-     ("USDD batch append / sequential parity and partial overflow",usddAccumulatorBatch),
-     ("USDD accumulator / returned count and legacy ABI parity",usddAccumulatorCountAbi),
-     ("USDD empty roots / exact callback preimages and order",usddEmptyRoots),
-     ("USDD checkpoint / error order and committed preimage",usddCheckpoint),
-     ("USDD checkpoint ABI / guards and output canary",usddCheckpointAbi),
-     ("USDD claim hashes / preimages, effect order and failure canaries",usddClaimHashesAbi),
-     ("USDD claim prefix / ordered validation and unpublished failures",usddClaimPrefixAbi),
-     ("USDD claim extraction / parse before hashes and output canaries",usddExtractClaimAbi),
-     ("USDD block extraction / traversal and incremental publication",usddBlockTraversal),
-     ("USDD block eligibility / facts gate candidate reads",usddBlockEligibility),
-     ("USDD application / ordered publication and overflow prefixes",usddApplyPublication),
-     ("USDD derivation / hash clearing and late checkpoint failure",usddDerivePublication),
-     ("Replay bounds / all kinds and unchanged transitions",parentReplayBounds),
-     ("Header admission / bounded callbacks and malformed replies",headerAdmissionBounds),
-     ("Activation policy / bounded callbacks and malformed replies",activationPolicyBounds),
-     ("Shared command runner / framing, terminal and committing actions",commandFlowFraming),
-     ("Shared command runner / long traversal and null callback",commandFlowLongRun),
-     ("Shared predicate runner / framing and terminal replies",predicateFlowFraming),
-     ("Shared predicate runner / faults and long traversal",predicateFlowFaults),
-     ("Replay block admission / ordered gates and loops",parentReplayAdmissionTransitions),
-     ("Composed block, transaction and accumulator admission stages",parentReplayStageTransitions),
-     ("USDD genesis / retired inherited workflow rejects",usddGenesisTransitions),
-     ("USDD inclusion proof / independent levels, siblings and effect count",usddInclusion),
-     ("USDD annex / bounded prefix, total sizes and null ABI",usddAnnexAbi),
-     ("exchange inbox entries / serialized layout and ABI canaries",inboxEntryAbi),
-     ("transaction snapshot / native predicate parity and malformed framing",transactionAdmissionAbi),
-     ("public bond snapshot / lazy derivation, failure order and one callback",publicTransactionAdmissionAbi),
-     ("depth / old C++",depthParity), ("treasury / old C++",treasuryParity),
-     ("treasury matching / slot range, decoder reuse and lazy reads",treasuryMatchParity),
-     ("payout / old C++",payoutParity), ("payout conservation",conservation),
-     ("withdrawal state anchor / independent bytes and ABI bounds",anchorPayload),
-     ("withdrawal destination / boundaries and invalid stage results",destinationTransitions),
-     ("wallet withdrawal plan / monetary bounds, fee bytes and ABI",walletBundlePlan),
-     ("wallet bundle workflow / post-Refl planning and construction",walletBundleWorkflow),
-     ("wallet bundle workflow / malformed frames, exceptions and lazy mismatch",walletBundleWorkflowFailures),
-     ("anchored wallet workflow / exact preimages and effect prefixes",property walletAnchoredWorkflow),
-     ("anchored wallet workflow / strict v3 framing",walletAnchoredFraming),
-     ("wallet marker / null commitments and canonical script bytes",walletMarker),
-     ("wallet transport / large buffers, insertion and canaries",walletTransport),
-     ("wallet event lookup / stage table and malformed replies",walletEventTransitions),
-     ("wallet submission / stage table and malformed replies",walletSubmissionTransitions),
-     ("wallet native output / stage table and malformed replies",walletOutputTransitions),
-     ("wallet RPC policy / fee boundaries and status classification",walletRpcPolicies),
-     ("wallet native amounts / signed boundaries and malformed ABI",walletNativeAmounts),
-     ("wallet native payout / combined monetary and dust admission",walletNativePayout),
-     ("wallet native burn plan / prior monetary and script sequence",walletNativeBurnPlan),
-     ("wallet native output selection / candidates, duplicates, malformed framing",walletNativeOutputSelection),
-     ("withdrawal journal admission / ordered errors and framing",withdrawalJournalAdmission),
-     ("withdrawal journal prefix / framing and error precedence ABI parity",withdrawalJournalPrefix),
-     ("withdrawal journal identity / exact hash match and ABI framing",withdrawalJournalIdentity),
-     ("withdrawal journal legacy / marker stripping and malformed ABI inputs",withdrawalJournalLegacy),
-     ("withdrawal journal read / ordered verification and delayed publication",withdrawalJournalRead),
-     ("withdrawal journal persistence / commit-close-rename and removal ordering",withdrawalJournalPersist),
-     ("withdrawal parent policy / wallet-RPC parity and malformed framing",withdrawalParentPolicy),
-     ("withdrawal RPC admission / options, pruning, reorg and depth precedence",withdrawalRpcAdmission),
-     ("withdrawal proof bounds / signed index, leaf limit and precedence",withdrawalProofBounds),
-     ("withdrawal submission policy / platform, process failures and duplicate precedence",withdrawalSubmissionPolicy),
-     ("gRPC duplicate text / native substring parity and failure precedence",grpcDuplicateTextPolicy),
-     ("withdrawal RPC burn scan / duplicates, malformed outputs and policy order",withdrawalRpcBurnScan),
-     ("withdrawal RPC claim / canonical round trip, anchors and parent replay order",withdrawalRpcClaim),
-     ("withdrawal RPC external verification / domain, authentication and publication order",withdrawalRpcVerify),
-     ("ordered admission pair / ECX and withdrawal checks, errors and effect order",requiredPairAdmission),
-     ("connection parent context / candidate, finalized and live authentication",connectionContextOrder),
-     ("snapshot preparation / interruption, reuse and publish ordering",snapshotPrepareOrder),
-     ("snapshot backlog / count threshold and locked cache reset",snapshotBacklogOrder),
-     ("anchor cache / epoch fence before cache reuse",anchorCacheOrder),
-     ("anchor publication / persist before candidate readmission",anchorPublishOrder),
-     ("anchor replacement / checkpoint, evidence and authorization order",anchorReplacementOrder),
-     ("reconciliation gate / budget before snapshot authentication",reconciliationGateOrder),
-     ("anchor ordering / height first and lazy hash tie-break",anchorOrdering),
-     ("anchor disconnection / unavailable stalls and failure stops",anchorDisconnectOrder),
-     ("candidate admission / lazy work comparison and header authentication",candidateAdmissionOrder),
-     ("anchor collection / optional copy and shared ancestry stopping",anchorCollectionOrder),
-     ("withdrawal proof / count, construction, root and diagnostic precedence",withdrawalProofOrder),
-     ("Retired BMM submission / no transitions or effects",retiredBmmSubmission),
-     ("BMM replacement / indexed capabilities, parser order and bounded adjustment",bmmReplacementWorkflow),
-     ("BMM initial bid / range boundaries, failure precedence and selected fees",bmmSelectedBid),
-     ("BMM replacement limit / old subtraction cap and overflow boundaries",bmmReplacementLimit),
-     ("anchor rules / native encoding, 256-bit work, wrapped heights and predecessor checks",anchorRules),
-     ("bond export range / admission, tip bounds, overflow and canaries",exportRange),
-     ("bounded output / mathematical capacity and signed count parity",boundedAppendRule),
-     ("bounded waits / signed limits and native clamp parity",boundedWaitRule),
-     ("approving parent height / unsigned successor limits",approvingParentHeightRule),
-     ("child height comparison / full signed domain",childBehindRule),
-     ("unsigned 32-bit fields / signed conversion, lengths and malformed ABI",unsigned32Fields),
-     ("runtime activation / optional private height and atomic output bounds",runtimeActivation),
-     ("peg event range / start-first errors, bounds, overflow and canaries",pegEventRange),
-     ("peg event default start / widened window, reserved inputs and canaries",pegEventDefaultStart),
-     ("wide decimal / signed 128-bit bounds, exact capacity and canaries",wideDecimal),
-     ("anchor rules / malformed framing and null ABI inputs",anchorFraming),
-     ("anchor checkpoint / rejected frames preserve output and canaries",anchorCheckpointFraming),
-     ("BMM work quote / pricing, partial rejection output and ABI bounds",bmmWorkQuote),
-     ("ECX 128-bit multiply/divide / frozen native oracle and canaries",mulDiv128Parity),
-     ("ECX canonical activation / native oracle and malformed payloads",canonicalActivationParity),
-     ("ECX V4/V5/successor canonical values / native oracle",canonicalValuesParity),
-     ("ECX Groth16 header / program-field boundaries and native oracle",groth16HeaderParity),
-     ("ECX reserve/collateral eligibility and short-circuit hash comparison",bondInputParity),
-     ("ECX proof flow / legacy-modern ordering and rejection short-circuit",groth16ProofFlow),
-     ("frozen resource schedule / unchanged values and unique names",resourceScheduleGolden),
-     ("script cache / exact layout, presence, endian boundaries and ABI canaries",scriptCacheParity),
-     ("script cache endpoint / fixed domain, revision, absent and present bytes",scriptCacheEndpoint),
-     ("script cache / truncated, noncanonical, trailing and invalid ABI rejection",scriptCacheMalformed),
-     ("consensus parameter gates / signed heights, boolean facts and invalid modes",parameterGateParity),
-     ("wallet issuance amount / native double comparison and null boundary",walletIssueAmountParity),
-     ("ECX required height / presence and full Word64 range",jetHeightParity),
-     ("optional Simplicity environment / exact presence and nonzero-field combinations",optionalEnvironmentParity),
-     ("optional checkpoint / absent bytes, null pointer and zero-height compatibility",optionalCheckpointParity),
-     ("annex retention / byte comparison and missing buffers",annexRetentionParity),
-     ("Merkle replacement / sentinel, matching and required index",merkleReplacementParity),
-     ("withdrawal frontier wire / compact order, absent clearing and failure stop",frontierWireOrder),
-     ("annex retention / bounded reads and short circuit order",annexRetentionOrder),
-     ("Simplicity work budget / lazy witness reads, overflow and callback faults",bmmWorkBudget),
-     ("Block work total / rejecting and saturating modes, lazy reads and nested ABI",bmmWorkTotal),
-     ("Credential read / retries, EOF, overflow probe, offsets and ABI canaries",credentialRead),
-     ("Private credential admission / guarded metadata, failure order and ABI",privateFileAdmission),
-     ("mTLS credential admission / ordered metadata, Windows branch and file identity",tlsFileAdmission),
-     ("Credential file / platform branches, nested read results, normalization and failure order",credentialFileOrder),
-     ("Credential record / read failure, validation and rejection effects",credentialRecordOrder),
-     ("Annex accounting / lazy feature gate and effect failure",annexAccountingOrder),
-     ("Peer block dispatch / request, discouragement and missing peer",peerBlockDispatchOrder),
-     ("Capital connection / scan, derivation, failures and check-only publication",capitalConnectionOrder),
-     ("Mempool witnesses / ordered validation, availability and error retention",mempoolWitnessOrder),
-     ("Retired preliminary witness selector / fail closed",retiredPreliminaryWitness),
-     ("Canonical M7 / count rejection and publication ordering",canonicalMatchOrder),
-     ("Explicit M4 / abstention, vote publication and error ordering",explicitVoteOrder),
-     ("Parent context / network, source, publication and fault ordering",parentContextOrder),
-     ("Block deposit preflight / traversal, rejection and unavailable ordering",blockDepositPreflightOrder),
-     ("Branch replay / fork boundaries, nested scans and early failure",branchReplayOrder),
-     ("Recovery ancestor / ordered alignment, forests and callback faults",recoveryAncestorOrder),
-     ("Recovery admission / branch reads before persisted-state screening",recoveryAdmissionOrder),
-     ("Ephemeral header / native admission, predecessor and publication order",ephemeralHeaderOrder),
-     ("Connection anchor / dry-run exceptions and persisted predecessor order",connectionAnchorOrder),
-     ("Connection state / prior context, BMM, exchange and bundle order",connectionStateOrder),
-     ("Legacy marker / lazy framing, payload and publication order",legacyMarkerOrder),
-     ("Startup parent / authentication before databases",startupParentOrder ParentReplay.ParentLoad),
-     ("Startup parent / reconciliation before verification",startupParentOrder ParentReplay.ParentVerify),
-     ("Startup parent / fatal gates and nonfatal mempool sweep",startupParentOrder ParentReplay.ParentServe),
-     ("Startup bundle / lazy tip and ordered restoration",startupBundleOrder),
-     ("Contextual header / BMM before exchange",blockValidationOrder ParentReplay.ContextualHeader),
-     ("Contextual outputs / configured then active passes",blockValidationOrder ParentReplay.ContextualOutputs),
-     ("Candidate self-check / budget and authenticated context",blockValidationOrder ParentReplay.CandidateSelfCheck),
-     ("Branch choice / lazy condition and selected result",blockValidationOrder ParentReplay.BranchChoice),
-     ("Startup reconciliation / locks, failure and stalled result",blockValidationOrder ParentReplay.StartupReconcile),
-     ("Exchange parent / presence priority before validity",blockValidationOrder ParentReplay.ExchangeParent),
-     ("Final BMM / invalid versus retryable parent evidence",blockValidationOrder ParentReplay.FinalBmm),
-     ("BMM failure / permanent versus transient state",blockValidationOrder ParentReplay.BmmFailure),
-     ("Bond marker authentication / context, optional signature and lazy key checks",markerAuthenticationOrder),
-     ("BMM reward admission / ordered facts, short circuit and invalid callback",bmmRewardAdmission),
-     ("fee asset / shared hex decoder, immutable identity and output preservation",feeAssetResolution),
-     ("BMM wait / reset versus retained failures, cadence and interruption",bmmWaitWorkflow),
-     ("native and ECX production / stage order, short circuit and malformed responses",productionStages),
-     ("BMM sync heights / comparison, short circuit and malformed responses",bmmSyncHeights),
-     ("policy callback boundary / lazy null rejection and exception conversion",policyCallBoundary),
-     ("parent RPC address / exact IPv4 and IPv6 loopback policy",parentRpcAddress),
-     ("result publication / lazy rejection and write exception preservation",resultPublication),
-     ("BMM proof build / bounded headers and ordered short-circuiting",proofBuildWorkflow),
-     ("deposit CTIP search / uniqueness, recoverable misses and exact effects",ctipSearchWorkflow),
-     ("deposit headers / inclusive bounded window and publication order",depositHeaderWorkflow),
-     ("indexed callback boundary / lazy rejection and full-width arguments",indexedCallbackBoundary),
-     ("replay leader / ranking, ties, margin and saturation",replayLeaderParity),
-     ("proposal expiry / ordered mutation and malformed-entry stop",proposalExpiryWorkflowParity),
-     ("withdrawal expiry / strict age and effect rejection",withdrawalExpiryWorkflowParity),
-     ("parent maintenance / slot order, snapshots, partial effects and malformed replies",replayMaintenanceExpiry),
-     ("parent maintenance / pruning before ordered publication",replayMaintenancePublication),
-     ("parent maintenance / composed block stages and short circuit",replayComposedStages),
-     ("deposit claims / three complete workflows",DepositClaimTests.whole),
-     ("deposit claims / checkpoint admission and publication",DepositClaimTests.lookupOrder),
-     ("deposit claims / projected transaction rule parity and order",DepositClaimTests.transaction),
-     ("deposit claims / legacy witness and destination precedence",DepositClaimTests.legacy),
-     ("deposit claims / callback exception prefixes",DepositClaimTests.faults),
-     ("deposit claims / malformed replies fail closed",DepositClaimTests.malformed),
-     ("deposit claims / lazy mismatches and missing input",DepositClaimTests.lazyDispatch),
-     ("deposit parsing / complete ordered workflow",DepositParsingTests.whole),
-     ("deposit parsing / domain rejection and publication gates",DepositParsingTests.rejections),
-     ("deposit parsing / callback fault prefixes",DepositParsingTests.faults),
-     ("deposit parsing / malformed frames and scalar widths",DepositParsingTests.malformed),
-     ("deposit parsing / lazy payload mismatch and index admission",DepositParsingTests.lazyDispatch),
-     ("deposit parsing / generic capability composition",DepositParsingTests.stages),
-     ("deposit construction / ordered reconstruction and partial publication",DepositConstructionTests.transcript),
-     ("deposit construction / signed and header-window boundaries",DepositConstructionTests.boundaries),
-     ("deposit construction / callback failure prefixes",DepositConstructionTests.exceptions),
-     ("deposit construction / candidate recovery and fatal exception preservation",DepositConstructionTests.recovery),
-     ("deposit construction / malformed callback replies",DepositConstructionTests.malformed),
-     ("deposit construction / payload equality precedes DSL and effects",DepositConstructionTests.lazyDispatch),
-     ("deposit construction / generic capability stage composition",DepositConstructionTests.stages),
-     ("parent prelude / ordered messages, duplicates, hash order and M8 rejection",ParentBlockTests.preludeMessages),
-     ("parent prelude / callback failure prefixes",ParentBlockTests.preludeFaults),
-     ("parent prelude / admission priority and safe snapshots",ParentBlockTests.preludeAdmission),
-     ("parent prelude / exact M8 encoding",ParentBlockTests.preludeM8),
-     ("parent prelude / payload equality precedes DSL and effects",ParentBlockTests.preludeLazy),
-     ("parent prelude / malformed snapshots and hash replies",ParentBlockTests.preludeMalformed),
-     ("parent block / generic capability stage ordering and short circuit",ParentBlockTests.blockStages),
-     ("parent block / payload equality precedes DSL and effects",ParentBlockTests.blockLazy),
-     ("parent block / complete grouped workflow and publication order",ParentBlockTests.blockWhole),
-     ("parent block / native exception prefixes",ParentBlockTests.blockFaults),
-     ("parent block / malformed callback replies",ParentBlockTests.blockMalformed),
-     ("parent block / domain rejection stops later stages",ParentBlockTests.blockRejections),
-     ("parent block / M5 parsing and block scoped M6 policy",ParentBlockTests.blockTreasury),
-     ("CTIP ownership / balance checks, duplicate rejection and order",ctipOwnersWorkflowParity),
-     ("CTIP spends / duplicate tracking and indexed effects",ctipSpendsWorkflowParity),
-     ("CTIP outputs / active treasury validation and insertion ordering",ctipOutputsWorkflowParity),
-     ("CTIP replacements / lazy checks and exact early exit",ctipReplacementsWorkflowParity),
-     ("entry traversal / exact count, lazy empty and unchanged errors",repeatEntriesParity),
-     ("CTIP changes / value branching and publication order",ctipChangesWorkflowParity),
-     ("coinbase collection / ordered duplicate rejection and publication",coinbaseWorkflowParity),
-     ("BMM typed submission / retries, caps, parent recheck and publication",bmmSubmissionWorkflow),
-     ("exchange inbox derivation / traversal, partial effects and lazy parent",inboxDerivationWorkflow),
-     ("exchange inbox sources / closed variants, empty batches and order",inboxSourcesOrder),
-     ("exchange cursor derivation / ordered scan, failure effects and full-width ABI",cursorDerivationWorkflow),
-     ("exchange state transition / selection, partial publication and nested rules",stateTransitionWorkflow),
-     ("M4 repeat / inactive, missing, unchanged and published votes",m4RepeatWorkflowParity),
-     ("M8 acceptance / deadline, recognition, commitment and parent order",m8AcceptanceWorkflowParity),
-     ("M2 activation / votes, windows, mutations and short-circuiting",m2ProposalWorkflowParity),
-     ("M4 mode / lazy slot lookup and full-width counts",m4ModeWorkflowParity),
-     ("M3 proposal / first duplicate and ordered publication",m3ProposalWorkflowParity),
-     ("M6 id / ordered checks, bounded sum and fee",m6IdWorkflowParity),
-     ("active slots / sorted multiset and bounded publication",activeSlotsParity),
-     ("block publication / admission and optional output order",blockPublishWorkflowParity),
-     ("slot pruning / occupancy and ordered mutations",pruneSlotsWorkflowParity),
-     ("M6 withdrawal / ordered guards and publication",m6WithdrawalWorkflowParity),
-     ("Treasury transaction / legacy rule composition, fault prefixes and effects",treasuryTransactionParity),
-     ("Treasury transaction / invalid modes, null callback and negative counts",treasuryTransactionBoundary),
-     ("BMM state workflow / lifecycle and source decisions preserve ordered native effects",bmmStateWorkflowParity),
-     ("M5 deposit / address-first validation and gated publication",m5DepositWorkflowParity),
-     ("replay leading workflow / duplicate identities and publication",replayLeadingParity),
-     ("replay explicit workflow / abstain, alarm and duplicate identities",replayExplicitParity),
-     ("replay alarm / batch decrement, no-op and output canaries",replayAlarmParity),
-     ("replay upvote / batch parity, saturation and output canaries",replayUpvoteParity),
-     ("raw deposit match / preflight and rejection ordering",rawDepositMatchParity),
-     ("match scan / ordered counting and failure short-circuit",matchScanParity),
-     ("deposit treasury / exact delta without signed overflow",treasuryDeltaParity),
-     ("reported effects / lazy mapping and terminal rejection",reportedEffects),
-     ("ordered facts / rejection codes, wide status and lazy tails",orderedFactsParity),
-     ("live deposit / index preflight and ordered verification",liveVerifyWorkflow),
-     ("deposit evidence / preflight, ordered effects and lazy tails",evidenceBuildWorkflow),
-     ("child monitor / drain, reap, cancellation, deadline and polling order",childMonitorWorkflow),
-     ("child termination grace / deadline, reaping and nonblocking drain order",childGraceWorkflow),
-     ("child reaping / interrupted waits, already reaped and native error ordering",childReapWorkflow),
-     ("child output / interrupted reads, EOF, truncation and native error ordering",childDrainWorkflow),
-     ("wallet parent dust / uint32 sizing and malformed ABI",walletParentDust),
-     ("wallet native guards / complete policy table and malformed ABI",walletNativeGuards),
-     ("deposit broadcast / branch table and malformed replies",depositBroadcastTransitions),
-     ("enforcer TLS / ordered fail-closed configuration",grpcConfigTransitions),
-     ("enforcer TLS / endpoint facts and optional argument short circuit",grpcEndpointAdmission),
-     ("enforcer request / fail before process execution",grpcRequestTransitions),
-     ("enforcer request / length admission boundaries",grpcRequestAdmission),
-     ("enforcer executable / platform and permission ordering",grpcExecutableTransitions),
-     ("RPC server / ordered loopback checks",rpcServerTransitions),
-     ("RPC binds / raw facts, lazy loopback check and first invalid binding",rpcBindAdmission),
-     ("credentials / platform, ownership and open ordering",tlsCredentialTransitions),
-     ("enforcer argument plan / byte-preserving direct argv",grpcArgumentPlan),
-     ("enforcer argument plan / rejection precedence",grpcArgumentRejections),
-     ("enforcer argument plan / FFI canaries",grpcPlanFfiBounds),
-     ("enforcer text admission / bytes, scheme and size",grpcTextAdmission),
-     ("enforcer text admission / null and oversized ABI",grpcTextBounds),
-     ("withdrawal preflight / fail before submission",withdrawalPreflightTransitions),
-     ("native withdrawal submission / exactly-once send and guarded result",nativeWithdrawalSubmissionOrder),
-     ("activation anchor / eligibility, clearing and publication order",activationAnchorOrder),
-     ("bond context / identity alternatives, ordered facts and faults",bondContextOrder),
-     ("withdrawal preflight / lazy individual facts and faults",withdrawalPreflightOrder),
-     ("replay workflows / exact initial action domain",replayInitialActions),
-     ("configured sidechain slot / signed bounds and exact identity",configuredSlotPolicy),
-     ("BMM wait errors / byte-substring parity and ABI bounds",definitiveWaitError),
-     ("BMM duplicate requests / byte-substring parity and ABI bounds",duplicateRequest),
-     ("explicit amount accumulation / non-wrapping bounds",amountSumPolicy),
-     ("wallet balance / nonnegative non-wrapping total",walletBalanceTotal),
-     ("deposit predecessor / positive sequence and signed boundaries",depositPreviousSequence),
-     ("deposit broadcast messages / byte-exact recognition and ABI bounds",depositBroadcastMessage),
-     ("work bid admission / pricing reuse, lazy rate and output canaries",workBidAdmission),
-     ("transaction total modes and unavailable parent rejection",transactionAdmissionModes),
-     ("header layout / version bits, field selection and ABI bounds",headerLayoutPolicy),
-     ("ECX fixed profiles / exact buffer bounds",fixedProfileBounds),
-     ("ECX source transaction / resumable branching",sourceTransactionTransitions),
-     ("ECX block sources / nested scan transitions",blockSourcesTransitions),
-     ("default wallet / load before missing-only create",defaultWalletTransitions),
-     ("deposit preflight / full-width signed amounts and bounds",depositPreflightBounds),
-     ("native deposit import / authentication before nested sponsorship",depositNativeImportTransitions),
-     ("deposit import / authenticated witness sequencing",depositImportTransitions),
-     ("deposit sponsorship / sequencing and malformed replies",depositSponsorshipTransitions),
-     ("deposit satoshis / parsing branch table and malformed replies",depositSatoshiTransitions),
-     ("wallet bundle admission / reservation and identity",walletBundleAdmission),
-     ("six-confirmation boundary",sixConfirmations), ("withdrawal script round trip",scriptRoundTrip),
-     ("noncanonical withdrawal script rejection",scriptMutations), ("M6 reference round trip",referenceRoundTrip),
-     ("M6 allocation preflight / old C++",legacyFrameParity), ("fee bounds",feeBounds),
-     ("byte ABI capacity and canaries",byteAbi), ("explicit burn output round trip / blinded rejection",outputRoundTrip),
-     ("M6 round trip / replay and shape rejection",m6RoundTrip),
-     ("deposit witness formats / old C++",depositWitnessParity),
-     ("deposit recipient policy / old C++",depositOutputParity),
-     ("class-constrained dispatch / all payload pairs",dispatchMatrix),
-     ("mismatched dispatch never evaluates payload",mismatchIsLazy),
-     ("typed withdrawal dispatch / all ABI tags",withdrawalDispatch),
-     ("Ethereum claim extraction / Integer oracle and rejection order",ethereumClaimExtraction),
-     ("ELMTP tagged parent / canonicality and partial publication",taggedParentParity),
-     ("BMM commitment selection / callback order / frozen native rules",bmmCommitmentParity),
-     ("BMM retarget boundaries and timespan clamps",bmmRetargetParity),
-     ("BMM retarget workflow / native parity, lazy reads and publication",bmmRetargetWorkflowParity),
-     ("BMM upper-middle median / unsigned times",bmmMedianParity),
-     ("BMM storage / ordered effects and height normalization",bmmStoreParity),
-     ("BMM encoding / ordered native primitives",bmmEncodingParity),
-     ("BMM target scaling / independent byte arithmetic and canaries",bmmScaleParity),
-     ("BMM fingerprint / frozen encoding and short circuit",bmmFingerprintParity),
-     ("Exchange fingerprint / field layout, lengths and private mode",exchangeFingerprintEncoding),
-     ("Activation fingerprint / ordered fields and fixed widths",activationFingerprintEncoding),
-     ("Fingerprint finalization / both formats force bytes before return",fingerprintFinalization),
-     ("BMM activation preflight / private bounds / public ancestry",bmmActivationParity),
-     ("signet extraction callback transcript / native rules",signetExtractionParity),
-     ("post-Refl signet orchestration / reusable capabilities",property signetCapabilities),
-     ("BMM signature hash mode plan / frozen native branches",bmmSignatureParity),
-     ("Bitcoin signature workflow / class dispatch and exact native-effect prefixes",bitcoinSignatureWorkflow),
-     ("signet validation / frozen control flow and short-circuit trace",signetValidationParity),
-     ("BMM proof and state codecs / frozen native guards",bmmCodecParity),
-     ("BMM traversal / frozen loop and short-circuit transcript",bmmTraversalParity),
-     ("BMM advancement / native wrap, retarget, history and ABI canaries",bmmAdvanceParity),
-     ("BMM wrapper / ordered short-circuit transcript",bmmWrapperParity),
-     ("BMM state source / corrupt storage before fallback",bmmStateSourceParity),
-     ("BMM connect/disconnect gates / frozen branch rules",bmmLifecycleParity),
-     ("BMM proof/effective state / failure and fallback order",bmmSelectionFlowParity),
-     ("BMM consensus/activation mode / short-circuit read order",bmmModeFlowParity),
-     ("BMM retarget/PoW flow / original branch order",bmmWorkFlowParity),
-     ("BMM extension / conditional checks and PoW ordering",bmmExtensionFlowParity),
-     ("BMM persisted decode / action order and short circuit",bmmDecodeFlowParity),
-     ("BMM native-state lookup / short circuit",bmmNativeLookupParity),
-     ("BMM state flow / frozen action trace and write attempts",bmmStateFlowParity),
-     ("BMM state runner / signed replies, phases and ABI faults",bmmStateRunBoundaries),
-     ("BMM state runner / long nonce traversal",bmmStateRunLong),
-     ("BMM proof runner / unsigned replies, null callbacks and malformed frames",bmmProofRunBoundaries),
-     ("BMM proof runner / long traversal and publication",bmmProofRunLong),
-     ("BMM proof workflow / nested reference, effects and ABI",bmmProofWorkflow),
-     ("Exchange state workflow / nested reference, effects and ABI",stateWorkflowParity),
-     ("parent signet signature / encoding before key and split",parentSignatureFlow),
-     ("Private BMM construction / retries and publication",bmmPrivateBuildParity),
-     ("Private BMM template / integer wrap and byte order",bmmPrivateTemplateParity),
-     ("BMM preimage / field ordering and writer failures",bmmPreimageParity),
-     ("BMM signature hash actions / old branches and writer faults",bmmSignatureActionsParity),
-     ("BMM signature split / prefix and hash type",bmmSignatureBytesParity),
-     ("Signet template / fixed fields and ABI bounds",bmmSignetTemplateBounds),
-     ("BMM consensus presets / frozen values and guarded outputs",bmmPresetParity),
-     ("BMM checkpoint presets / frozen records and guarded outputs",bmmCheckpointParity),
-     ("BMM fixed identities / frozen bytes and output canaries",bmmIdentityParity),
-     ("BMM difficulty interval / signed native division and output faults",bmmIntervalParity),
-     ("BMM commitment payload / byte order and fault canaries",bmmCommitmentBytesParity),
-     ("parent commitment payload / parser-selected byte order",parentCommitmentBytes),
-     ("Signet assembly/decode / primitive order and faults",bmmSignetActionsParity),
-     ("withdrawal capability orchestration / frame before body",withdrawalCapabilities),
-     ("dispatch faults preserve ABI sentinel and output",dispatchFaults),
-     ("existential packing defers effects",deferredEffects),
-     ("direct workflows / lazy payload gates and deferred effects",lazyWorkflows),
-     ("authenticated deposit shape and accounting / old C++",authenticatedDepositParity),
-     ("authenticated deposit overflow and error priority",authenticatedDepositBounds),
-     ("deterministic deposit evidence / old C++ and callback ordering",evidenceParity),
-     ("deterministic evidence faults and early pointer rejection",evidenceFaults),
-     ("deposit inclusion / old C++ and lazy header ordering",inclusionParity),
-     ("deposit inclusion faults and bounded callbacks",inclusionFaults),
-     ("authenticated CTIP increase / old C++ and full-width amounts",ctipParity),
-     ("persisted CTIP / old C++, decode faults and callback ordering",persistedCtipParity),
-     ("CTIP script / native packing and read order",ctipScriptPacking),
-     ("Persisted CTIP workflow / old C++, cursor and decoder order",persistedCtipWorkflow),
-     ("deposit verification / original branch transcript",depositVerificationFlow),
-     ("deposit anchor / original branch transcript",depositAnchorFlow),
-     ("deposit lifecycle / original branch transcript and terminal publication",depositLifecycleFlow),
-     ("deposit parsing / original short circuit and publication order",depositParsingFlow),
-     ("CTIP input scan / ordered guards and last match",ctipInputScanFlow),
-     ("deposit authentication / ordered checks and publication",depositAuthenticationFlow),
-     ("deposit access / checkpoint claim and CTIP short circuit",depositAccessFlow),
-     ("deposit projection / shape gates and bounded output reads",depositProjectionFlow),
-     ("peg read runner / unsigned values, failure traces and invalid modes",pegReadRunnerParity),
-     ("withdrawal status / event filtering and failure order",withdrawalStatusTraversal),
-     ("L1 normalization / transition and adapter fault table",l1NormalizationTransitions),
-     ("sidechain events / transition and adapter fault table",sidechainEventTransitions),
-     ("L1 location / transition and adapter fault table",l1LocationTransitions),
-     ("peg schema / guards, widths and phase faults",pegSchemaTransitions),
-     ("parent epoch / nonzero equality and shared anchor fence",currentEpochRule),
-     ("parent replay records / frozen C++ and numeric boundaries",parentReplayRecordParity),
-     ("signed predecessor / full-width adjacency",signedPredecessorRule),
-     ("replay distance / full-width subtraction and underflow",replayDistanceRule),
-     ("nonempty bounded size / scalar ABI and full-width boundaries",nonEmptyBoundedRule),
-     ("deposit routing / format, network and malformed scalar flags",depositRoutingRule),
-     ("legacy witness shape / shallow recognition and untouched outputs",legacyWitnessShapePolicy),
-     ("parent replay constants / frozen storage contract",parentReplayConstantsFrozen),
-     ("parent cache / epoch mismatch and timeout retention",cacheExpiryRule),
-     ("resource lanes / shared overflow-safe cumulative limit",laneLimitRule),
-     ("parent rule catalog / exact versions and native schema",parentRuleCatalog),
-     ("parent replay tip / transitions and invalid snapshots",parentReplayTipTransitions),
-     ("parent replay store / status and terminal diagnostics",parentReplayStoreTransitions),
-     ("parent replay append / ordered validation and atomic commit",parentReplayAppendTransitions),
-     ("parent replay identity / preimage and terminal hash order",parentReplayIdentityTransitions),
-     ("parent replay cache / preflight and identity sequencing",parentReplayCacheTransitions),
-     ("parent replay cache / durable tip selection",parentReplayCacheLoadTransitions),
-     ("parent replay bootstrap / preimage and reconstruction transitions",parentReplayBootstrapTransitions),
-     ("parent replay boundaries / reorg preflight and terminal publication",parentReplayBoundaryTransitions),
-     ("parent replay advancement / durable ordering and loop transitions",parentReplayAdvanceTransitions),
-     ("parent replay wrappers / budget snapshot and lock transitions",parentReplayWrapperTransitions),
-     ("parent deadlines / interrupt timeout and backoff transitions",parentDeadlineTransitions),
-     ("parent milestones / guarded state and message tags",parentMilestoneTransitions),
-     ("parent messages / decoding traversal and pinned guards",parentMessageTransitions),
-     ("parent RPC parsing / short circuit and publication",parentRpcParseTransitions),
-     ("parent work / guarded targets and chainwork order",parentWorkTransitions),
-     ("parent raw headers / request decode and deadline order",parentRawHeaderTransitions),
-     ("parent median time / traversal and overflow boundaries",parentMedianTimeTransitions),
-     ("parent header metadata / lazy reads and diagnostic order",parentHeaderMetadataTransitions),
-     ("parent predecessor / guarded RPC and chainwork branches",parentPredecessorTransitions),
-     ("verified parent header / request and publication ordering",parentVerifiedHeaderTransitions),
-     ("parent block transactions / scan and periodic deadline order",parentBlockTransactionTransitions),
-     ("parent block wrappers / lazy signet and output ordering",parentBlockWrapperTransitions),
-     ("parent recovery / tighter limit and stable duration",parentRecoveryTransitions),
-     ("parent signet Merkle / ordered traversal and terminal hash",parentSignetMerkleTransitions),
-     ("parent signet / lazy validation and diagnostics",parentSignetTransitions),
-     ("parent warmup / RPC ordering and failure gates",parentWarmupTransitions),
-     ("RPC reply / error priority and lazy result",rpcReplyTransitions),
-     ("RPC cookie retry / invalidation and budget gate",authRetryTransitions),
-     ("RPC timeout / deadline precedence and lazy clamping",rpcTimeoutTransitions),
-     ("signed positive / full-width bounds",signedPositiveParity),
-     ("cookie cache / nonblocking budget and protected copy",cookieCacheTransitions),
-     ("credential sources / conflicts and validation file guard",credentialTransitions),
-     ("checkpoint identity / lazy absent and present branches",checkpointIdentityTransitions),
-     ("checkpoint CTIP / frozen money and outpoint bounds",checkpointCtipParity),
-     ("activation windows / original predicate and full-width bounds",activationWindowParity),
-     ("CTIP balances / optional treasury and full-width money bounds",ctipBalanceParity),
-     ("proposal expiry / age, misses and guarded subtraction",proposalExpiryParity),
-     ("parent header MTP / lazy JSON and parse boundary",headerMtpTransitions),
-     ("parent preflight / lazy branches and malformed replies",parentPreflightTransitions),
-     ("M8 acceptance / traversal, skip and rejection boundaries",m8AcceptanceTransitions),
-     ("coinbase messages / ordered collection and duplicate rejection",coinbaseMessagesTransitions),
-     ("proposal ACK / lazy activation and partial mutations",proposalAckTransitions),
-     ("proposal admission / lazy insert, scan and append order",proposalAdmissionTransitions),
-     ("M4 voting / saturation, competing downvotes and alarm effects",m4VoteTransitions),
-     ("M4 leader / ordered scan, fifty-vote gap and guarded submission",m4LeaderTransitions),
-     ("M4 explicit/repeat / skip, guards and effective publication",m4DispatchTransitions),
-     ("expiry loops / lazy checks, errors and iterator transitions",expiryTransitions),
-     ("CTIP scans / ownership, deadlines and duplicate spends",ctipScanTransitions),
-     ("CTIP outputs / lazy script, value and replacement checks",ctipOutputTransitions),
-     ("CTIP changes / old-value selection and ordered publication",ctipChangeTransitions),
-     ("M5 deposits / validation, CTIP updates and optional mint record",m5DepositTransitions),
-     ("M6 withdrawals / approval gates and ordered treasury mutation",m6WithdrawalTransitions),
-     ("replay finish / lazy slot pruning and output publication",replayFinishTransitions),
-     ("M6 identity / payout loop, serialization and publication order",m6IdTransitions),
-     ("M4 mode / validation and active-slot traversal",m4ModeTransitions),
-     ("snapshot membership / admission and guarded lookup",snapshotMembershipTransitions),
-     ("snapshot epochs / signed slots and full-width generations",snapshotEpochParity),
-     ("cache epoch inequality / full-width generations",cacheEpochParity),
-     ("signed height windows / no overflow or narrowing",signedHeightWindowParity),
-     ("cache capacity / full-width unsigned sizes",cacheCapacityParity),
-     ("parent probe metadata / ordered parsing and status",parentProbeMetadataTransitions),
-     ("BMM edge recheck / mismatch-only invalidation",bmmEdgeRecheckTransitions),
-     ("BMM cache preflight / budget locking and invalidation",bmmCachePreflightTransitions),
-     ("BMM cache hit / cheap rejection and exact publication",bmmCacheHitTransitions),
-     ("BMM cache key / lazy hash and slot match",bmmCacheKeyTransitions),
-     ("untrusted BMM admission / indexed evidence only",bmmAdmissionTransitions),
-     ("BMM probe result / rejection cache ordering",bmmProbeResultTransitions),
-     ("BMM publication / partial output and cache ordering",bmmPublicationTransitions),
-     ("BMM successor / preparation and chainwork ordering",bmmSuccessorTransitions),
-     ("authenticated JSON / transport admission and output clearing",authenticatedJsonTransitions),
-     ("BMM bid / preflight and transaction id admission",bmmBidTransitions),
-     ("anchor reconciliation / orphaning versus unavailability",anchorReconcileTransitions),
-     ("block contexts / reset, preflight and guarded publication",blockContextTransitions),
-     ("parent contexts / shared tip guards and publication",parentContextTransitions),
-     ("withdrawal lookup / ordered invalidation and publication",withdrawalLookupTransitions),
-     ("deposit preflight / diagnostics and guarded identity",depositPreflightTransitions),
-     ("confirmed deposit / lazy state and RPC ordering",confirmedDepositTransitions),
-     ("parent message parser / original C++ and ABI canaries",parentMessageParity),
-     ("M8 parser / ordered guarded extraction",m8ParseTransitions),
-     ("replay message dispatch / lazy handler selection",messageDispatchTransitions),
-     ("replay each / shared short-circuiting traversal",eachTransitions),
-     ("parent bootstrap / versioned catalog and activation height",parentBootstrapCatalog),
-     ("parent lifecycle / generated nonthrowing action plans",parentLifecyclePlans),
-     ("peg defaults / slot endpoint and historical fee",pegDefaults),
-     ("event identity / old C++ bytes and output canaries",eventIdentityParity),
-     ("event layout / frozen schema and ABI canaries",eventLayoutAbi),
-     ("CTIP state and anchor phases / old C++ and invalid phases",stateRuleParity),
-     ("legacy claim / old C++ and full-width values",legacyClaimParity),
-     ("destination selection / old C++ and callback ordering",destinationParity),
-     ("checkpoint ABI bounds, immutable lookup and output canaries",checkpointAbi),
-     ("live evidence / old C++, ordered field reads and parser faults",liveEvidenceParity),
-     ("live evidence / synchronous isolation and initialized callbacks",liveSynchronousLifecycle),
-     ("declaration and deposit selection / old C++ and lazy read traces",selectionParity),
-     ("peg event lifecycle and amounts / old C++",pegEventParity),
-     ("withdrawal status bytes / old C++ and exact matching",withdrawalStatusParity),
-     ("BMM parent state / old C++ and interval truncation",bmmStateParity),
-     ("BMM header preflight/final phases / old C++",bmmHeaderParity),
-     ("BMM proof bounds and authentication / old C++",bmmProofParity)]
-  unless (all isSuccess results) exitFailure
 
 withdrawalStatusParity :: Property
 withdrawalStatusParity = forAll ((,) <$> state <*> statusBytes) $ \(prior,status) -> ioProperty $
@@ -13133,3 +8879,501 @@ bmmStateParity = forAll gen $ \(present,interval,height,time,bits,start,startTim
       count <- edge [0,10,11,12]
       latest <- elements [0,time]
       elements [(h,i,height,time,bits,start,startTime,count,latest), (1,2016,4031,1,1,2016,1,11,1)]
+main :: IO ()
+main = do
+  results <- mapM (\(name,prop) -> putStrLn name >> quickCheckWithResult
+    stdArgs { maxSuccess = 10000, replay = Just (mkQCGen 20261009, 0) } prop) $ SignetSessionTests.properties ++ CommitmentTests.properties ++ BmmChainTests.properties ++ ProofSessionTests.properties ++ StateStorageTests.properties ++ BmmStateAccessTests.properties ++ BmmHeaderPolicyTests.properties ++ JournalWorkflowTests.properties ++ WalletWithdrawalTests.properties ++ BmmContextTests.properties ++ LocalBidTests.properties ++ ConfirmationDepthTests.properties ++ ReplayStoreTests.properties ++ ParentRpcTests.properties ++ ParentHeaderTests.properties ++ NativeDepositTests.properties ++
+    [("next block height / missing tip, signed boundaries and overflow",nextBlockHeight),
+     ("extra nonce / parent reset, full-width increment and wrap",extraNonce),
+     ("fee-free selection / raw values, signed age and clock laziness",feeFreeSelectionValues),
+     ("fee-free selection / multi-row lazy reads and fault prefixes",feeFreeSelectionOrder),
+     ("template commitments / lazy BMM marking",templateCommitmentOrder),
+     ("template selection / reset, optional authentication and publication",templateSelectionOrder),
+     ("template admission / replay fence precedes mandatory native validity",templateAdmissionOrder),
+     ("template parent / authentication, fallback and publication order",templateParentOrder),
+     ("child checkpoint / pre-flush checks, cursor ordering and failures",childCheckpointOrder),
+     ("checkpoint metadata / lazy reads, precedence and failures",checkpointMetadataOrder),
+     ("checkpoint records / prefix boundaries, lazy decoders and failures",checkpointKeyOrder),
+     ("BMM RPC authentication / ordered effects and no early publication",bmmRpcAuthenticationOrder),
+     ("BMM RPC source / lazy native and legacy selection",bmmRpcSourceOrder),
+     ("generated block preparation / mode selection and failure precedence",blockPreparationOrder),
+     ("withdrawal history / continuity, monotonicity and selected blocks",withdrawalHistoryOrder),
+     ("child preflight / lazy cancellation and fault order",childPreflightOrder),
+     ("periodic reverification / activation survives warm-up and refresh rejection",reverificationOrder),
+     ("sync preflight / first rejection and fault order",syncPreflightOrder),
+     ("sync loop / shutdown, sleep interruption and fault order",syncLoopOrder),
+     ("bid parent / fetch ordering and stale rejection",bidParentOrder),
+     ("wallet command / timeout, stderr fallback and JSON admission",walletCommandOrder),
+     ("mined commitment / slot before null hash before lookup",minedPreflightOrder),
+     ("configured slot / missing before mismatched identity",configuredSlotOrder),
+     ("mempool sweep / epoch fence before publication or locked traversal",mempoolSweepPreflightOrder),
+     ("parent RPC host / lazy numeric lookup and family selection",parentRpcHostOrder),
+     ("unknown full block / preflight before index mutation",blockAdmissionOrder 312 22 Bmm.FullBlockPreflight),
+     ("indexed full block / BMM then deposits before anchor publication",blockAdmissionOrder 313 31 Bmm.BlockAnchorAdmission),
+     ("stored full block / durable anchor and notification order",blockAdmissionOrder 314 11 Bmm.BlockAnchorPublication),
+     ("BMM cache routing / cached, indexed and negative paths",cacheRoutingOrder),
+     ("required facts / proposal, snapshot and marker ordering",requiredFactsOrder),
+     ("native deposit admission / ordered checks, status and unavailable publication",nativeDepositAdmissionOrder),
+     ("bid input / default selection and parse publication ordering",bidInputOrder),
+     ("funded submission and template creation / admission and reporting order",fundedSubmissionOrder),
+     ("BMM wait probes / lazy status classification",waitProbeOrder),
+     ("reward wallets / first spendable private wallet",rewardWalletOrder),
+     ("producer preparation / signed, nonce, witness and rejection order",producerPreparationOrder),
+     ("producer routing / exactly one native or ECX path",producerRoutingOrder),
+     ("producer acceptance / reject once without changing the result",producerAcceptanceOrder),
+     ("parent request / reset optional error slot and exception boundary",parentRequestOrder),
+     ("bundle event / verification errors and final-event clearing",bundleEventOrder),
+     ("parent report / native, authenticated and isolated-regtest context selection",parentReportOrder),
+     ("pegin confirmation policy / pinned identity order and height boundary",peginConfirmationPolicy),
+     ("startup arguments / ordered native-width reads, effects and rejection",startupArgsOrder),
+     ("peer rejection / edge identity and saturating strikes",peerStrikes),
+     ("domain ABI / scalar and pointer roundtrip",abiRoundTrip),
+     ("domain ABI / rejection before effects",abiRejectsBeforeEffects),
+     ("domain ABI / signed canonicality before effects",abiSignedCanonical),
+     ("domain ABI / exceptions preserve result canary",abiExceptionsPreserveResult),
+     ("family ABI / section isolation, canonical arguments and no effects on rejection",abiFamilyRouting),
+     ("parent messages / ordered M1-M4 composition, errors and fault prefixes",wholeReplayMessages),
+     ("parent messages / framing rejects before later effects",replayMessageFraming),
+     ("M4 whole workflow / modes, saturation, lazy reads and publication",wholeM4Voting),
+     ("deposit state workflow / legacy decisions, publication order and exceptions",depositStateWorkflowParity),
+     ("pruned parent recovery / first full peer, service order and failed callbacks",recoveryPeerOrder),
+     ("pruned parent recovery / reply and header admission order",recoveryValidationOrder),
+     ("pruned parent recovery / outer deadline, retry and active-height order",recoveryBodyOrder),
+     ("pruned parent recovery / composed capabilities, retry trace and failure prefix",recoveryComposedOrder),
+     ("pruned parent recovery / null callback and invalid composed selector",recoveryComposedBoundary),
+     ("configuration field parser / byte ABI, lengths and canaries",configurationFieldAbi),
+     ("payment URI / selection, admission and invalid ABI",paymentUriAbi),
+     ("address aliases / network, parent exclusion, prefix and invalid ABI",addressAliasAbi),
+     ("network selection / names, precedence and invalid ABI",networkSelectionAbi),
+     ("Peer admission / request lookup, sync backoff and callback order",peerAdmissionOrder),
+     ("deposit input limit / nested traversal, cap and callback failures",depositInputLimitAbi),
+     ("cursor transport / shared reads, reset, publication and null guards",cursorTransportAbi),
+     ("CTV admission / flag precedence, stack shapes and invalid ABI",ctvAdmissionAbi),
+     ("proposal description / frozen prefix and output boundaries",proposalDescriptionBoundaries),
+     ("Replay bounds / all kinds and unchanged transitions",parentReplayBounds),
+     ("Header admission / bounded callbacks and malformed replies",headerAdmissionBounds),
+     ("Shared command runner / framing, terminal and committing actions",commandFlowFraming),
+     ("Shared command runner / long traversal and null callback",commandFlowLongRun),
+     ("Shared predicate runner / framing and terminal replies",predicateFlowFraming),
+     ("Shared predicate runner / faults and long traversal",predicateFlowFaults),
+     ("Replay block admission / ordered gates and loops",parentReplayAdmissionTransitions),
+     ("Composed block, transaction and accumulator admission stages",parentReplayStageTransitions),
+     ("depth / old C++",depthParity), ("treasury / old C++",treasuryParity),
+     ("treasury matching / slot range, decoder reuse and lazy reads",treasuryMatchParity),
+     ("payout / old C++",payoutParity), ("payout conservation",conservation),
+     ("withdrawal state anchor / independent bytes and ABI bounds",anchorPayload),
+     ("withdrawal destination / boundaries and invalid stage results",destinationTransitions),
+     ("wallet withdrawal plan / monetary bounds, fee bytes and ABI",walletBundlePlan),
+     ("wallet bundle workflow / post-Refl planning and construction",walletBundleWorkflow),
+     ("wallet bundle workflow / malformed frames, exceptions and lazy mismatch",walletBundleWorkflowFailures),
+     ("anchored wallet workflow / exact preimages and effect prefixes",property walletAnchoredWorkflow),
+     ("anchored wallet workflow / strict v3 framing",walletAnchoredFraming),
+     ("wallet marker / null commitments and canonical script bytes",walletMarker),
+     ("wallet transport / large buffers, insertion and canaries",walletTransport),
+     ("wallet event lookup / stage table and malformed replies",walletEventTransitions),
+     ("wallet submission / stage table and malformed replies",walletSubmissionTransitions),
+     ("wallet native output / stage table and malformed replies",walletOutputTransitions),
+     ("wallet RPC policy / fee boundaries and status classification",walletRpcPolicies),
+     ("wallet native amounts / signed boundaries and malformed ABI",walletNativeAmounts),
+     ("wallet native payout / combined monetary and dust admission",walletNativePayout),
+     ("wallet native burn plan / prior monetary and script sequence",walletNativeBurnPlan),
+     ("wallet native output selection / candidates, duplicates, malformed framing",walletNativeOutputSelection),
+     ("withdrawal journal admission / ordered errors and framing",withdrawalJournalAdmission),
+     ("withdrawal journal prefix / framing and error precedence ABI parity",withdrawalJournalPrefix),
+     ("withdrawal journal identity / exact hash match and ABI framing",withdrawalJournalIdentity),
+     ("withdrawal journal legacy / marker stripping and malformed ABI inputs",withdrawalJournalLegacy),
+     ("withdrawal journal read / ordered verification and delayed publication",withdrawalJournalRead),
+     ("withdrawal journal persistence / commit-close-rename and removal ordering",withdrawalJournalPersist),
+     ("withdrawal parent policy / wallet-RPC parity and malformed framing",withdrawalParentPolicy),
+     ("withdrawal RPC admission / options, pruning, reorg and depth precedence",withdrawalRpcAdmission),
+     ("withdrawal proof bounds / signed index, leaf limit and precedence",withdrawalProofBounds),
+     ("withdrawal submission policy / platform, process failures and duplicate precedence",withdrawalSubmissionPolicy),
+     ("gRPC duplicate text / native substring parity and failure precedence",grpcDuplicateTextPolicy),
+     ("withdrawal RPC burn scan / duplicates, malformed outputs and policy order",withdrawalRpcBurnScan),
+     ("withdrawal RPC claim / canonical round trip, anchors and parent replay order",withdrawalRpcClaim),
+     ("withdrawal RPC external verification / domain, authentication and publication order",withdrawalRpcVerify),
+     ("ordered admission pair / ECX and withdrawal checks, errors and effect order",requiredPairAdmission),
+     ("connection parent context / candidate, finalized and live authentication",connectionContextOrder),
+     ("snapshot preparation / interruption, reuse and publish ordering",snapshotPrepareOrder),
+     ("snapshot backlog / count threshold and locked cache reset",snapshotBacklogOrder),
+     ("anchor cache / epoch fence before cache reuse",anchorCacheOrder),
+     ("anchor publication / persist before candidate readmission",anchorPublishOrder),
+     ("anchor replacement / checkpoint, evidence and authorization order",anchorReplacementOrder),
+     ("reconciliation gate / budget before snapshot authentication",reconciliationGateOrder),
+     ("anchor ordering / height first and lazy hash tie-break",anchorOrdering),
+     ("anchor disconnection / unavailable stalls and failure stops",anchorDisconnectOrder),
+     ("candidate admission / lazy work comparison and header authentication",candidateAdmissionOrder),
+     ("anchor collection / optional copy and shared ancestry stopping",anchorCollectionOrder),
+     ("Retired BMM submission / no transitions or effects",retiredBmmSubmission),
+     ("BMM replacement / indexed capabilities, parser order and bounded adjustment",bmmReplacementWorkflow),
+     ("BMM initial bid / range boundaries, failure precedence and selected fees",bmmSelectedBid),
+     ("BMM replacement limit / old subtraction cap and overflow boundaries",bmmReplacementLimit),
+     ("anchor rules / native encoding, 256-bit work, wrapped heights and predecessor checks",anchorRules),
+     ("bounded output / mathematical capacity and signed count parity",boundedAppendRule),
+     ("bounded waits / signed limits and native clamp parity",boundedWaitRule),
+     ("approving parent height / unsigned successor limits",approvingParentHeightRule),
+     ("child height comparison / full signed domain",childBehindRule),
+     ("unsigned 32-bit fields / signed conversion, lengths and malformed ABI",unsigned32Fields),
+     ("peg event range / start-first errors, bounds, overflow and canaries",pegEventRange),
+     ("peg event default start / widened window, reserved inputs and canaries",pegEventDefaultStart),
+     ("anchor rules / malformed framing and null ABI inputs",anchorFraming),
+     ("anchor checkpoint / rejected frames preserve output and canaries",anchorCheckpointFraming),
+     ("BMM work quote / pricing, partial rejection output and ABI bounds",bmmWorkQuote),
+     ("script cache endpoint / fixed domain, revision, absent and present bytes",scriptCacheEndpoint),
+     ("script cache / truncated, noncanonical, trailing and invalid ABI rejection",scriptCacheMalformed),
+     ("consensus parameter gates / signed heights, boolean facts and invalid modes",parameterGateParity),
+     ("wallet issuance amount / native double comparison and null boundary",walletIssueAmountParity),
+     ("ECX required height / presence and full Word64 range",jetHeightParity),
+     ("optional Simplicity environment / exact presence and nonzero-field combinations",optionalEnvironmentParity),
+     ("optional checkpoint / absent bytes, null pointer and zero-height compatibility",optionalCheckpointParity),
+     ("Merkle replacement / sentinel, matching and required index",merkleReplacementParity),
+     ("Simplicity work budget / lazy witness reads, overflow and callback faults",bmmWorkBudget),
+     ("Block work total / rejecting and saturating modes, lazy reads and nested ABI",bmmWorkTotal),
+     ("Credential read / retries, EOF, overflow probe, offsets and ABI canaries",credentialRead),
+     ("Private credential admission / guarded metadata, failure order and ABI",privateFileAdmission),
+     ("mTLS credential admission / ordered metadata, Windows branch and file identity",tlsFileAdmission),
+     ("Credential file / platform branches, nested read results, normalization and failure order",credentialFileOrder),
+     ("Credential record / read failure, validation and rejection effects",credentialRecordOrder),
+     ("Peer block dispatch / request, discouragement and missing peer",peerBlockDispatchOrder),
+     ("Mempool witnesses / ordered validation, availability and error retention",mempoolWitnessOrder),
+     ("Retired preliminary witness selector / fail closed",retiredPreliminaryWitness),
+     ("Canonical M7 / count rejection and publication ordering",canonicalMatchOrder),
+     ("Explicit M4 / abstention, vote publication and error ordering",explicitVoteOrder),
+     ("Block deposit preflight / traversal, rejection and unavailable ordering",blockDepositPreflightOrder),
+     ("Branch replay / fork boundaries, nested scans and early failure",branchReplayOrder),
+     ("Recovery ancestor / ordered alignment, forests and callback faults",recoveryAncestorOrder),
+     ("Recovery admission / branch reads before persisted-state screening",recoveryAdmissionOrder),
+     ("Ephemeral header / native admission, predecessor and publication order",ephemeralHeaderOrder),
+     ("Connection anchor / dry-run exceptions and persisted predecessor order",connectionAnchorOrder),
+     ("Connection state / prior context, BMM, exchange and bundle order",connectionStateOrder),
+     ("Startup parent / authentication before databases",startupParentOrder ParentReplay.ParentLoad),
+     ("Startup parent / reconciliation before verification",startupParentOrder ParentReplay.ParentVerify),
+     ("Startup parent / fatal gates and nonfatal mempool sweep",startupParentOrder ParentReplay.ParentServe),
+     ("Startup bundle / lazy tip and ordered restoration",startupBundleOrder),
+     ("Contextual header / BMM before exchange",blockValidationOrder ParentReplay.ContextualHeader),
+     ("Contextual outputs / configured then active passes",blockValidationOrder ParentReplay.ContextualOutputs),
+     ("Candidate self-check / budget and authenticated context",blockValidationOrder ParentReplay.CandidateSelfCheck),
+     ("Branch choice / lazy condition and selected result",blockValidationOrder ParentReplay.BranchChoice),
+     ("Startup reconciliation / locks, failure and stalled result",blockValidationOrder ParentReplay.StartupReconcile),
+     ("Final BMM / invalid versus retryable parent evidence",blockValidationOrder ParentReplay.FinalBmm),
+     ("BMM failure / permanent versus transient state",blockValidationOrder ParentReplay.BmmFailure),
+     ("BMM reward admission / ordered facts, short circuit and invalid callback",bmmRewardAdmission),
+     ("fee asset / shared hex decoder, immutable identity and output preservation",feeAssetResolution),
+     ("BMM wait / reset versus retained failures, cadence and interruption",bmmWaitWorkflow),
+     ("native and ECX production / stage order, short circuit and malformed responses",productionStages),
+     ("BMM sync heights / comparison, short circuit and malformed responses",bmmSyncHeights),
+     ("policy callback boundary / lazy null rejection and exception conversion",policyCallBoundary),
+     ("parent RPC address / exact IPv4 and IPv6 loopback policy",parentRpcAddress),
+     ("result publication / lazy rejection and write exception preservation",resultPublication),
+     ("BMM proof build / bounded headers and ordered short-circuiting",proofBuildWorkflow),
+     ("deposit CTIP search / uniqueness, recoverable misses and exact effects",ctipSearchWorkflow),
+     ("deposit headers / inclusive bounded window and publication order",depositHeaderWorkflow),
+     ("indexed callback boundary / lazy rejection and full-width arguments",indexedCallbackBoundary),
+     ("replay leader / ranking, ties, margin and saturation",replayLeaderParity),
+     ("proposal expiry / ordered mutation and malformed-entry stop",proposalExpiryWorkflowParity),
+     ("withdrawal expiry / strict age and effect rejection",withdrawalExpiryWorkflowParity),
+     ("parent maintenance / slot order, snapshots, partial effects and malformed replies",replayMaintenanceExpiry),
+     ("parent maintenance / pruning before ordered publication",replayMaintenancePublication),
+     ("parent maintenance / composed block stages and short circuit",replayComposedStages),
+     ("deposit claims / three complete workflows",DepositClaimTests.whole),
+     ("deposit claims / checkpoint admission and publication",DepositClaimTests.lookupOrder),
+     ("deposit claims / projected transaction rule parity and order",DepositClaimTests.transaction),
+     ("deposit claims / legacy witness and destination precedence",DepositClaimTests.legacy),
+     ("deposit claims / callback exception prefixes",DepositClaimTests.faults),
+     ("deposit claims / malformed replies fail closed",DepositClaimTests.malformed),
+     ("deposit claims / lazy mismatches and missing input",DepositClaimTests.lazyDispatch),
+     ("deposit parsing / complete ordered workflow",DepositParsingTests.whole),
+     ("deposit parsing / domain rejection and publication gates",DepositParsingTests.rejections),
+     ("deposit parsing / callback fault prefixes",DepositParsingTests.faults),
+     ("deposit parsing / malformed frames and scalar widths",DepositParsingTests.malformed),
+     ("deposit parsing / lazy payload mismatch and index admission",DepositParsingTests.lazyDispatch),
+     ("deposit parsing / generic capability composition",DepositParsingTests.stages),
+     ("deposit construction / ordered reconstruction and partial publication",DepositConstructionTests.transcript),
+     ("deposit construction / signed and header-window boundaries",DepositConstructionTests.boundaries),
+     ("deposit construction / callback failure prefixes",DepositConstructionTests.exceptions),
+     ("deposit construction / candidate recovery and fatal exception preservation",DepositConstructionTests.recovery),
+     ("deposit construction / malformed callback replies",DepositConstructionTests.malformed),
+     ("deposit construction / payload equality precedes DSL and effects",DepositConstructionTests.lazyDispatch),
+     ("deposit construction / generic capability stage composition",DepositConstructionTests.stages),
+     ("parent prelude / ordered messages, duplicates, hash order and M8 rejection",ParentBlockTests.preludeMessages),
+     ("parent prelude / callback failure prefixes",ParentBlockTests.preludeFaults),
+     ("parent prelude / admission priority and safe snapshots",ParentBlockTests.preludeAdmission),
+     ("parent prelude / exact M8 encoding",ParentBlockTests.preludeM8),
+     ("parent prelude / payload equality precedes DSL and effects",ParentBlockTests.preludeLazy),
+     ("parent prelude / malformed snapshots and hash replies",ParentBlockTests.preludeMalformed),
+     ("parent block / generic capability stage ordering and short circuit",ParentBlockTests.blockStages),
+     ("parent block / payload equality precedes DSL and effects",ParentBlockTests.blockLazy),
+     ("parent block / complete grouped workflow and publication order",ParentBlockTests.blockWhole),
+     ("parent block / native exception prefixes",ParentBlockTests.blockFaults),
+     ("parent block / malformed callback replies",ParentBlockTests.blockMalformed),
+     ("parent block / domain rejection stops later stages",ParentBlockTests.blockRejections),
+     ("parent block / M5 parsing and block scoped M6 policy",ParentBlockTests.blockTreasury),
+     ("CTIP ownership / balance checks, duplicate rejection and order",ctipOwnersWorkflowParity),
+     ("CTIP spends / duplicate tracking and indexed effects",ctipSpendsWorkflowParity),
+     ("CTIP outputs / active treasury validation and insertion ordering",ctipOutputsWorkflowParity),
+     ("CTIP replacements / lazy checks and exact early exit",ctipReplacementsWorkflowParity),
+     ("entry traversal / exact count, lazy empty and unchanged errors",repeatEntriesParity),
+     ("CTIP changes / value branching and publication order",ctipChangesWorkflowParity),
+     ("coinbase collection / ordered duplicate rejection and publication",coinbaseWorkflowParity),
+     ("BMM typed submission / retries, caps, parent recheck and publication",bmmSubmissionWorkflow),
+     ("M4 repeat / inactive, missing, unchanged and published votes",m4RepeatWorkflowParity),
+     ("M8 acceptance / deadline, recognition, commitment and parent order",m8AcceptanceWorkflowParity),
+     ("M2 activation / votes, windows, mutations and short-circuiting",m2ProposalWorkflowParity),
+     ("M4 mode / lazy slot lookup and full-width counts",m4ModeWorkflowParity),
+     ("M3 proposal / first duplicate and ordered publication",m3ProposalWorkflowParity),
+     ("M6 id / ordered checks, bounded sum and fee",m6IdWorkflowParity),
+     ("active slots / sorted multiset and bounded publication",activeSlotsParity),
+     ("block publication / admission and optional output order",blockPublishWorkflowParity),
+     ("slot pruning / occupancy and ordered mutations",pruneSlotsWorkflowParity),
+     ("M6 withdrawal / ordered guards and publication",m6WithdrawalWorkflowParity),
+     ("Treasury transaction / legacy rule composition, fault prefixes and effects",treasuryTransactionParity),
+     ("Treasury transaction / invalid modes, null callback and negative counts",treasuryTransactionBoundary),
+     ("BMM state workflow / lifecycle and source decisions preserve ordered native effects",bmmStateWorkflowParity),
+     ("M5 deposit / address-first validation and gated publication",m5DepositWorkflowParity),
+     ("replay leading workflow / duplicate identities and publication",replayLeadingParity),
+     ("replay explicit workflow / abstain, alarm and duplicate identities",replayExplicitParity),
+     ("replay alarm / batch decrement, no-op and output canaries",replayAlarmParity),
+     ("replay upvote / batch parity, saturation and output canaries",replayUpvoteParity),
+     ("raw deposit match / preflight and rejection ordering",rawDepositMatchParity),
+     ("match scan / ordered counting and failure short-circuit",matchScanParity),
+     ("deposit treasury / exact delta without signed overflow",treasuryDeltaParity),
+     ("reported effects / lazy mapping and terminal rejection",reportedEffects),
+     ("ordered facts / rejection codes, wide status and lazy tails",orderedFactsParity),
+     ("live deposit / index preflight and ordered verification",liveVerifyWorkflow),
+     ("deposit evidence / preflight, ordered effects and lazy tails",evidenceBuildWorkflow),
+     ("child monitor / drain, reap, cancellation, deadline and polling order",childMonitorWorkflow),
+     ("child termination grace / deadline, reaping and nonblocking drain order",childGraceWorkflow),
+     ("child reaping / interrupted waits, already reaped and native error ordering",childReapWorkflow),
+     ("child output / interrupted reads, EOF, truncation and native error ordering",childDrainWorkflow),
+     ("wallet parent dust / uint32 sizing and malformed ABI",walletParentDust),
+     ("wallet native guards / complete policy table and malformed ABI",walletNativeGuards),
+     ("deposit broadcast / branch table and malformed replies",depositBroadcastTransitions),
+     ("enforcer TLS / ordered fail-closed configuration",grpcConfigTransitions),
+     ("enforcer TLS / endpoint facts and optional argument short circuit",grpcEndpointAdmission),
+     ("enforcer request / fail before process execution",grpcRequestTransitions),
+     ("enforcer request / length admission boundaries",grpcRequestAdmission),
+     ("enforcer executable / platform and permission ordering",grpcExecutableTransitions),
+     ("RPC server / ordered loopback checks",rpcServerTransitions),
+     ("RPC binds / raw facts, lazy loopback check and first invalid binding",rpcBindAdmission),
+     ("credentials / platform, ownership and open ordering",tlsCredentialTransitions),
+     ("enforcer argument plan / byte-preserving direct argv",grpcArgumentPlan),
+     ("enforcer argument plan / rejection precedence",grpcArgumentRejections),
+     ("enforcer argument plan / FFI canaries",grpcPlanFfiBounds),
+     ("enforcer text admission / bytes, scheme and size",grpcTextAdmission),
+     ("enforcer text admission / null and oversized ABI",grpcTextBounds),
+     ("withdrawal preflight / fail before submission",withdrawalPreflightTransitions),
+     ("native withdrawal submission / exactly-once send and guarded result",nativeWithdrawalSubmissionOrder),
+     ("withdrawal preflight / lazy individual facts and faults",withdrawalPreflightOrder),
+     ("replay workflows / exact initial action domain",replayInitialActions),
+     ("configured sidechain slot / signed bounds and exact identity",configuredSlotPolicy),
+     ("BMM wait errors / byte-substring parity and ABI bounds",definitiveWaitError),
+     ("BMM duplicate requests / byte-substring parity and ABI bounds",duplicateRequest),
+     ("explicit amount accumulation / non-wrapping bounds",amountSumPolicy),
+     ("wallet balance / nonnegative non-wrapping total",walletBalanceTotal),
+     ("deposit predecessor / positive sequence and signed boundaries",depositPreviousSequence),
+     ("deposit broadcast messages / byte-exact recognition and ABI bounds",depositBroadcastMessage),
+     ("work bid admission / pricing reuse, lazy rate and output canaries",workBidAdmission),
+     ("transaction total modes and unavailable parent rejection",transactionAdmissionModes),
+     ("header layout / version bits, field selection and ABI bounds",headerLayoutPolicy),
+     ("default wallet / load before missing-only create",defaultWalletTransitions),
+     ("deposit preflight / full-width signed amounts and bounds",depositPreflightBounds),
+     ("native deposit import / authentication before nested sponsorship",depositNativeImportTransitions),
+     ("deposit import / authenticated witness sequencing",depositImportTransitions),
+     ("deposit sponsorship / sequencing and malformed replies",depositSponsorshipTransitions),
+     ("deposit satoshis / parsing branch table and malformed replies",depositSatoshiTransitions),
+     ("wallet bundle admission / reservation and identity",walletBundleAdmission),
+     ("six-confirmation boundary",sixConfirmations), ("withdrawal script round trip",scriptRoundTrip),
+     ("noncanonical withdrawal script rejection",scriptMutations), ("M6 reference round trip",referenceRoundTrip),
+     ("M6 allocation preflight / old C++",legacyFrameParity), ("fee bounds",feeBounds),
+     ("byte ABI capacity and canaries",byteAbi), ("explicit burn output round trip / blinded rejection",outputRoundTrip),
+     ("M6 round trip / replay and shape rejection",m6RoundTrip),
+     ("deposit witness formats / old C++",depositWitnessParity),
+     ("deposit recipient policy / old C++",depositOutputParity),
+     ("class-constrained dispatch / all payload pairs",dispatchMatrix),
+     ("mismatched dispatch never evaluates payload",mismatchIsLazy),
+     ("typed withdrawal dispatch / all ABI tags",withdrawalDispatch),
+     ("ELMTP tagged parent / canonicality and partial publication",taggedParentParity),
+     ("BMM commitment selection / callback order / frozen native rules",bmmCommitmentParity),
+     ("BMM retarget boundaries and timespan clamps",bmmRetargetParity),
+     ("BMM retarget workflow / native parity, lazy reads and publication",bmmRetargetWorkflowParity),
+     ("BMM upper-middle median / unsigned times",bmmMedianParity),
+     ("BMM storage / ordered effects and height normalization",bmmStoreParity),
+     ("BMM encoding / ordered native primitives",bmmEncodingParity),
+     ("BMM target scaling / independent byte arithmetic and canaries",bmmScaleParity),
+     ("BMM fingerprint / frozen encoding and short circuit",bmmFingerprintParity),
+     ("BMM fingerprint finalization / force bytes before return",fingerprintFinalization),
+     ("BMM activation preflight / private bounds / public ancestry",bmmActivationParity),
+     ("signet extraction callback transcript / native rules",signetExtractionParity),
+     ("post-Refl signet orchestration / reusable capabilities",property signetCapabilities),
+     ("BMM signature hash mode plan / frozen native branches",bmmSignatureParity),
+     ("Bitcoin signature workflow / class dispatch and exact native-effect prefixes",bitcoinSignatureWorkflow),
+     ("signet validation / frozen control flow and short-circuit trace",signetValidationParity),
+     ("BMM proof and state codecs / frozen native guards",bmmCodecParity),
+     ("BMM traversal / frozen loop and short-circuit transcript",bmmTraversalParity),
+     ("BMM advancement / native wrap, retarget, history and ABI canaries",bmmAdvanceParity),
+     ("BMM wrapper / ordered short-circuit transcript",bmmWrapperParity),
+     ("BMM state source / corrupt storage before fallback",bmmStateSourceParity),
+     ("BMM connect/disconnect gates / frozen branch rules",bmmLifecycleParity),
+     ("BMM proof/effective state / failure and fallback order",bmmSelectionFlowParity),
+     ("BMM consensus/activation mode / short-circuit read order",bmmModeFlowParity),
+     ("BMM retarget/PoW flow / original branch order",bmmWorkFlowParity),
+     ("BMM extension / conditional checks and PoW ordering",bmmExtensionFlowParity),
+     ("BMM persisted decode / action order and short circuit",bmmDecodeFlowParity),
+     ("BMM native-state lookup / short circuit",bmmNativeLookupParity),
+     ("BMM state flow / frozen action trace and write attempts",bmmStateFlowParity),
+     ("BMM state runner / signed replies, phases and ABI faults",bmmStateRunBoundaries),
+     ("BMM state runner / long nonce traversal",bmmStateRunLong),
+     ("BMM proof runner / unsigned replies, null callbacks and malformed frames",bmmProofRunBoundaries),
+     ("BMM proof runner / long traversal and publication",bmmProofRunLong),
+     ("BMM proof workflow / nested reference, effects and ABI",bmmProofWorkflow),
+     ("parent signet signature / encoding before key and split",parentSignatureFlow),
+     ("Private BMM construction / retries and publication",bmmPrivateBuildParity),
+     ("Private BMM template / integer wrap and byte order",bmmPrivateTemplateParity),
+     ("BMM preimage / field ordering and writer failures",bmmPreimageParity),
+     ("BMM signature hash actions / old branches and writer faults",bmmSignatureActionsParity),
+     ("BMM signature split / prefix and hash type",bmmSignatureBytesParity),
+     ("Signet template / fixed fields and ABI bounds",bmmSignetTemplateBounds),
+     ("BMM consensus presets / frozen values and guarded outputs",bmmPresetParity),
+     ("BMM checkpoint presets / frozen records and guarded outputs",bmmCheckpointParity),
+     ("BMM fixed identities / frozen bytes and output canaries",bmmIdentityParity),
+     ("BMM difficulty interval / signed native division and output faults",bmmIntervalParity),
+     ("BMM commitment payload / byte order and fault canaries",bmmCommitmentBytesParity),
+     ("parent commitment payload / parser-selected byte order",parentCommitmentBytes),
+     ("Signet assembly/decode / primitive order and faults",bmmSignetActionsParity),
+     ("withdrawal capability orchestration / frame before body",withdrawalCapabilities),
+     ("dispatch faults preserve ABI sentinel and output",dispatchFaults),
+     ("existential packing defers effects",deferredEffects),
+     ("direct workflows / lazy payload gates and deferred effects",lazyWorkflows),
+     ("authenticated deposit shape and accounting / old C++",authenticatedDepositParity),
+     ("authenticated deposit overflow and error priority",authenticatedDepositBounds),
+     ("deterministic deposit evidence / old C++ and callback ordering",evidenceParity),
+     ("deterministic evidence faults and early pointer rejection",evidenceFaults),
+     ("deposit inclusion / old C++ and lazy header ordering",inclusionParity),
+     ("deposit inclusion faults and bounded callbacks",inclusionFaults),
+     ("authenticated CTIP increase / old C++ and full-width amounts",ctipParity),
+     ("persisted CTIP / old C++, decode faults and callback ordering",persistedCtipParity),
+     ("CTIP script / native packing and read order",ctipScriptPacking),
+     ("Persisted CTIP workflow / old C++, cursor and decoder order",persistedCtipWorkflow),
+     ("deposit verification / original branch transcript",depositVerificationFlow),
+     ("deposit anchor / original branch transcript",depositAnchorFlow),
+     ("deposit lifecycle / original branch transcript and terminal publication",depositLifecycleFlow),
+     ("deposit parsing / original short circuit and publication order",depositParsingFlow),
+     ("CTIP input scan / ordered guards and last match",ctipInputScanFlow),
+     ("deposit authentication / ordered checks and publication",depositAuthenticationFlow),
+     ("deposit access / checkpoint claim and CTIP short circuit",depositAccessFlow),
+     ("deposit projection / shape gates and bounded output reads",depositProjectionFlow),
+     ("peg read runner / unsigned values, failure traces and invalid modes",pegReadRunnerParity),
+     ("withdrawal status / event filtering and failure order",withdrawalStatusTraversal),
+     ("L1 normalization / transition and adapter fault table",l1NormalizationTransitions),
+     ("sidechain events / transition and adapter fault table",sidechainEventTransitions),
+     ("L1 location / transition and adapter fault table",l1LocationTransitions),
+     ("peg schema / guards, widths and phase faults",pegSchemaTransitions),
+     ("parent epoch / nonzero equality and shared anchor fence",currentEpochRule),
+     ("parent replay records / frozen C++ and numeric boundaries",parentReplayRecordParity),
+     ("signed predecessor / full-width adjacency",signedPredecessorRule),
+     ("replay distance / full-width subtraction and underflow",replayDistanceRule),
+     ("nonempty bounded size / scalar ABI and full-width boundaries",nonEmptyBoundedRule),
+     ("deposit routing / format, network and malformed scalar flags",depositRoutingRule),
+     ("legacy witness shape / shallow recognition and untouched outputs",legacyWitnessShapePolicy),
+     ("parent replay constants / frozen storage contract",parentReplayConstantsFrozen),
+     ("parent cache / epoch mismatch and timeout retention",cacheExpiryRule),
+     ("resource lanes / shared overflow-safe cumulative limit",laneLimitRule),
+     ("parent rule catalog / exact versions and native schema",parentRuleCatalog),
+     ("parent replay tip / transitions and invalid snapshots",parentReplayTipTransitions),
+     ("parent replay store / status and terminal diagnostics",parentReplayStoreTransitions),
+     ("parent replay append / ordered validation and atomic commit",parentReplayAppendTransitions),
+     ("parent replay identity / preimage and terminal hash order",parentReplayIdentityTransitions),
+     ("parent replay cache / preflight and identity sequencing",parentReplayCacheTransitions),
+     ("parent replay cache / durable tip selection",parentReplayCacheLoadTransitions),
+     ("parent replay bootstrap / preimage and reconstruction transitions",parentReplayBootstrapTransitions),
+     ("parent replay boundaries / reorg preflight and terminal publication",parentReplayBoundaryTransitions),
+     ("parent replay advancement / durable ordering and loop transitions",parentReplayAdvanceTransitions),
+     ("parent replay wrappers / budget snapshot and lock transitions",parentReplayWrapperTransitions),
+     ("parent deadlines / interrupt timeout and backoff transitions",parentDeadlineTransitions),
+     ("parent milestones / guarded state and message tags",parentMilestoneTransitions),
+     ("parent messages / decoding traversal and pinned guards",parentMessageTransitions),
+     ("parent RPC parsing / short circuit and publication",parentRpcParseTransitions),
+     ("parent work / guarded targets and chainwork order",parentWorkTransitions),
+     ("parent raw headers / request decode and deadline order",parentRawHeaderTransitions),
+     ("parent median time / traversal and overflow boundaries",parentMedianTimeTransitions),
+     ("parent header metadata / lazy reads and diagnostic order",parentHeaderMetadataTransitions),
+     ("parent predecessor / guarded RPC and chainwork branches",parentPredecessorTransitions),
+     ("verified parent header / request and publication ordering",parentVerifiedHeaderTransitions),
+     ("parent block transactions / scan and periodic deadline order",parentBlockTransactionTransitions),
+     ("parent block wrappers / lazy signet and output ordering",parentBlockWrapperTransitions),
+     ("parent recovery / tighter limit and stable duration",parentRecoveryTransitions),
+     ("parent signet Merkle / ordered traversal and terminal hash",parentSignetMerkleTransitions),
+     ("parent signet / lazy validation and diagnostics",parentSignetTransitions),
+     ("parent warmup / RPC ordering and failure gates",parentWarmupTransitions),
+     ("RPC reply / error priority and lazy result",rpcReplyTransitions),
+     ("RPC cookie retry / invalidation and budget gate",authRetryTransitions),
+     ("RPC timeout / deadline precedence and lazy clamping",rpcTimeoutTransitions),
+     ("signed positive / full-width bounds",signedPositiveParity),
+     ("cookie cache / nonblocking budget and protected copy",cookieCacheTransitions),
+     ("credential sources / conflicts and validation file guard",credentialTransitions),
+     ("checkpoint identity / lazy absent and present branches",checkpointIdentityTransitions),
+     ("checkpoint CTIP / frozen money and outpoint bounds",checkpointCtipParity),
+     ("activation windows / original predicate and full-width bounds",activationWindowParity),
+     ("CTIP balances / optional treasury and full-width money bounds",ctipBalanceParity),
+     ("proposal expiry / age, misses and guarded subtraction",proposalExpiryParity),
+     ("parent header MTP / lazy JSON and parse boundary",headerMtpTransitions),
+     ("parent preflight / lazy branches and malformed replies",parentPreflightTransitions),
+     ("M8 acceptance / traversal, skip and rejection boundaries",m8AcceptanceTransitions),
+     ("coinbase messages / ordered collection and duplicate rejection",coinbaseMessagesTransitions),
+     ("proposal ACK / lazy activation and partial mutations",proposalAckTransitions),
+     ("proposal admission / lazy insert, scan and append order",proposalAdmissionTransitions),
+     ("M4 voting / saturation, competing downvotes and alarm effects",m4VoteTransitions),
+     ("M4 leader / ordered scan, fifty-vote gap and guarded submission",m4LeaderTransitions),
+     ("M4 explicit/repeat / skip, guards and effective publication",m4DispatchTransitions),
+     ("expiry loops / lazy checks, errors and iterator transitions",expiryTransitions),
+     ("CTIP scans / ownership, deadlines and duplicate spends",ctipScanTransitions),
+     ("CTIP outputs / lazy script, value and replacement checks",ctipOutputTransitions),
+     ("CTIP changes / old-value selection and ordered publication",ctipChangeTransitions),
+     ("M5 deposits / validation, CTIP updates and optional mint record",m5DepositTransitions),
+     ("M6 withdrawals / approval gates and ordered treasury mutation",m6WithdrawalTransitions),
+     ("replay finish / lazy slot pruning and output publication",replayFinishTransitions),
+     ("M6 identity / payout loop, serialization and publication order",m6IdTransitions),
+     ("M4 mode / validation and active-slot traversal",m4ModeTransitions),
+     ("snapshot membership / admission and guarded lookup",snapshotMembershipTransitions),
+     ("snapshot epochs / signed slots and full-width generations",snapshotEpochParity),
+     ("cache epoch inequality / full-width generations",cacheEpochParity),
+     ("signed height windows / no overflow or narrowing",signedHeightWindowParity),
+     ("cache capacity / full-width unsigned sizes",cacheCapacityParity),
+     ("parent probe metadata / ordered parsing and status",parentProbeMetadataTransitions),
+     ("BMM edge recheck / mismatch-only invalidation",bmmEdgeRecheckTransitions),
+     ("BMM cache preflight / budget locking and invalidation",bmmCachePreflightTransitions),
+     ("BMM cache hit / cheap rejection and exact publication",bmmCacheHitTransitions),
+     ("BMM cache key / lazy hash and slot match",bmmCacheKeyTransitions),
+     ("untrusted BMM admission / indexed evidence only",bmmAdmissionTransitions),
+     ("BMM probe result / rejection cache ordering",bmmProbeResultTransitions),
+     ("BMM publication / partial output and cache ordering",bmmPublicationTransitions),
+     ("BMM successor / preparation and chainwork ordering",bmmSuccessorTransitions),
+     ("authenticated JSON / transport admission and output clearing",authenticatedJsonTransitions),
+     ("BMM bid / preflight and transaction id admission",bmmBidTransitions),
+     ("anchor reconciliation / orphaning versus unavailability",anchorReconcileTransitions),
+     ("block contexts / reset, preflight and guarded publication",blockContextTransitions),
+     ("parent contexts / shared tip guards and publication",parentContextTransitions),
+     ("withdrawal lookup / ordered invalidation and publication",withdrawalLookupTransitions),
+     ("deposit preflight / diagnostics and guarded identity",depositPreflightTransitions),
+     ("confirmed deposit / lazy state and RPC ordering",confirmedDepositTransitions),
+     ("parent message parser / original C++ and ABI canaries",parentMessageParity),
+     ("M8 parser / ordered guarded extraction",m8ParseTransitions),
+     ("replay message dispatch / lazy handler selection",messageDispatchTransitions),
+     ("replay each / shared short-circuiting traversal",eachTransitions),
+     ("parent bootstrap / versioned catalog and activation height",parentBootstrapCatalog),
+     ("parent lifecycle / generated nonthrowing action plans",parentLifecyclePlans),
+     ("event identity / old C++ bytes and output canaries",eventIdentityParity),
+     ("event layout / frozen schema and ABI canaries",eventLayoutAbi),
+     ("CTIP state and anchor phases / old C++ and invalid phases",stateRuleParity),
+     ("legacy claim / old C++ and full-width values",legacyClaimParity),
+     ("destination selection / old C++ and callback ordering",destinationParity),
+     ("checkpoint ABI bounds, immutable lookup and output canaries",checkpointAbi),
+     ("live evidence / old C++, ordered field reads and parser faults",liveEvidenceParity),
+     ("live evidence / synchronous isolation and initialized callbacks",liveSynchronousLifecycle),
+     ("declaration and deposit selection / old C++ and lazy read traces",selectionParity),
+     ("peg event lifecycle and amounts / old C++",pegEventParity),
+     ("withdrawal status bytes / old C++ and exact matching",withdrawalStatusParity),
+     ("BMM parent state / old C++ and interval truncation",bmmStateParity),
+     ("BMM header preflight/final phases / old C++",bmmHeaderParity),
+     ("BMM proof bounds and authentication / old C++",bmmProofParity)]
+  unless (all isSuccess results) exitFailure

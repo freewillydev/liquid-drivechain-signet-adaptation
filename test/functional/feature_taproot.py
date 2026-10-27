@@ -1246,36 +1246,6 @@ def spenders_taproot_active():
     # tempoarily removed because random bit errors will cause differt sorts of Simplicity errors.
     # add_spender(spenders, "simplicity/iden", tap=tap, leaf="simplicity_iden", simplicity_program=bytes.fromhex("20"), failure={"simplicity_program": bitflipper(bytes.fromhex("20"))}, **ERR_SIMPLICITY_BITSTREAM_ILLEGAL_PADDING)
 
-    # Optional private-E2E lane: execute a real externally generated SP1 proof
-    # through the complete Taproot -> Simplicity -> ECX jet -> Rust verifier
-    # consensus path. It is absent from normal upstream test runs.
-    smoke_program = os.getenv("ECX_SP1_SMOKE_PROGRAM")
-    smoke_annex = os.getenv("ECX_SP1_SMOKE_ANNEX")
-    smoke_cmr = os.getenv("ECX_SP1_SMOKE_CMR")
-    if smoke_program or smoke_annex or smoke_cmr:
-        assert smoke_program and smoke_annex and smoke_cmr
-        with open(smoke_program, "rb") as file:
-            program = file.read()
-        with open(smoke_annex, "rb") as file:
-            annex = file.read()
-        assert annex[:1] == bytes([ANNEX_TAG])
-        tap = taproot_construct(
-            pubs[0],
-            [("ecx_sp1_real_proof", bytes.fromhex(smoke_cmr), LEAF_VERSION_TAPSIMPLICITY)],
-        )
-        add_spender(
-            spenders,
-            "simplicity/ecx-sp1-real-proof",
-            tap=tap,
-            leaf="ecx_sp1_real_proof",
-            simplicity_program=program,
-            simplicity_witness=b"",
-            annex=annex,
-            standard=True,
-            failure={"annex": annex[:-1] + bytes([annex[-1] ^ 1])},
-            err_msg="Assertion failed",
-        )
-
     # == Legacy tests ==
 
     # Also add a few legacy spends into the mix, so that transactions which combine taproot and pre-taproot spends get tested too.

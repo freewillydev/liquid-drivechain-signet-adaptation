@@ -3,7 +3,6 @@
 # file COPYING or https://opensource.org/license/mit/.
 
 include(AddWindowsResources)
-include(DrivechainVerifiers)
 
 configure_file(${PROJECT_SOURCE_DIR}/cmake/bitcoin-build-config.h.in bitcoin-build-config.h USE_SOURCE_PERMISSIONS @ONLY)
 include_directories(${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR})
@@ -112,7 +111,6 @@ target_compile_options(elementssimplicity PRIVATE
 )
 target_link_libraries(elementssimplicity
   PUBLIC
-    drivechain_verifiers
   PRIVATE
     core_interface
 )

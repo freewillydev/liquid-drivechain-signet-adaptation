@@ -388,7 +388,7 @@ instance Validation WithdrawalPayout where
 -- Constructor order is the version-1 C++ WithdrawalOp ABI (one-based).
 data WithdrawalAction = BuildScript | ParseScript | BuildReference | ParseReference
   | LegacyFrame | DecodeFee | EncodeFee | BuildOutput | ParseOutput | BuildM6 | ParseM6
-  | ExtractEthereumClaim | StateAnchor | WalletBundle | WalletAnchor | StateMarker | WalletTransport
+  | Reserved12 | StateAnchor | WalletBundle | WalletAnchor | StateMarker | WalletTransport
   | RpcFee | EventPolicy | BundleAdmission | NativeAmount | ParentDust | NativeGuard | NativeGuardResult | InputsCommitment | NativePayout | NativeBurnPlan | NativeOutputSelection | JournalAdmission | ParentPolicy | RpcAdmission | SubmissionPolicy | ProofBounds | JournalLegacy | JournalIdentity
   deriving (Bounded, Enum, Eq, Show)
 data WithdrawalRequest = WithdrawalRequest Int64 B.ByteString
@@ -406,7 +406,7 @@ instance WithdrawalFrame WithdrawalRequest where
     ParseOutput -> size >= 108
     BuildM6 -> size >= 93
     ParseM6 -> size >= 69
-    ExtractEthereumClaim -> size == 116
+    Reserved12 -> False
     StateAnchor -> size == 132
     WalletBundle -> size == 25
     WalletAnchor -> size == 132
@@ -739,30 +739,6 @@ withdrawal op maximumMoney input
       execute (WithdrawalRequest maximumMoney input) withdrawRules (toEnum (fromIntegral op - 1))
   | otherwise = error "invalid withdrawal FFI request"
 
-extractEthereumClaim :: B.ByteString -> Result
-extractEthereumClaim input
-  | scale == 0 = error "invalid withdrawal claim scale"
-  | B.length script /= 2 + fromIntegral (B.index input 48) ||
-    B.take 2 script /= B.pack [106,B.index input 48] ||
-    B.take 4 (B.drop 2 script) /= B.take 4 (B.drop 44 input) ||
-    fromIntegral (B.index script 6) /= readLE (B.take 4 (B.drop 40 input)) = pure B.empty
-  | explicit <= 0 || amount == 0 || amount > maximumAmount ||
-    amount > maxBound `div` scale || amount * scale /= fromIntegral explicit = pure B.empty
-  | count > maxBound - first = Left "USDD withdrawal claim index overflow"
-  | B.all (==0) vault || B.all (==0) recipient = pure B.empty
-  | otherwise = pure (wordLE 8 amount <> vault <> recipient)
-  where
-    word offset = readLE (B.take 8 (B.drop offset input))
-    first = word 0
-    count = word 8
-    explicit = fromIntegral (word 16) :: Int64
-    scale = word 24
-    maximumAmount = word 32
-    script = B.drop 49 input
-    amount = readBE (B.drop 59 script)
-    vault = B.take 32 (B.drop 7 script)
-    recipient = B.take 20 (B.drop 39 script)
-
 encodeRpcResult :: Either (Int32, String) B.ByteString -> B.ByteString
 encodeRpcResult = either (\(code,message) -> wordLE 4 (fromIntegral code) <> C.pack message) (wordLE 4 0 <>)
 
@@ -809,7 +785,7 @@ instance WithdrawalRule WithdrawalRequest where
     ParseOutput -> parseOutput maximumMoney input
     BuildM6 -> buildM6 maximumMoney input
     ParseM6 -> parseM6 maximumMoney input
-    ExtractEthereumClaim -> extractEthereumClaim input
+    Reserved12 -> error "retired withdrawal operation"
     StateAnchor -> Right (B.pack [1,24] <> B.take 32 (B.drop 4 input) <>
                          B.reverse (B.take 4 input) <> B.drop 36 input)
     WalletBundle -> do

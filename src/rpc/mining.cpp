@@ -19,7 +19,6 @@
 #include <deploymentinfo.h>
 #include <deploymentstatus.h>
 #include <drivechain_bmm.h>
-#include <ecx_exchange_state.h>
 #include <interfaces/mining.h>
 #include <key_io.h>
 #include <mainchainrpc.h>
@@ -426,34 +425,14 @@ static RPCHelpMan generateblock()
         block.vtx.insert(block.vtx.end(), txs.begin(), txs.end());
         RegenerateCommitments(block, chainman);
 
-        // CreateNewBlock prepared ECX roots for its original transaction set.
-        // generateblock appends raw transactions afterwards, so recompute the
-        // additive ECX commitment before validation while retaining the exact
-        // authenticated parent height selected by the block assembler.
         CBlockIndex* previous = chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
-        std::string exchange_error;
+        if (!previous) throw JSONRPCError(RPC_INTERNAL_ERROR, "generated block's previous index is unavailable");
+        utreexo::Prepare(block, previous, chainman.ActiveChainstate().CoinsTip(),
+            chainman.GetParams(), *chainman.m_blockman.m_block_tree_db);
         BlockValidationState state;
-        const auto status = drivechain::haskell::ParentReplayStore(
-            drivechain::haskell::ReplayStoreFlow::RPC_BLOCK_PREPARATION,
-            [&](uint32_t step) EXCLUSIVE_LOCKS_REQUIRED(cs_main) -> uint32_t {
-            switch (step) {
-            case 1: return previous != nullptr;
-            case 2: return Params().GetConsensus().elements_mode;
-            case 3:
-                return ecx::PrepareExchangeStateHeader(block, previous, chainman.ActiveChainstate().CoinsTip(),
-                    previous->nHeight + 1, exchange_error, ecx::LayerTwoLabsExchangeConsensus(),
-                    block.ecxParentHeight == 0 ? std::nullopt : std::optional<uint64_t>{block.ecxParentHeight});
-            case 4:
-                return TestBlockValidity(state, chainman.GetParams(), chainman.ActiveChainstate(),
-                    block, previous, /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/false, /*allow_incomplete_candidate=*/true);
-            default: throw std::logic_error("invalid generated-block preparation action");
-            }
-        });
-        switch (status) {
-        case 0: break;
-        case 1: throw JSONRPCError(RPC_INTERNAL_ERROR, "generated block's previous index is unavailable");
-        case 2: throw JSONRPCError(RPC_VERIFY_ERROR, strprintf("ECX header preparation failed: %s", exchange_error));
-        case 3: throw JSONRPCError(RPC_VERIFY_ERROR, strprintf("TestBlockValidity failed: %s", state.ToString()));
+        if (!TestBlockValidity(state, chainman.GetParams(), chainman.ActiveChainstate(), block,
+                previous, /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/false, /*allow_incomplete_candidate=*/true)) {
+            throw JSONRPCError(RPC_VERIFY_ERROR, strprintf("TestBlockValidity failed: %s", state.ToString()));
         }
     }
 
@@ -1358,68 +1337,12 @@ static RPCHelpMan getnewblockhex()
     };
 }
 
-static RPCHelpMan getsimplicityinfo()
-{
-    return RPCHelpMan{"getsimplicityinfo",
-        "Return the exact build/runtime identity of the ECX Simplicity evaluator.\n",
-        {},
-        RPCResult{RPCResult::Type::OBJ, "", "", {
-            {RPCResult::Type::BOOL, "active", "Whether an exact evaluator identity is configured"},
-            {RPCResult::Type::BOOL, "catalogueFrozen", "Whether the catalogue was compiled as a production-frozen catalogue"},
-            {RPCResult::Type::BOOL, "privateCatalogue", "Whether this is an explicitly test-only private catalogue build"},
-            {RPCResult::Type::STR_HEX, "catalogueSha256", "Exact catalogue identity, or empty when unavailable"},
-            {RPCResult::Type::STR_HEX, "programCmr", "Exact prediction-market program CMR, or empty when unavailable"},
-        }},
-        RPCExamples{HelpExampleCli("getsimplicityinfo", "") + HelpExampleRpc("getsimplicityinfo", "")},
-        [&](const RPCHelpMan&, const JSONRPCRequest&) -> UniValue {
-            bool frozen{false};
-            bool private_catalogue{false};
-            std::string catalogue;
-            std::string program_cmr;
-#ifdef ECX_SIMPLICITY_CATALOGUE_FROZEN
-#ifndef ECX_SIMPLICITY_CATALOGUE_SHA256_HEX
-#error "a frozen Simplicity catalogue build must define ECX_SIMPLICITY_CATALOGUE_SHA256_HEX"
-#endif
-            frozen = true;
-            catalogue = ECX_SIMPLICITY_CATALOGUE_SHA256_HEX;
-#ifdef ECX_PREDICTION_MARKET_PROGRAM_CMR_HEX
-            // A catalogue-enabled Elements node need not host a prediction
-            // market. Never substitute an activation covenant CMR here.
-            program_cmr = ECX_PREDICTION_MARKET_PROGRAM_CMR_HEX;
-#endif
-#endif
-#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
-            private_catalogue = true;
-#endif
-            drivechain::haskell::ParentReplayStore(drivechain::haskell::ReplayStoreFlow::EVALUATOR_SOURCE,
-                [&](uint32_t step) -> uint32_t {
-                    switch (step) {
-                    case 1: return private_catalogue;
-                    case 2: return frozen;
-                    case 3:
-                        catalogue = gArgs.GetArg("-ecxprivatesimplicitycataloguesha256", "");
-                        program_cmr = gArgs.GetArg("-ecxprivatesimplicityprogramcmr", "");
-                        return 1;
-                    default: throw std::logic_error("invalid evaluator source action");
-                    }
-                });
-            const int identity{drivechain::haskell::EvaluatorIdentity(frozen, private_catalogue, catalogue, program_cmr)};
-            UniValue result(UniValue::VOBJ);
-            result.pushKV("active", identity == 3);
-            result.pushKV("catalogueFrozen", frozen);
-            result.pushKV("privateCatalogue", private_catalogue);
-            result.pushKV("catalogueSha256", identity ? catalogue : "");
-            result.pushKV("programCmr", identity ? program_cmr : "");
-            return result;
-        }};
-}
-
 static RPCHelpMan getbmmconsensuscontext()
 {
     return RPCHelpMan{"getbmmconsensuscontext",
         "Return the active sidechain tip's authenticated prior-parent context.\n"
-        "Native Alpha uses its validated P-to-Q drivechain anchor; other networks use\n"
-        "the ECX BMM state coin. This does not activate ECX or choose a future block's parent.\n",
+        "Native Drivechain uses its validated P-to-Q anchor; other supported networks use\n"
+        "the authenticated BMM state coin. This does not choose a future block's parent.\n",
         {},
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::NUM, "sidechainheight", "Active sidechain height"},
@@ -1595,82 +1518,6 @@ static RPCHelpMan submitbmmworkbid()
         }};
 }
 
-#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
-static RPCHelpMan generateprivatebmmblock()
-{
-    return RPCHelpMan{"generateprivatebmmblock",
-        "\nGenerate exactly one consensus-valid synthetic-BMM block. Available only in a private-catalogue build with -ecxprivatebmmcheckpoint.\n",
-        {},
-        RPCResult{RPCResult::Type::STR_HEX, "blockhash", "accepted sidechain block hash"},
-        RPCExamples{HelpExampleCli("generateprivatebmmblock", "")},
-        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
-            ChainstateManager* chainman{nullptr};
-            const NodeContext* node{nullptr};
-            drivechain::BmmL1State previous;
-            std::unique_ptr<CBlockTemplate> block_template;
-            drivechain::BmmProof proof;
-            std::string proof_error;
-            std::string error;
-            const bool accepted = drivechain::haskell::ParentReplayEach(std::array{1, 2, 3, 4, 5, 6, 7}, [&](int step) {
-                switch (step) {
-                case 1:
-                    error = "private BMM checkpoint mode is disabled";
-                    return gArgs.GetBoolArg("-ecxprivatebmmcheckpoint", false);
-                case 2: {
-                    chainman = &EnsureAnyChainman(request.context);
-                    node = &EnsureAnyNodeContext(request.context);
-                    LOCK(cs_main);
-                    std::string state_error;
-                    const bool valid = drivechain::GetEffectiveBmmState(
-                        chainman->ActiveChainstate().CoinsTip(), chainman->ActiveChain().Tip(), previous, state_error);
-                    error = "cannot obtain private BMM state: " + state_error;
-                    return valid;
-                }
-                case 3: {
-                    BlockAssembler::Options options;
-                    ApplyArgsManOptions(gArgs, options);
-                    options.coinbase_output_script = CScript() << OP_TRUE;
-                    options.commit_scripts = {CScript() << OP_RETURN << std::vector<unsigned char>(previous.block_hash.begin(), previous.block_hash.end())};
-                    options.authenticated_parent_height = static_cast<uint64_t>(previous.height) + 1;
-                    block_template = BlockAssembler(chainman->ActiveChainstate(), node->mempool.get(), options).CreateNewBlock();
-                    error = "private BMM block template is unavailable";
-                    return drivechain::haskell::ParentReplayAll<2>({
-                        [&] { return bool(block_template); },
-                        [&] { return block_template->block.HasBmmProof(); },
-                    });
-                }
-                case 4: {
-                    LOCK(cs_main);
-                    unsigned int extra_nonce = 0;
-                    IncrementExtraNonce(&block_template->block, chainman->ActiveChain().Tip(), extra_nonce);
-                    utreexo::Prepare(block_template->block, chainman->ActiveChain().Tip(),
-                        chainman->ActiveChainstate().CoinsTip(), chainman->GetParams(),
-                        *chainman->m_blockman.m_block_tree_db);
-                    return true;
-                }
-                case 5: {
-                    node::AppendOpTrueBlockWitness(block_template->block);
-                    const bool valid = drivechain::BuildPrivateE2eBmmProof(previous, block_template->block.GetBmmCriticalHash(), proof, proof_error);
-                    error = "cannot build private BMM proof: " + proof_error;
-                    return valid;
-                }
-                case 6: {
-                    const bool valid = drivechain::AttachBmmProof(block_template->block, proof, proof_error);
-                    error = "cannot build private BMM proof: " + proof_error;
-                    return valid;
-                }
-                case 7:
-                    error = "private BMM block was rejected";
-                    return chainman->ProcessNewBlock(std::make_shared<const CBlock>(block_template->block),
-                        /*force_processing=*/true, /*min_pow_checked=*/true, nullptr);
-                default: throw std::logic_error("invalid private BMM generation action");
-                }
-            });
-            if (!accepted) throw JSONRPCError(RPC_MISC_ERROR, error);
-            return block_template->block.GetHash().GetHex();
-        }};
-}
-#endif
 
 static RPCHelpMan combineblocksigs()
 {
@@ -2064,12 +1911,8 @@ void RegisterMiningRPCCommands(CRPCTable& t)
         {"generating", &finalizecompactblock},
         {"mining", &testproposedblock},
 
-        {"blockchain", &getsimplicityinfo},
         {"blockchain", &getbmmconsensuscontext},
         {"mining", &submitbmmworkbid},
-#ifdef ECX_SIMPLICITY_PRIVATE_E2E_CATALOGUE
-        {"hidden", &generateprivatebmmblock},
-#endif
         {"mining", &submitblock},
         {"hidden", &generate},
         {"hidden", &generatetoaddress},

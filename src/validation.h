@@ -466,9 +466,6 @@ public:
 /** Context-independent validity checks */
 bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true, bool fCheckMerkleRoot = true);
 
-/** Enforce the deterministic per-block USDD SP1 proof-verification lane. */
-bool CheckUsddSp1AnnexBlockResources(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams);
-
 /** Check a block is completely valid from start to finish (only works on top of our current best block) */
 bool TestBlockValidity(BlockValidationState& state,
                        const CChainParams& chainparams,

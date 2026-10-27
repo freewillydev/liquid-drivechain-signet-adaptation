@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Generate internal typed adapters and six family exports from HS signatures.
+"""Generate internal typed adapters and four family exports from HS signatures.
 
 abi.def is append-only within each section. Section tags and operation indices
-are stable within the private v2 ABI; new sections must be appended to a family.
+are stable within the private v3 ABI; new sections must be appended to a family.
 Generated adapters have internal linkage, not legacy public C ABI symbols.
 """
 import argparse
@@ -15,8 +15,6 @@ FAMILIES = {
     "parent": ("parent_replay",),
     "bmm": ("bmm", "bmm_proof", "bmm_codec", "bmm_state"),
     "peg": ("deposit", "deposit_state", "deposit_evidence", "withdrawal"),
-    "exchange": ("exchange", "exchange_codec", "exchange_state", "exchange_admission"),
-    "usdd": ("usdd",),
 }
 
 
@@ -63,11 +61,11 @@ def generate():
     if len(sections) != len(set(sections)) or set(sections) != domains.keys():
         raise ValueError("ABI families must cover every section exactly once")
     for family, sections in FAMILIES.items():
-        export = f'elements_hs_{family}_api_v2'
+        export = f'elements_hs_{family}_api_v3'
         hs += [f'foreign export ccall "{export}" {family} :: Entry',
                f'{family} :: Entry', f'{family} = dispatchFamily']
         counts = ', '.join(str(len(domains[section])) for section in sections)
-        cpp += [f'static constexpr uint32_t elements_hs_{family}_sections_v2[]{{{counts}}};']
+        cpp += [f'static constexpr uint32_t elements_hs_{family}_sections_v3[]{{{counts}}};']
         for tag, section in enumerate(sections):
             rows = domains[section]
             if tag >= 65536 or len(rows) > 65536:
@@ -80,8 +78,8 @@ def generate():
                 signature = f'{ret}(' + ', '.join(ctype(t) for t in types[:-1]) + ')'
                 cpp += [f'static constexpr elements_abi::Binding<{export}, {(tag << 16) | opcode}, {signature}> {symbol}{{}};']
         hs += ['  ]', '']
-    cpp += ['static constexpr std::array elements_hs_families_v2{',
-            ',\n'.join(f'    std::pair{{&elements_hs_{family}_api_v2, std::span<const uint32_t>{{elements_hs_{family}_sections_v2}}}}' for family in FAMILIES), '};']
+    cpp += ['static constexpr std::array elements_hs_families_v3{',
+            ',\n'.join(f'    std::pair{{&elements_hs_{family}_api_v3, std::span<const uint32_t>{{elements_hs_{family}_sections_v3}}}}' for family in FAMILIES), '};']
     return {'DomainABI.hs': '\n'.join(hs), 'domain_abi.h': '\n'.join(cpp)}
 
 

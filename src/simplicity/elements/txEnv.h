@@ -181,20 +181,14 @@ typedef struct assetIssuance {
  * and 'pegin' contains the hash of the parent chain's genesis block.
  */
 typedef struct sigInput {
-  const unsigned char* annex;
-  uint_fast32_t annexLen;
   sha256_midstate annexHash;
-  /* Exact bounded Taproot annex retained for the pinned SP1 verifier jet. */
-  const unsigned char* fullAnnex;
   sha256_midstate pegin;
   sha256_midstate scriptSigHash;
   outpoint prevOutpoint;
   utxo txo;
   uint_fast32_t sequence;
   assetIssuance issuance;
-  uint_fast32_t fullAnnexLen;
   bool hasAnnex;
-  bool hasFullAnnex;
   bool isPegin;
 } sigInput;
 
@@ -267,36 +261,6 @@ typedef struct txEnv {
   const elementsTapEnv* taproot;
   sha256_midstate genesisHash;
   sha256_midstate sigAllHash;
-  sha256_midstate priorActiveExchangeStateRoot;
-  bool priorActiveExchangeStateRootPresent;
-  sha256_midstate priorActiveForcedInboxRoot;
-  bool priorActiveForcedInboxRootPresent;
-  sha256_midstate priorActiveDepositInboxRoot;
-  bool priorActiveDepositInboxRootPresent;
-  uint_fast64_t priorActiveForcedProcessedCursor;
-  uint_fast64_t priorActiveDepositProcessedCursor;
-  sha256_midstate currentBmmParentBlockHash;
-  uint_fast64_t currentBmmParentHeight;
-  uint_fast64_t currentBmmParentMtp;
-  bool currentBmmParentPresent;
-  sha256_midstate bondV2ConfigurationHash;
-  sha256_midstate bondV2AssetId;
-  sha256_midstate bondV2DeploymentCommitment;
-  sha256_midstate bondV2TransitionCmr;
-  sha256_midstate bondV2CollateralVaultScriptSha256;
-  sha256_midstate bondV2CollateralVaultCmr;
-  sha256_midstate bondV2InsuranceReserveScriptSha256;
-  sha256_midstate bondV2InsuranceReserveCmr;
-  bool bondV2IdentityPresent;
-  sha256_midstate bondV2IncrementalActivationCmr;
-  sha256_midstate incrementalSuccessorTransitionCmr;
-  bool bondV2IncrementalActivationIdentityPresent;
-  sha256_midstate priorActiveBondInboxRoot;
-  uint_fast64_t priorActiveBondInboxCount;
-  uint_fast64_t currentSidechainHeight;
-  bool bondV2ProjectionPresent;
-  ecx_sp1_groth16_verify_fn verifySp1Groth16;
-  void* verifySp1Groth16Context;
   uint_fast32_t ix;
   uint_fast64_t bmmParentMtp;
   bool bmmParentMtpPresent;
@@ -314,7 +278,7 @@ typedef struct txEnv {
  *               ix < tx->numInputs
  */
 txEnv simplicity_elements_build_txEnv(const elementsTransaction* tx, const elementsTapEnv* taproot,
-                                      const sha256_midstate* genesisHash, const ecx_prior_active_root_env* ecxRoot, uint_fast32_t ix,
+                                      const sha256_midstate* genesisHash, uint_fast32_t ix,
                                       bool bmmParentMtpPresent, uint_fast64_t bmmParentMtp,
                                       bool priorActiveBmmParentCheckpointPresent,
                                       const unsigned char priorActiveBmmParentCheckpoint[80]);

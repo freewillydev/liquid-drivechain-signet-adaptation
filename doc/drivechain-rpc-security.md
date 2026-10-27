@@ -1,7 +1,8 @@
 # Secure native Drivechain RPC setup
 
-The current network is `-chain=elements`, data subdirectory `elements-betanet-slot24-v1`,
-ECX Betanet slot 24. It is not production eCash mainnet or the historical Liquid-signet chain.
+The current network is `-chain=elements`, data subdirectory `elements-native-v1`,
+a fresh child targeting ECX Betanet slot 24. It requires its own proposal activation;
+it is not the existing Betanet child or production eCash mainnet.
 See the [generated identity table](drivechain-network-identity.md) and
 [identity and peg operations](drivechain-peg-operations.md).
 
@@ -31,7 +32,7 @@ containing `user:password`, and cannot be combined with cookie or inline
 credential options. Prefer the rotating cookie for direct parent access.
 Verify the frozen parent checkpoint before using funds.
 
-Elements' own authenticated JSON-RPC defaults to port 7065 and is restricted to
+Elements' own authenticated JSON-RPC defaults to port 7071 and is restricted to
 numeric loopback (IPv4 127/8 or IPv6 ::1). Use its generated cookie. Local
 `rpcauth`/static credentials remain supported for existing clients. Native
 `rest=1` is rejected because that listener bypasses RPC authentication.
@@ -119,9 +120,9 @@ data directory):
 
 ```ini
 drivechainbmmgrpcaddr=127.0.0.1:55051
-drivechainbmmgrpcca=/absolute/path/to/elements-betanet-slot24-v1/enforcer-tls/ca.pem
-drivechainbmmgrpccert=/absolute/path/to/elements-betanet-slot24-v1/enforcer-tls/elements-client.pem
-drivechainbmmgrpckey=/absolute/path/to/elements-betanet-slot24-v1/enforcer-tls/elements-client-key.pem
+drivechainbmmgrpcca=/absolute/path/to/elements-native-v1/enforcer-tls/ca.pem
+drivechainbmmgrpccert=/absolute/path/to/elements-native-v1/enforcer-tls/elements-client.pem
+drivechainbmmgrpckey=/absolute/path/to/elements-native-v1/enforcer-tls/elements-client-key.pem
 drivechainbmmgrpcauthority=enforcer.local
 ```
 
@@ -179,9 +180,9 @@ with a finite authorized balance and no automatic refill. Disabling the bidder
 cannot cancel transactions already in the parent mempool. Explicit manual bid
 RPCs still spend when requested. Keep the bidder off during read-only setup.
 
-The built-in identity also requires `acceptbetanettestprofile=1`; this acknowledges
-the [existing-proposal test limitation](betanet-slot24-test.md), not a production
-activation or spending permission. Enforcer calls fail closed at use when credentials
+The fresh child requires a matching parent proposal; see its
+[network identity](drivechain-network-identity.md). An operator option cannot
+substitute for proposal activation. Enforcer calls fail closed at use when credentials
 are invalid; this is not a guarantee of a startup TLS probe.
 A native `sendtomainchain` burn can be created without an available enforcer,
 so verify the submission path before burning coins. Explicit bundle submission
