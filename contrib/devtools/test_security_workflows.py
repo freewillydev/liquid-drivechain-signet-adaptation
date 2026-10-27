@@ -4,6 +4,7 @@
 from pathlib import Path
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -12,6 +13,17 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_security_helper_scripts_exist(self):
+        text = (ROOT / ".github/workflows/drivechain-security.yml").read_text()
+        commands = [shlex.split(line) for line in text.splitlines()
+                    if line.lstrip().startswith(("python3 ", "/usr/bin/python3 "))]
+        self.assertTrue(commands, "security workflow has no helper checks")
+        for command in commands:
+            with self.subTest(script=command[1]):
+                script = ROOT / command[1]
+                self.assertEqual(script.suffix, ".py")
+                self.assertTrue(script.is_file(), "CI references a missing helper")
+
     def test_actions_are_sha_pinned(self):
         for path in (ROOT / ".github/workflows").glob("*.yml"):
             text = path.read_text()

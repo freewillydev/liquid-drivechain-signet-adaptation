@@ -24,6 +24,6 @@ jobs:
           PYTHONDONTWRITEBYTECODE: '1'
         run: |
           python3 contrib/devtools/check_drivechain_docs.py
-          python3 contrib/devtools/test_verifier_pins.py
+          python3 contrib/devtools/test_elements_identity_refreeze.py
           /usr/bin/python3 contrib/drivechain-mtls/test_security_helpers.py
           python3 contrib/devtools/test_security_workflows.py
