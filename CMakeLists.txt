@@ -93,6 +93,10 @@ include(CMakeDependentOption)
 option(BUILD_DAEMON "Build elementsd executable." ON)
 option(BUILD_GUI "Build elements-qt executable." OFF)
 option(BUILD_CLI "Build elements-cli executable." ON)
+option(BUILD_BLUE_CURRENT "Build the bundled Elements Blue Current wallet." OFF)
+if(BUILD_BLUE_CURRENT AND BUILD_GUI)
+  message(FATAL_ERROR "Blue Current is the product wallet. Build it without the legacy Qt GUI (-DBUILD_GUI=OFF).")
+endif()
 
 option(BUILD_TESTS "Build test_elements executable." ON)
 option(BUILD_CONSENSUS_LIB "Build the public Elements consensus C library." ON)
@@ -621,6 +625,9 @@ add_subdirectory(test)
 add_subdirectory(doc)
 
 add_subdirectory(src)
+if(BUILD_BLUE_CURRENT)
+  add_subdirectory(ui/blue-current)
+endif()
 
 include(cmake/tests.cmake)
 

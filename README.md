@@ -10,6 +10,17 @@ part of this branch. The fairmint exchange is maintained on `fairmint-exchange`.
 The previous complete implementation is preserved on
 `archive/exchange-usdd-sp1-20261027`.
 
+## Wallet
+
+[Blue Current](ui/blue-current/README.md) is the bundled Elements+ wallet:
+balances, Send, Receive and wallet backup/recovery. Configure with
+`-DBUILD_BLUE_CURRENT=ON -DBUILD_GUI=OFF` to build it beside the node and CLI.
+It uses authenticated node RPC and checked network profiles, not another wallet
+implementation. Portable bundles contain no Qt or legacy terminal frontend.
+BitWindow integration uses the same wallet/node/CLI bundle and owns the daemon.
+Production installation remains gated on finalized chain identity and verified
+release artifacts; test-chain identities are not production substitutes.
+
 ## Chain Isolation
 
 This branch targets a **fresh child chain**, not an upgrade of the running

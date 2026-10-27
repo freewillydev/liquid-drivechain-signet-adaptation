@@ -1,0 +1,58 @@
+# Install as .github/workflows/blue-current.yml at the repository root to run.
+name: Blue Current platform builds
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            ghc: '9.6.7'
+          - os: macos-14
+            ghc: '9.6.7'
+          - os: windows-latest
+            ghc: '9.10.3'
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: blue-current
+    steps:
+      - uses: actions/checkout@v4
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: ${{ matrix.ghc }}
+          cabal-version: '3.16'
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsdl2-dev libglew-dev libgl1-mesa-dev xvfb libatk1.0-dev libatk-bridge2.0-dev
+      - if: runner.os == 'macOS'
+        run: brew install sdl2 glew
+      - if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-glew mingw-w64-x86_64-pkgconf
+      - if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          cygpath -w /mingw64/bin >> "$GITHUB_PATH"
+          printf 'BLUE_CURRENT_MSYS_PREFIX=%s\n' "$(cygpath -m /mingw64)" >> "$GITHUB_ENV"
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $archive=Join-Path $env:RUNNER_TEMP 'sdl-sdk.zip'
+          Invoke-WebRequest 'https://github.com/libsdl-org/SDL/releases/download/release-2.32.10/SDL2-devel-2.32.10-mingw.zip' -OutFile $archive
+          if((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -ne 'f15cff5fca62ec9381a016ef1d42a95c638cd72d2f226ba5781c76fe43dbd1ac'){throw 'SDL SDK digest mismatch'}
+          $native=Join-Path $env:RUNNER_TEMP 'blue-current-native'
+          Expand-Archive $archive $native
+          $sdk=(Join-Path $native 'SDL2-2.32.10/x86_64-w64-mingw32').Replace('\','/')
+          $pc=Join-Path $sdk 'lib/pkgconfig/sdl2.pc'
+          $text=(Get-Content $pc -Raw) -replace '(?m)^prefix=.*$',('prefix='+$sdk)
+          [IO.File]::WriteAllText($pc,$text,(New-Object Text.UTF8Encoding($false)))
+          "$sdk/bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+          "PKG_CONFIG_PATH=$sdk/lib/pkgconfig;$($env:BLUE_CURRENT_MSYS_PREFIX)/lib/pkgconfig" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+      - run: cabal update
+      - run: cabal build all --enable-tests
+      - run: cabal test wallet-behavior --test-show-details=direct

@@ -1,0 +1,12 @@
+packages: .
+optimization: False
+shared: False
+library-for-ghci: False
+
+source-repository-package
+  type: git
+  location: https://github.com/fjvallarino/monomer.git
+  tag: 5c6239365e3a37686b6547bc91c29270ae5487c6
+
+package nanovg
+  flags: +stb_truetype
