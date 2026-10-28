@@ -25,6 +25,9 @@ DEFAULT_INFO = {
     "parent_chain_has_pow": True,
     "enforce_pak": False,
     "pegin_confirmation_depth": 8,
+    "pegin_confirmation_depth_historical": 8,
+    "pegin_confirmation_depth_current_block": 8,
+    "pegin_confirmation_depth_validation_height": 1,
 }
 OVERRIDE_FEE_ASSET = "11" * 32
 BLOCKSUBSIDY_INFO = {
