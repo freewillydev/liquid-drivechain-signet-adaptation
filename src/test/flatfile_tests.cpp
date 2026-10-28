@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chain.h>
 #include <clientversion.h>
 #include <common/args.h>
 #include <flatfile.h>
@@ -124,6 +125,55 @@ BOOST_AUTO_TEST_CASE(flatfile_flush)
     // Flush with finalize should truncate file.
     seq.Flush(FlatFilePos(0, 1), true);
     BOOST_CHECK_EQUAL(fs::file_size(seq.FileName(FlatFilePos(0, 1))), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(flatfile_large_offsets)
+{
+    FlatFileSeq seq{m_args.GetDataDirBase(), "large", 4096};
+    const FlatFilePos low{0, 17};
+    {
+        AutoFile file{seq.Open(low)};
+        file << uint8_t{0x11};
+    }
+    for (const uint64_t offset : {(uint64_t{1} << 31) + 17, (uint64_t{1} << 32) + 17}) {
+        const FlatFilePos pos{0, offset};
+        DataStream stream;
+        stream << pos;
+        FlatFilePos decoded;
+        stream >> decoded;
+        BOOST_CHECK_EQUAL(decoded.nPos, offset);
+        BOOST_CHECK(decoded == pos);
+
+        CBlockFileInfo info;
+        info.nSize = offset;
+        info.nUndoSize = offset + 1;
+        stream << info;
+        CBlockFileInfo restored;
+        stream >> restored;
+        BOOST_CHECK_EQUAL(restored.nSize, offset);
+        BOOST_CHECK_EQUAL(restored.nUndoSize, offset + 1);
+
+        // Sparse writes exercise both signed-32-bit seek and unsigned-32-bit
+        // position boundaries without allocating gigabytes of test data.
+        {
+            AutoFile file{seq.Open(pos)};
+            BOOST_CHECK_EQUAL(file.tell(), offset);
+            file << uint8_t{0x42};
+            BOOST_REQUIRE(file.Commit());
+            BOOST_REQUIRE(file.Truncate(offset + 1));
+            file.seek(-1, SEEK_END);
+            BOOST_CHECK_EQUAL(file.tell(), offset);
+            uint8_t value;
+            file >> value;
+            BOOST_CHECK_EQUAL(value, 0x42);
+        }
+        BOOST_REQUIRE(seq.Flush(FlatFilePos{0, offset + 1}, true));
+        BOOST_CHECK_EQUAL(fs::file_size(seq.FileName(pos)), offset + 1);
+        AutoFile file{seq.Open(low, true)};
+        uint8_t value;
+        file >> value;
+        BOOST_CHECK_EQUAL(value, 0x11);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

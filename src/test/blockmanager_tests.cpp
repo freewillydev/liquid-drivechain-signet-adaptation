@@ -10,6 +10,8 @@
 #include <node/kernel_notifications.h>
 #include <script/solver.h>
 #include <primitives/block.h>
+#include <streams.h>
+#include <undo.h>
 #include <util/chaintype.h>
 #include <validation.h>
 
@@ -96,6 +98,39 @@ BOOST_FIXTURE_TEST_CASE(blockmanager_scan_unlink_already_pruned_files, TestChain
     const int new_file_number{WITH_LOCK(chainman->GetMutex(), return new_tip->GetBlockPos().nFile)};
     const FlatFilePos new_pos(new_file_number, 0);
     BOOST_CHECK(!blockman.OpenBlockFile(new_pos, true).IsNull());
+}
+
+BOOST_FIXTURE_TEST_CASE(blockmanager_large_undo_offset, TestChain100Setup)
+{
+    auto& chainman = *m_node.chainman;
+    auto& blockman = chainman.m_blockman;
+    const auto* previous = WITH_LOCK(cs_main, return chainman.ActiveTip());
+    const int file_number = WITH_LOCK(cs_main, return previous->GetBlockPos().nFile);
+    constexpr uint64_t offset = (uint64_t{1} << 32) + 17;
+    // Stay inside one allocation chunk: the undo write creates a sparse file.
+    WITH_LOCK(cs_main, blockman.GetBlockFileInfo(file_number)->nUndoSize = offset);
+    CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+
+    LOCK(cs_main);
+    const auto* tip = chainman.ActiveTip();
+    BOOST_REQUIRE(tip != previous);
+    BOOST_CHECK_EQUAL(tip->nFile, file_number);
+    BOOST_CHECK_EQUAL(tip->GetUndoPos().nPos, offset + BLOCK_SERIALIZATION_HEADER_SIZE);
+    CBlockUndo undo;
+    BOOST_REQUIRE(blockman.ReadBlockUndo(undo, *tip));
+    BOOST_CHECK(undo.vtxundo.empty());
+    BOOST_CHECK(blockman.GetBlockFileInfo(file_number)->nUndoSize > offset);
+
+    DataStream stream;
+    stream << CDiskBlockIndex{tip};
+    CDiskBlockIndex restored;
+    stream >> restored;
+    BOOST_CHECK(restored.hashPrev == previous->GetBlockHash());
+    restored.pprev = tip->pprev;
+    BOOST_CHECK_EQUAL(restored.GetUndoPos().nPos, tip->GetUndoPos().nPos);
+    BOOST_REQUIRE(blockman.ReadBlockUndo(undo, restored));
+    BOOST_CHECK(undo.vtxundo.empty());
+    BOOST_REQUIRE(blockman.ReadBlockUndo(undo, *previous));
 }
 
 BOOST_FIXTURE_TEST_CASE(blockmanager_block_data_availability, TestChain100Setup)

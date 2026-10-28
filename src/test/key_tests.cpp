@@ -251,6 +251,21 @@ BOOST_AUTO_TEST_CASE(pubkey_unserialize)
     }
 }
 
+BOOST_AUTO_TEST_CASE(schnorr_variable_message_length)
+{
+    // BIP340 vector 17, also present in secp256k1's schnorrsig tests.
+    const XOnlyPubKey key{ParseHex("778CAA53B4393AC467774D09497A87224BF9FAB6F6E68B23086497324D6FD117")};
+    const auto sig = ParseHex("5130F39A4059B43BC7CAC09A19ECE52B5D8699D1A71E3C52DA9AFDB6B50AC370"
+                              "C4A482B77BF960F8681540E25B6771ECE1E5A37FD80E5A51897C5566A97EA5A5");
+    auto msg = ParseHex("0102030405060708090A0B0C0D0E0F1011");
+    msg.resize(32);
+    BOOST_CHECK(key.VerifySchnorr(Span{msg}.first(17), sig));
+    BOOST_CHECK(!key.VerifySchnorr(msg, sig));
+    BOOST_CHECK(!key.VerifySchnorr(Span{msg}.first(16), sig));
+    msg[0] ^= 1;
+    BOOST_CHECK(!key.VerifySchnorr(Span{msg}.first(17), sig));
+}
+
 BOOST_AUTO_TEST_CASE(bip340_test_vectors)
 {
     static const std::vector<std::pair<std::array<std::string, 3>, bool>> VECTORS = {

@@ -81,6 +81,45 @@ BOOST_AUTO_TEST_CASE(move_assignment)
     BOOST_CHECK(SocketIsClosed(s2));
 }
 
+#ifndef USE_POLL
+BOOST_AUTO_TEST_CASE(paused_receive_ignores_tcp_urgent_data)
+{
+    Sock listener{CreateSocket()};
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    BOOST_REQUIRE_EQUAL(listener.Bind(reinterpret_cast<sockaddr*>(&address), sizeof(address)), 0);
+    BOOST_REQUIRE_EQUAL(listener.Listen(1), 0);
+    socklen_t length = sizeof(address);
+    BOOST_REQUIRE_EQUAL(listener.GetSockName(reinterpret_cast<sockaddr*>(&address), &length), 0);
+    Sock sender{CreateSocket()};
+    BOOST_REQUIRE_EQUAL(sender.Connect(reinterpret_cast<sockaddr*>(&address), length), 0);
+    std::shared_ptr<Sock> receiver{listener.Accept(nullptr, nullptr)};
+    BOOST_REQUIRE(receiver);
+    BOOST_REQUIRE_EQUAL(sender.Send("!", 1, MSG_OOB), 1);
+
+    Sock::EventsPerSock events;
+    events.emplace(receiver, Sock::Events{Sock::RECV});
+    BOOST_REQUIRE(receiver->WaitMany(1s, events));
+    BOOST_REQUIRE(events.at(receiver).occurred & Sock::ERR);
+
+    // SEND remains monitored, but urgent data cannot bypass a paused RECV.
+    events.at(receiver).requested = Sock::SEND;
+    BOOST_REQUIRE(receiver->WaitMany(1s, events));
+    BOOST_CHECK(events.at(receiver).occurred & Sock::SEND);
+    BOOST_CHECK_EQUAL(events.at(receiver).occurred & (Sock::RECV | Sock::ERR), 0);
+
+    char byte;
+    BOOST_REQUIRE_EQUAL(receiver->Recv(&byte, 1, MSG_OOB), 1);
+    BOOST_REQUIRE_EQUAL(sender.Send("a", 1, 0), 1);
+    events.at(receiver).requested = Sock::RECV;
+    BOOST_REQUIRE(receiver->WaitMany(1s, events));
+    BOOST_CHECK(events.at(receiver).occurred & Sock::RECV);
+    BOOST_REQUIRE_EQUAL(receiver->Recv(&byte, 1, 0), 1);
+    BOOST_CHECK_EQUAL(byte, 'a');
+}
+#endif
+
 #ifndef WIN32 // Windows does not have socketpair(2).
 
 static void CreateSocketPair(int s[2])

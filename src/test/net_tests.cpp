@@ -16,6 +16,7 @@
 #include <serialize.h>
 #include <span.h>
 #include <streams.h>
+#include <test/util/net.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <test/util/validation.h>
@@ -130,6 +131,44 @@ BOOST_AUTO_TEST_CASE(cnode_simple_test)
     BOOST_CHECK(pnode4->IsInboundConn() == true);
     BOOST_CHECK(pnode4->m_inbound_onion == true);
     BOOST_CHECK_EQUAL(pnode4->ConnectedThroughNetwork(), Network::NET_ONION);
+}
+
+BOOST_AUTO_TEST_CASE(paused_send_timeout)
+{
+    auto& connman = static_cast<ConnmanTestMsg&>(*m_node.connman);
+    CConnman::Options options{};
+    options.nSendBufferMaxSize = 1024;
+    connman.Init(options);
+    const auto start = GetTime<std::chrono::seconds>();
+    SetMockTime(start);
+    CNode node{0, nullptr, CAddress{}, 0, 0, CAddress{}, "", ConnectionType::INBOUND, false};
+    node.fSuccessfullyConnected = true;
+    node.nVersion = BIP0031_VERSION;
+    node.SetCommonVersion(BIP0031_VERSION);
+    const auto enqueue = [&] {
+        connman.PushMessage(&node, NetMsg::Make(NetMsgType::INV, std::vector<uint8_t>(2048)));
+    };
+    enqueue();
+    BOOST_CHECK(node.fPauseSend);
+    BOOST_CHECK(node.m_pause_send_since.load() == start);
+
+    // Continued traffic must not extend a full send queue's deadline, including
+    // for old peers without BIP31 ping timeouts.
+    for (const auto elapsed : {std::chrono::seconds{TIMEOUT_INTERVAL}, TIMEOUT_INTERVAL + 1s}) {
+        SetMockTime(start + elapsed);
+        node.m_last_send = start + elapsed;
+        node.m_last_recv = start + elapsed;
+        enqueue();
+        BOOST_CHECK(node.m_pause_send_since.load() == start);
+        BOOST_CHECK_EQUAL(connman.InactivityCheck(node), elapsed > TIMEOUT_INTERVAL);
+    }
+    connman.FlushSendBuffer(node);
+    node.fPauseSend = false;
+    BOOST_CHECK(!connman.InactivityCheck(node));
+    enqueue();
+    BOOST_CHECK(node.m_pause_send_since.load() == start + TIMEOUT_INTERVAL + 1s);
+    BOOST_CHECK(!connman.InactivityCheck(node));
+    SetMockTime(0s);
 }
 
 BOOST_AUTO_TEST_CASE(cnetaddr_basic)

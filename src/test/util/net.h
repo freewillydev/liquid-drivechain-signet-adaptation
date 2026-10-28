@@ -34,6 +34,7 @@ class FastRandomContext;
 
 struct ConnmanTestMsg : public CConnman {
     using CConnman::CConnman;
+    using CConnman::InactivityCheck;
 
     void SetMsgProc(NetEventsInterface* msgproc)
     {
