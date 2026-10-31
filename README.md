@@ -1,4 +1,4 @@
-# Elements Native
+# Elements+ node
 
 This branch contains upstream Elements, native BIP300/BIP301 deposits,
 withdrawals and BMM bidding, and Utreexo accumulator development tooling.
