@@ -8,12 +8,12 @@
 > [repository README](../README.md) instead. The remaining text is retained
 > only as an audit trail and does not describe the current implementation.
 
-**Retired, unqualified prototype, not production-ready.** The historical design
+**Retired historical design.** The historical design
 below explored Elements on a private drivechain signet using CUSF mechanisms.
 It is not deployment guidance or security evidence for the current node.
 
 - **Upstream base**: ElementsProject/elements (cloned into this workspace at commit 75499e7 on branch `liquid-drivechain-signet-adaptation`).
-- **Target environment**: The private Drivechain signet in `../drivechain-wallet-dev/local-dev` (mainchain + bip300301_enforcer + bitassets ID 4 live example).
+- **Historical environment**: The private Drivechain signet in `../drivechain-wallet-dev/local-dev` (mainchain + bip300301_enforcer + bitassets ID 4 live example).
 - **Sidechain ID**: 5 ("liquid-signet").
 
 ## Quick Start (Reproducible on Live Signet)
@@ -300,4 +300,4 @@ See `docs/DESIGN.md` for full architecture + earlier evidence.
 - [x] Full production evidence (real txids, BMM inclusion, side H/credits, restart, polished e2e exit 0) on machine.
 
 This historical document is not an authoritative description of the current
-node and does not establish production readiness. See the root README.
+node. See the root README for the production mainnet identity.

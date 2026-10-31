@@ -1,8 +1,7 @@
 # Secure native Drivechain RPC setup
 
 The current network is `-chain=elements`, data subdirectory `elements-native-v1`,
-a fresh child targeting ECX Betanet slot 24. It requires its own proposal activation;
-it is not the existing Betanet child or production eCash mainnet.
+the production identity targeting mainnet slot 24. It requires its own proposal activation.
 See the [generated identity table](drivechain-network-identity.md) and
 [identity and peg operations](drivechain-peg-operations.md).
 
@@ -21,7 +20,7 @@ drivechainl1blocksync=0
 Do not configure `mainchainrpcuser` or `mainchainrpcpassword`. On POSIX the
 rotating cookie must be a regular non-symlink file owned by the Elements user,
 mode 0600, containing the canonical `__cookie__:` plus 64 hex characters.
-The native default cookie location has no `signet/` suffix.
+The native default cookie location is the parent data directory's `.cookie` file.
 The inherited `contrib/assets_tutorial` uses isolated tutorial chains and random
 inline credentials. Its tests do not define the native `-chain=elements` policy;
 do not copy tutorial authentication settings into a native deployment.

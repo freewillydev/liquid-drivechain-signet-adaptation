@@ -16,7 +16,7 @@
 #include <haskell/resource_constants.h>
 
 /**
- * Frozen identity of the sole built-in Elements Drivechain network.
+ * Production identity of the sole built-in Elements Drivechain mainnet network.
  *
  * These values and the generated resource table have no runtime dependencies, so
  * startup gates, chain parameters, and wire codecs cannot silently drift.
@@ -74,7 +74,7 @@ inline constexpr char PARENT_SIGNET_CHALLENGE[]{
 // parsing and state transitions are mirrored by the authenticated replay.
 inline constexpr char BIP300301_ENFORCER_REVISION[]{
     "0e27251ef351a522c72ab9ef079f75e06075390f"};
-// Betanet compatibility rules mirrored in the accompanying enforcer:
+// Parent compatibility rules mirrored in the accompanying enforcer:
 // sequential authenticated M6/CTIP transitions and bundle reproposal.
 // BIP300301_LOCAL_RULE_ID is raw SHA256 of this exact ASCII domain (no NUL).
 inline constexpr char BIP300301_LOCAL_RULE_DOMAIN[]{

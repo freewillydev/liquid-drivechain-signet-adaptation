@@ -148,7 +148,7 @@ if __name__ == "__main__":
     for mode, error in {
         "success": "", "retry": "fixture ambiguous broadcast", "wallet": "explicitly funded parent wallet",
         "host": "numeric loopback", "genesis": "wrong genesis", "network": "post-fork block",
-        "network-error": "cannot verify ECX Betanet", "checkpoint": "wrong fork checkpoint",
+        "network-error": "cannot verify mainnet parent", "checkpoint": "wrong fork checkpoint",
         "slot": "differs from the selected chain", "cancel": "submission cancelled",
         "signing": "signing parent wallet", "ownership": "not wallet-owned", "unconfirmed": "not confirmed",
         "signature": "Incomplete BMM signature", "mempool": "fixture rejection", "txid": "different BMM transaction ID",

@@ -2141,8 +2141,8 @@ BOOST_AUTO_TEST_CASE(production_startup_reuses_network_admission)
         BOOST_CHECK(!AppInitBasicSetup(args,status));
     }
     const std::vector<std::string> expected{
-        "This binary only supports the built-in -chain=elements Betanet test network",
-        "Refusing to start with a noncanonical Elements Betanet identity: " + identity_error};
+        "This binary only supports the built-in -chain=elements production mainnet identity",
+        "Refusing to start with a noncanonical Elements production identity: " + identity_error};
     BOOST_CHECK(errors == expected);
 }
 

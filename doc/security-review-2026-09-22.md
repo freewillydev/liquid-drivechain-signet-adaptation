@@ -9,8 +9,7 @@ as the comparison baseline. This is not a claim that no newer upstream commits
 exist. The node delta, excluding `src/test` and Qt translations, spans 189 files
 with 38,732 insertions and 555 deletions before this patch.
 
-This is a bounded source review and regression-tested refactor, not a complete
-cryptographic audit or production-readiness certification. Focus: native deposit
+This bounded source review and regression-tested refactor focuses on native deposit
 and withdrawal authorization, BMM admission, parent RPC/enforcer boundaries,
 and duplicated wallet serialization. No live funds, configuration or services
 were changed. The discarded explicit-reissuance experiment was not restored.
@@ -99,8 +98,8 @@ precheck; this is input hardening, not a newly discovered inflation exploit.
    workflow: later network or bundle failures can occur after `SendMoney`.
    Its `subtractfeefromamount` path also constructs the bundle from the requested
    amount rather than rederiving the actual fee-subtracted burn. A dedicated
-   prepared-transaction/recovery design is required before treating that path
-   as production-ready. Native Betanet explicitly rejects fee subtraction and
+   prepared-transaction/recovery design is required for that historical path.
+   The native node explicitly rejects fee subtraction and
    separates confirmed-burn submission; it does not use this legacy path.
 2. BMM `AlreadyExists` handling does not recover an exact persisted candidate
    across restart. Final block validation still requires the exact mined

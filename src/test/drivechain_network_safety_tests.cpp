@@ -116,7 +116,7 @@ BOOST_AUTO_TEST_CASE(parent_network_preserves_exception_scope_and_exact_identity
     const auto unavailable = [](const std::string&, const UniValue&) -> UniValue { throw std::domain_error("offline"); };
     BOOST_CHECK(!VerifyDrivechainParentRpcNetwork(consensus,unavailable,epoch,&error));
     BOOST_CHECK_EQUAL(epoch.load(),0U);
-    BOOST_CHECK_EQUAL(error,"cannot verify ECX Betanet parent RPC identity: offline");
+    BOOST_CHECK_EQUAL(error,"cannot verify mainnet parent RPC identity: offline");
     for (size_t i = 0; i < correct.size(); ++i) {
         auto altered = correct;
         altered[i] = altered[i] == '0' ? '1' : '0';
@@ -124,7 +124,7 @@ BOOST_AUTO_TEST_CASE(parent_network_preserves_exception_scope_and_exact_identity
         epoch.store(42);
         BOOST_CHECK(!VerifyDrivechainParentRpcNetwork(consensus,wrong,epoch,&error));
         BOOST_CHECK_EQUAL(epoch.load(),0U);
-        BOOST_CHECK_EQUAL(error,"parent RPC does not serve the ECX Betanet post-fork block at height 967680");
+        BOOST_CHECK_EQUAL(error,"parent RPC does not serve the mainnet parent post-fork block at height 967680");
     }
     // Canonical case is significant even when the numeric hash is identical.
     auto upper = correct;

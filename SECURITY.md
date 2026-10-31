@@ -34,7 +34,6 @@ automatically reaches them.
 ## Scope and Support
 
 Report issues in consensus, deposits, withdrawals, RPC transport, dependencies,
-and release artifacts. State the exact source SHA and binary checksum. A patch
-or successful test run is not a claim of an independent audit or production
-readiness. Historical slot-5 tools and obsolete network identities are not
+and release artifacts. State the exact source SHA and binary checksum. The node uses a production identity targeting mainnet. Independent audits
+should be identified by their published scope and report. Historical slot-5 tools and obsolete network identities are not
 supported deployments.

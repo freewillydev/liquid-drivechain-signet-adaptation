@@ -1721,10 +1721,10 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-mainchainrpcport=<n>", strprintf("RPC port of the fully validating mainchain node. (default: %u)", defaultBaseParams->MainchainRPCPort()), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpcuser=<user>", "RPC username for the fully validating mainchain node. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpcpassword=<pwd>", "RPC password for the fully validating mainchain node. (default: cookie auth)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-mainchainrpccookiefile=<file>", "Cookie for the fully validating parent node. Relative paths resolve under Bitcoin's data directory. Native Elements uses the frozen mainnet-ancestry parent (default: .cookie), not historical LayerTwoLabs Signet.", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-mainchainrpccookiefile=<file>", "Cookie for the fully validating parent node. Relative paths resolve under Bitcoin's data directory. Native Elements uses the frozen mainnet parent identity (default: .cookie).", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpccredentialfile=<file>", "Explicit absolute path to an owner-only POSIX username:password file for a numeric-loopback parent RPC bridge. Mutually exclusive with cookie and inline credential options. Never interprets static credentials as a rotating cookie.", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::ELEMENTS);
     argsman.AddArg("-mainchainrpctimeout=<n>", strprintf("Timeout in seconds during mainchain RPC requests, or 0 for no timeout. Native drivechain validation requires 1..2 seconds because these requests may run on consensus paths. (ordinary-network default: %d; drivechain default: 2)", DEFAULT_HTTP_CLIENT_TIMEOUT), ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
-    argsman.AddArg("-acceptbetanettestprofile", "Acknowledge that this Betanet-only child uses an existing slot-24 proposal that does not commit its genesis or current rules. Required for this test profile; does not enable spending or permit other proposals. (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
+    argsman.AddArg("-acceptbetanettestprofile", "Acknowledge a legacy existing-proposal slot-24 profile that does not commit its genesis or current rules. Required only when that legacy profile is compiled in; does not enable spending or permit other proposals. (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainl1blocksync", "Opt in to automatic bids for sidechain blocks containing selected mempool transactions using the explicitly funded -drivechainbmmwallet. Empty candidates do not trigger bids. Bid settings are per-transaction limits, NOT a lifetime budget; use a dedicated wallet with a bounded balance and no automatic refill. Already-submitted bids can still be mined after disabling. (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainautodeposit", "Automatically import confirmed native sidechain deposits for all recipients, including external wallets. Fee-free unless L1 explicitly commits an Elements fee; no spending keys required. Uses the authenticated parent index every 30 seconds, independently of block bidding. (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
     argsman.AddArg("-drivechainl1blocksyncinterval=<n>", "How often, in seconds, to poll the parent chain when -drivechainl1blocksync is enabled. (default: 10)", ArgsManager::ALLOW_ANY, OptionsCategory::ELEMENTS);
@@ -1955,7 +1955,7 @@ bool CheckDrivechainTestProfileOptIn(const ArgsManager& args, std::string* error
 {
     if (!ElementsDrivechainIdentity::BETANET_EXISTING_ELEMENTS_TEST_PROFILE ||
         args.GetBoolArg("-acceptbetanettestprofile", false)) return true;
-    if (error) *error = "Set -acceptbetanettestprofile=1 only for Betanet testing. The existing slot-24 proposal does not commit this child's genesis or replay-v5 rules. This is not a production eCash network.";
+    if (error) *error = "The production identity requires a matching parent proposal. Set -acceptbetanettestprofile=1 only to acknowledge the legacy existing-proposal profile; its proposal does not commit this child's genesis or replay-v5 rules.";
     return false;
 }
 
@@ -1967,12 +1967,12 @@ bool AppInitBasicSetup(const ArgsManager& args, std::atomic<int>& exit_status)
     // startup identities for this binary.
 #ifndef ELEMENTS_FUNCTIONAL_TEST_ONLY
     std::string identity_error;
-    const char* reason = "This binary only supports the built-in -chain=elements Betanet test network";
+    const char* reason = "This binary only supports the built-in -chain=elements production mainnet identity";
     if (!drivechain::haskell::ParentReplayAll<3>({
         [&] { return drivechain::haskell::NetworkSelectionStatus(
             drivechain::haskell::NetworkSelection::PRODUCTION, args.GetChainName()) == 0; },
         [&] {
-            reason = "Refusing to start with a noncanonical Elements Betanet identity: ";
+            reason = "Refusing to start with a noncanonical Elements production identity: ";
             return IsCanonicalElementsProductionIdentity(Params(), BaseParams(), &identity_error);
         },
         [&] {

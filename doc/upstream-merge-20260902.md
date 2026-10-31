@@ -157,5 +157,4 @@ and are not committed, particularly wallet data and private TLS credentials.
   integration before release use; their presence is not a passing CI claim.
 
 The [security remediation release gates](security-report-remediation.md) still
-apply. Upstream synchronization does not certify consensus safety, custody
-cryptography, deployment compatibility or readiness for production funds.
+apply. Upstream synchronization and release validation are separate processes.

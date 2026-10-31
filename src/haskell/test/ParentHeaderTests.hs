@@ -186,8 +186,8 @@ networkWorkflow = forAll arbitrary $ \selected -> forAll (elements [0,2,41,42,43
       prefix = if not selected then [0] else if rejected
         then takeWhile (/=bad) networkSteps ++ [bad] else networkSteps
       expected = prefix ++ if rejected then [4,5] else activeSteps
-      diagnostic = if bad == 2 then "cannot verify ECX Betanet parent RPC identity: offline"
-        else "parent RPC does not serve the ECX Betanet post-fork block at height 967680"
+      diagnostic = if bad == 2 then "cannot verify mainnet parent RPC identity: offline"
+        else "parent RPC does not serve the mainnet parent post-fork block at height 967680"
   (status,trace) <- networkCapture H.AuthenticateActiveHash reply
   pure $ conjoin [either (const (-1)) id status === if rejected then 0 else 1,
     map fst trace === expected,

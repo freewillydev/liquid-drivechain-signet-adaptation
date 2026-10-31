@@ -1,21 +1,20 @@
 # Native slot-24 deposits and withdrawals
 
-This guide applies to the current `-chain=elements` node, not the historical
-Liquid-signet/ECX bridge. Use a fresh `elements-native-v1` chain data directory. Do not
+This guide applies to the production `-chain=elements` mainnet identity. Use a fresh `elements-native-v1` chain data directory. Do not
 point the current binary at a preserved historical chain.
 
 ## Identity and transport
 
 The frozen identity in `src/elements_drivechain_identity.h` specifies slot 24,
-ECX Betanet with Bitcoin-mainnet ancestry, an empty signet challenge, and parent
+the mainnet parent profile with an empty signet challenge and parent
 checkpoint 967679 (`00000000000000000001b58cb69869f6067f0ecb3f2fe0f2263e62ba1ccb0c41`).
 The [generated identity table](drivechain-network-identity.md) records the exact
 genesis, asset, proposal and ports from that header.
-This is not a runtime-selectable signet. Sharing Bitcoin's genesis and address
+The parent identity is frozen. Sharing Bitcoin's genesis and address
 prefixes does not prove a connected node follows the intended parent fork.
 Verify the checkpoint, enforcer compatibility revision, proposal identity, and
 activation on the intended parent deployment before funding anything.
-The former Betanet proposal is not reused; the new matching proposal must be activated.
+The matching production proposal must be activated on the parent.
 
 Follow [RPC security](drivechain-rpc-security.md). Parent access requires
 authentication on numeric loopback, preferably a private rotating cookie;
@@ -60,9 +59,9 @@ credit the entire deposit without an Elements fee. BitWindow's existing fee
 field is the **parent transaction fee**, not an Elements fee.
 
 Manual import remains available after the required active parent depth:
-six confirmations for the Betanet slot-24 identity, counting inclusion as one.
+six confirmations for the mainnet slot-24 identity, counting inclusion as one.
 The frozen identity retains its historical 100-block parameter; the effective
-Betanet confirmation policy is six, without changing that identity.
+mainnet confirmation policy is six, without changing that identity.
 
 ```sh
 elements-cli -chain=elements -rpcwallet=<wallet> importdrivechaindeposit \

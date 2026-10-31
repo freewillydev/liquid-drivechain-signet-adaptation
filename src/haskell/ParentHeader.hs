@@ -192,10 +192,10 @@ instance ParentNetwork Header where
         matches <- if valid then flag native 3 else pure False
         unless matches $ do
           effect native 4 0
-          networkDiagnostic native (C.pack "parent RPC does not serve the ECX Betanet post-fork block at height 967680")
+          networkDiagnostic native (C.pack "parent RPC does not serve the mainnet parent post-fork block at height 967680")
           throwE 0) `catch` \(NetworkFailure message) -> runExceptT $ do
             effect native 4 0
-            networkDiagnostic native (C.pack "cannot verify ECX Betanet parent RPC identity: " <> message)
+            networkDiagnostic native (C.pack "cannot verify mainnet parent RPC identity: " <> message)
             throwE 0
 
 instance ActiveParentHash Header where
