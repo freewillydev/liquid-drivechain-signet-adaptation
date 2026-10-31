@@ -25,11 +25,13 @@ data directory differ from the fairmint branch; keep their chain data separate.
 ## Build and Test
 
 Use the platform instructions in `doc/build-unix.md` or `doc/build-osx.md` and the
-Haskell requirements in `src/haskell/README.md`. CMake builds the Haskell library
-and native node together. No USDD or SP1 verifier archive is required.
+[Haskell compiler and test setup](src/haskell/README.md#compiler-and-test-setup).
+Use **GHC 9.6.7** and **cabal-install >= 3.14.2.0**. CMake builds the Haskell
+library and native node together. No USDD or SP1 verifier archive is required.
 
 ```sh
-cmake -S . -B build -DBUILD_TESTS=ON
+cmake -S . -B build -DBUILD_TESTS=ON \
+  -DELEMENTS_GHC="$(command -v ghc-9.6.7)"
 cmake --build build -j1
 ctest --test-dir build --output-on-failure
 ```

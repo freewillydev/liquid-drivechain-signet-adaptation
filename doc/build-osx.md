@@ -4,6 +4,14 @@
 
 This guide describes how to build elementsd, command-line utilities, and GUI on macOS.
 
+## Haskell toolchain
+
+Use **GHC 9.6.7** and **cabal-install >= 3.14.2.0** (3.16.1.0 recommended for
+new installs), in addition to the macOS dependencies below. Follow the
+[compiler selection and Haskell test commands](../src/haskell/README.md#compiler-and-test-setup).
+Select the versioned compiler explicitly; an unversioned Homebrew `ghc` may
+resolve to a newer release that conflicts with the pinned test dependencies.
+
 ## Preparation
 
 The commands in this guide should be executed in a Terminal application.

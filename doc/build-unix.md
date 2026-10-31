@@ -93,6 +93,11 @@ The local, network-free version-check regression is:
 cmake -DTEST_TMP="$PWD/build/cabal-check-test" -P src/haskell/test/cabal_check.cmake
 ```
 
+For the standalone Haskell property suite, use the explicit GHC 9.6.7 command
+in [compiler and test setup](../src/haskell/README.md#compiler-and-test-setup).
+The property-test dependency pins also require this compiler selection;
+plain `cabal test` can pick an incompatible system compiler.
+
 ## Memory Requirements
 
 C++ compilers are memory-hungry. It is recommended to have at least 1.5 GB of

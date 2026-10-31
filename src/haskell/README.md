@@ -65,6 +65,56 @@ consensus data. Native failures must cross the boundary through checked results,
 not exceptions escaping a C callback. Capability visibility is an API discipline,
 not evidence that authorization or validation occurred.
 
+## Compiler and test setup
+
+Use **GHC 9.6.7** and **cabal-install >= 3.14.2.0**; Cabal 3.16.1.0 is
+recommended for new installs. The node and its Haskell property tests use the
+same compiler baseline. See the [toolchain setup](../../doc/build-unix.md#haskell-toolchain)
+for installation and platform dependencies.
+
+For an existing GHCup installation, install the versioned compiler without
+changing the system default:
+
+```sh
+ghcup install ghc 9.6.7
+ghc-9.6.7 --numeric-version
+cabal --numeric-version
+```
+
+Run the Haskell property suite from the repository root:
+
+```sh
+cd src/haskell
+cabal update
+cabal test --enable-tests --with-compiler=ghc-9.6.7
+```
+
+Keep the versioned compiler on `PATH`, or pass its absolute path to
+`--with-compiler`. This command explicitly enables the property test suite and
+selects GHC 9.6.7 even if plain `ghc` resolves to a newer compiler. A native C++
+compiler is also required for the suite's reference implementation.
+
+The pinned test dependencies include `QuickCheck ==2.15.0.1`,
+`random ==1.2.1.3` and `splitmix ==0.1.0.5`. GHC 9.14.1 supplies `base 4.22`,
+which conflicts with this pinned splitmix version's `base <4.21` requirement.
+That combination fails dependency resolution before any tests run. Select
+GHC 9.6.7 rather than overriding dependency bounds.
+
+For a full node build, select the same compiler explicitly when configuring
+CMake from the repository root:
+
+```sh
+cmake -S . -B build -DBUILD_TESTS=ON \
+  -DELEMENTS_GHC="$(command -v ghc-9.6.7)" \
+  -DELEMENTS_CABAL="$(command -v cabal)"
+cmake --build build -j1
+ctest --test-dir build --output-on-failure
+```
+
+CMake caches the selected tool paths. Pass the explicit paths again when
+reconfiguring an existing build; changing `PATH` alone may leave the cached
+compiler selected. Use a separate build directory when switching compilers.
+
 ## Verification
 
 Build with CMake and run the native tests, ABI/loader tests, Haskell properties
